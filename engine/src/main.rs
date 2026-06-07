@@ -1,18 +1,9 @@
-//! Checkpoint 01 CLI — path distance smoke test.
+//! Checkpoint 02 CLI — list legal moves.
 
-use titanium::{Board, Player, shortest_distance};
+use titanium::{generate_legal_moves, Board};
 
 fn main() {
     let board = Board::new();
-    println!("Titanium Engine 0.1.0 — checkpoint 01 (BFS)");
-    println!(
-        "P1 {} → goal dist {:?}",
-        Board::format_square(board.pawns[0].0, board.pawns[0].1),
-        shortest_distance(&board, Player::One),
-    );
-    println!(
-        "P2 {} → goal dist {:?}",
-        Board::format_square(board.pawns[1].0, board.pawns[1].1),
-        shortest_distance(&board, Player::Two),
-    );
+    let moves = generate_legal_moves(&board);
+    println!("{} legal moves at startpos", moves.len());
 }
