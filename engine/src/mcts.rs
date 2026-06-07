@@ -144,13 +144,66 @@ fn wall_disturbs_path(board: &mut Board, mv: Move, target: Player, bfs: &mut Bfs
     after > before
 }
 
+fn collect_shortest_pawn_moves(board: &mut Board, out: &mut [Move], bfs: &mut BfsScratch) -> usize {
+    let stm = board.side();
+    let base = bfs.shortest_distance(board, stm).unwrap_or(255);
+    let mut legal = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
+    let n = generate_legal_moves_slice(board, &mut legal, bfs);
+
+    let mut best = base;
+    let mut out_n = 0usize;
+    for i in 0..n {
+        let mv = legal[i];
+        let Move::Pawn { .. } = mv else { continue };
+        let undo = board.make_move(mv);
+        let d = bfs.shortest_distance(board, stm).unwrap_or(255);
+        board.unmake_move(undo);
+
+        if d <= best {
+            if d < best {
+                best = d;
+                out_n = 0;
+            }
+            out[out_n] = mv;
+            out_n += 1;
+        }
+    }
+    out_n
+}
+
 fn expansion_moves_fixed(board: &mut Board, buf: &mut [Move], bfs: &mut BfsScratch) -> usize {
     let mut scratch = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
     let full = generate_legal_moves_slice(board, &mut scratch, bfs);
     let stm = board.side();
     let opp = stm.opposite();
     let opp_no_walls = board.walls_remaining[opp as usize] == 0;
+    let self_has_walls = board.walls_remaining[stm as usize] > 0;
     let mut n = 0usize;
+
+    if opp_no_walls {
+        // Match JS behavior: when opponent has no walls, race with shortest pawn
+        // moves; only keep walls that disturb opponent's shortest path.
+        n += collect_shortest_pawn_moves(board, &mut buf[n..], bfs);
+
+        if self_has_walls {
+            for i in 0..full {
+                let mv = scratch[i];
+                if let Move::Wall { .. } = mv {
+                    if wall_disturbs_path(board, mv, opp, bfs) {
+                        buf[n] = mv;
+                        n += 1;
+                    }
+                }
+            }
+        }
+
+        if n > 0 {
+            return n;
+        }
+        // Safety fallback: never return empty if legal moves exist.
+        buf[..full].copy_from_slice(&scratch[..full]);
+        return full;
+    }
 
     for i in 0..full {
         let mv = scratch[i];
@@ -158,12 +211,6 @@ fn expansion_moves_fixed(board: &mut Board, buf: &mut [Move], bfs: &mut BfsScrat
             Move::Pawn { .. } => {
                 buf[n] = mv;
                 n += 1;
-            }
-            Move::Wall { .. } if opp_no_walls => {
-                if wall_disturbs_path(board, mv, opp, bfs) {
-                    buf[n] = mv;
-                    n += 1;
-                }
             }
             Move::Wall { .. } => {
                 buf[n] = mv;
