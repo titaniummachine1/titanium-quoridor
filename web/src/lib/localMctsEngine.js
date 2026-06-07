@@ -12,6 +12,25 @@ export class LocalMctsEngineClient {
     this.resolveUct = resolveUct ?? (() => engineConfig.uctConst ?? 0.2);
     this.worker = null;
     this.gorisansonMoves = [];
+    this.isPondering = false;
+  }
+
+  /**
+   * Future: node-cap-only MCTS on predicted opponent reply (no wall clock).
+   * @see docs/video/09-pondering-prep.md
+   */
+  ponder() {
+    this.isPondering = false;
+  }
+
+  stopPonder() {
+    if (!this.isPondering) {
+      return;
+    }
+    this.worker?.terminate();
+    this.worker = null;
+    this.isPondering = false;
+    this.setStatus('idle');
   }
 
   destroy() {

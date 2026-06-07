@@ -315,6 +315,8 @@ function renderTurnIndicator(playerNum, playerToMove, playerType, engineStatus, 
     spinner.classList.add('engine-spinner--error');
     spinner.textContent = '!';
     spinner.title = 'Engine error — try New game or pick another opponent';
+  } else if (status === 'pondering') {
+    spinner.title = 'Pondering on opponent time...';
   } else if (aiThinking || status === 'searching') {
     spinner.title = 'Engine is thinking...';
   } else if (status === 'connecting') {

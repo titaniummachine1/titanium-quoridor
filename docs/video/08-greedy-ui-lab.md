@@ -131,4 +131,4 @@ node benchmark/head_to_head.mjs --games 4 --p1 7500 --p2 20000
 
 ## Next
 
-Episode 09: **αβ search** in Rust — first Titanium version that can realistically climb the Gorisanson Elo ladder; optional WASM or subprocess hook for the web lab.
+Episode 09: [09-pondering-prep.md](09-pondering-prep.md) — pondering hooks (Stockfish-style, not built yet). Episode 10+: **αβ search** in Rust.

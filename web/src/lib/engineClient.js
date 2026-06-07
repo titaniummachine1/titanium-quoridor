@@ -180,6 +180,25 @@ export class EngineClient {
     this.connect();
   }
 
+  /** Stockfish-style — search on opponent time (your WS slot only). Not called yet. */
+  ponder(timeMode) {
+    if (this.outstandingSearches > 0 || this.isPondering) {
+      return;
+    }
+    if (timeMode == null) {
+      timeMode = this.lastTimeMode ?? TimeToMove.Short;
+    }
+    this.lastTimeMode = timeMode;
+    this.sendTimeToMoveSettings(timeMode);
+    this.send('go ponder');
+    this.isPondering = true;
+    this.setStatus('pondering');
+  }
+
+  stopPonder() {
+    this.stop();
+  }
+
   stop() {
     if (!this.isPondering) {
       return;

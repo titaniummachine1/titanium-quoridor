@@ -23,6 +23,7 @@ import {
   isRemoteEngine,
   isTitaniumEngine,
 } from '../lib/timeControl.js';
+import { ponderCandidateSlots } from '../lib/enginePonder.js';
 
 function isSavedSettingsValid(playerType, saved, engineConfigs) {
   if (isTitaniumEngine(playerType, engineConfigs)) {
@@ -301,6 +302,7 @@ export class AppController {
     this.syncRemoteEnginesAfterMove(action);
     this.onChange?.();
     this.maybeRequestAiMove();
+    this.maybePonderInactiveEngines();
   }
 
   onSessionChange() {
@@ -389,11 +391,38 @@ export class AppController {
     });
   }
 
+  /** Stop background ponder on all engines before a real search. Safe no-op until pondering ships. */
+  stopAllPonders() {
+    for (const engine of this.engines.values()) {
+      engine.stopPonder?.();
+    }
+  }
+
+  /**
+   * Future: remote `go ponder` + local predicted-line MCTS (node cap only).
+   * @see docs/video/09-pondering-prep.md
+   */
+  maybePonderInactiveEngines() {
+    if (this.session.winner || this.aiThinking) {
+      return;
+    }
+    const { playerToMove } = this.session.getSnapshot();
+    for (const { playerType } of ponderCandidateSlots(this.settings.players, playerToMove)) {
+      const engine = this.getEngine(playerType);
+      if (!engine?.ponder) {
+        continue;
+      }
+      // Not enabled yet — wire aiSettings + sync before calling engine.ponder(...)
+    }
+  }
+
   maybeRequestAiMove() {
     if (this.session.winner) {
       this.aiThinking = false;
       return;
     }
+
+    this.stopAllPonders();
 
     const playerType = this.session.getCurrentPlayerType(this.settings.players);
     if (playerType === PlayerType.Human) {
@@ -426,6 +455,7 @@ export class AppController {
       this.syncRemoteEnginesAfterMove(action);
       this.onChange?.();
       this.maybeRequestAiMove();
+      this.maybePonderInactiveEngines();
     };
 
     const playerIndex = this.session.getSnapshot().playerToMove - 1;
