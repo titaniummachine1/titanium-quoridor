@@ -1,7 +1,7 @@
 # Episode 04 — Benchmarks + JS cross-check
 
 - **branch:** `checkpoint/04-bench`
-- **commit:** *(fill after commit)*
+- **commit:** `90193b0`
 - **tag:** `checkpoint-04-bench`
 
 ## Hook
