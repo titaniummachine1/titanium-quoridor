@@ -2,7 +2,7 @@
 name = "titanium"
 version = "0.1.0"
 edition = "2021"
-description = "Titanium Engine — hybrid Quoridor AI (alpha-beta + guided MCTS)"
+description = "Titanium Engine ? hybrid Quoridor AI (alpha-beta + guided MCTS)"
 license = "MIT OR Apache-2.0"
 
 [lib]
@@ -14,3 +14,10 @@ name = "titanium"
 path = "src/main.rs"
 
 [dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "path_bfs"
+harness = false

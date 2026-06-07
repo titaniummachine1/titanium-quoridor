@@ -28,9 +28,18 @@ Play Human vs **Ishtar** or **Ka** (remote WebSocket engines).
 
 ```bash
 cd engine
-cargo build
+cargo build --release
 cargo test
-cargo run --bin titanium
+cargo run --release -- perft 2
+cargo run --release -- divide 1
+cargo run --release -- bench 2 20
+cargo bench
+```
+
+Cross-check move generation vs scraped JS:
+
+```bash
+node benchmark/compare_moves.mjs
 ```
 
 ## Engine roadmap

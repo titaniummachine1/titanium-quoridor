@@ -1,7 +1,7 @@
 # Episode 01 — Bitboard walls + BFS pathfinding
 
 - **branch:** `checkpoint/01-path-bfs`
-- **commit:** *(fill after commit — `git rev-parse --short HEAD` on that branch)*
+- **commit:** `43a1b93`
 - **tag:** `checkpoint-01-path-bfs`
 
 ## Hook (15s)

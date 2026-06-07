@@ -1,7 +1,7 @@
 # Episode 03 — Perft (divide) harness
 
 - **branch:** `checkpoint/03-perft`
-- **commit:** *(fill after commit)*
+- **commit:** `5a4b0fc`
 - **tag:** `checkpoint-03-perft`
 
 ## Hook

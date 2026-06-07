@@ -1,7 +1,7 @@
 # Episode 02 — Legal move generation (JS oracle parity)
 
 - **branch:** `checkpoint/02-legal-moves`
-- **commit:** *(fill after commit)*
+- **commit:** `19864b8`
 - **tag:** `checkpoint-02-legal-moves`
 
 ## Hook
