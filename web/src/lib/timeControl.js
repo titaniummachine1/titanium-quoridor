@@ -34,8 +34,8 @@ export const WALL_CLOCK_RANGE = {
 /** Exponential visit cap for local MCTS — slider is linear, stored value is log-spaced. */
 export const LOCAL_VISITS_RANGE = {
   min: 1_000,
-  max: 1_000_000_000,
-  default: 1_000_000_000,
+  max: 2_000_000_000,
+  default: 2_000_000_000,
   sliderSteps: 1_000,
 };
 
@@ -140,7 +140,8 @@ export function formatVisits(n) {
     return '?';
   }
   if (v >= 1_000_000_000) {
-    return `${(v / 1_000_000_000).toFixed(1)}B`;
+    const billions = v / 1_000_000_000;
+    return billions >= 10 ? `${Math.round(billions)}B` : `${billions.toFixed(1)}B`;
   }
   if (v >= 1_000_000) {
     return `${(v / 1_000_000).toFixed(1)}M`;
@@ -176,8 +177,9 @@ export function describePlayerAiSettings(playerType, aiSettings, engineConfigs) 
     const time = formatWallClock(aiSettings.wallClockSeconds ?? WALL_CLOCK_RANGE.defaultSeconds);
     const cap = formatVisitsCap(aiSettings.visitsBudget ?? LOCAL_VISITS_RANGE.default);
     if (isTitaniumEngine(playerType, engineConfigs)) {
-      const strength = strengthLevelLabel(aiSettings.strengthLevel ?? StrengthLevel.Alpha);
-      return `${config.name}: ${strength} · ${time} · ${cap}`;
+      const modeLabel = config.engineMode === 'minimax' ? 'Rust Minimax' : 'Rust MCTS';
+      const budgetLabel = config.engineMode === 'minimax' ? 'nodes' : 'sims';
+      return `${config.name}: ${time} · ${cap} ${budgetLabel} · ${modeLabel}`;
     }
     return `${config.name}: ${time} · ${cap}`;
   }
