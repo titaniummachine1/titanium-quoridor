@@ -137,8 +137,14 @@ struct SearchState<'a> {
     pv_move: Move,
     search_depth: u32,
     /// Stockfish-style LMR table: lmr_table[depth][moves_searched] = plies to reduce.
-    /// Formula: floor(0.75 + ln(depth) * ln(moves_searched) / 2.0)
+    /// Formula: floor(0.5 + ln(depth) * ln(moves_searched) / 2.25)
     lmr_table: [[u32; 64]; 64],
+    /// Per-branch forcing extension budget.
+    /// Each branch can contribute at most this many extension plies before
+    /// extensions stop firing — prevents depth from never decreasing.
+    /// Saved before and restored after each node's subtree so sibling
+    /// branches each get an independent cap.
+    extensions_budget: u32,
 }
 
 impl SearchState<'_> {
@@ -741,6 +747,11 @@ fn negamax(
         return terminal_score(ply);
     }
 
+    // Hard ply ceiling — prevents runaway extensions from overflowing the stack.
+    if ply >= MAX_PLY {
+        return eval_stm(board, board.side(), state.bfs);
+    }
+
     let hash = board.hash;
     let mut tt_best = None;
     if let Some(entry) = state.tt.probe(hash) {
@@ -840,28 +851,35 @@ fn negamax(
     );
 
     // ── Forcing extension ─────────────────────────────────────────────────
-    // Extend the search by 1 ply at nodes where the position is near-forcing:
-    //   (a) The current side has ≤ 1 legal pawn move — walls have hemmed them
-    //       in so severely that the line is essentially forced.
-    //   (b) Either player's shortest path is ≤ 2 steps — the race to the goal
-    //       is imminent and we must see the outcome clearly.
-    // Apply only at non-root interior nodes (ply > 0, depth > 1) to avoid
-    // blowing up the tree at the root or at leaves.
-    // One node can contribute at most 1 ply of extension (no stacking).
-    let forcing_extension: u32 = if ply > 0 && depth > 1 {
+    // Extend by 1 ply when the position is near-forcing:
+    //   (a) STM has ≤ 1 legal pawn move — line is essentially forced.
+    //   (b) Either player is ≤ 2 steps from the goal — race outcome is near.
+    //
+    // CRITICAL safety: child_depth = (depth-1)+1 = depth, so WITHOUT a budget
+    // cap depth would NEVER decrease → stack overflow. The budget is saved here
+    // and restored after the move loop, giving each branch an independent cap
+    // of MAX_EXTENSIONS_PER_BRANCH plies. When the budget hits 0 the extension
+    // doesn't fire and depth decreases normally.
+    const MAX_EXTENSIONS_PER_BRANCH: u32 = 4;
+    let forcing_extension: u32 = if ply > 0
+        && depth > 1
+        && state.extensions_budget > 0
+    {
         let pawn_count = buf[..n]
             .iter()
             .filter(|m| matches!(m, Move::Pawn { .. }))
             .count();
         let near_goal = our_dist_pre <= 2 || opp_dist_pre <= 2;
-        if pawn_count <= 1 || near_goal {
-            1
-        } else {
-            0
-        }
+        if pawn_count <= 1 || near_goal { 1 } else { 0 }
     } else {
         0
     };
+    // Save budget now; decrement for this whole subtree; restore after the loop.
+    let budget_before_subtree = state.extensions_budget;
+    if forcing_extension > 0 {
+        state.extensions_budget = state.extensions_budget.saturating_sub(1);
+    }
+    let _ = MAX_EXTENSIONS_PER_BRANCH; // used in init only
 
     let mut best_score = -MATE;
     let mut best_mv = buf[0];
@@ -969,6 +987,9 @@ fn negamax(
             break;
         }
     }
+
+    // Restore extension budget so sibling branches each get an independent cap.
+    state.extensions_budget = budget_before_subtree;
 
     let bound = if best_score <= original_alpha {
         TtBound::Upper
@@ -1128,6 +1149,7 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
         pv_move: buf[0],
         search_depth: 0,
         lmr_table: build_lmr_table(),
+        extensions_budget: 4,
     };
 
     let root_side = board.side();
