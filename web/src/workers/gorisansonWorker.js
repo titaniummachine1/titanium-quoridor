@@ -113,10 +113,60 @@ const bootstrap = new Function(
     return fallbackMove(game);
   }
 
+  function findImmediateWinMove(game) {
+    const valids = game.getArrOfValidNextPositionTuples();
+    for (const [row, col] of valids) {
+      const trial = Game.clone(game);
+      trial.doMove([[row, col], null, null], true);
+      if (trial.winner !== null) {
+        return [[row, col], null, null];
+      }
+    }
+    return null;
+  }
+
+  function stmOneStepFromGoal(game) {
+    const next = AI.chooseShortestPathNextPawnPosition(game);
+    const goalRow = game.pawnOfTurn === game.pawn1 ? 8 : 0;
+    return next.row === goalRow;
+  }
+
+  function shouldStopGorisansonSearch(mcts, game, simulations) {
+    if (simulations < 100) {
+      return false;
+    }
+    if (stmOneStepFromGoal(game)) {
+      return true;
+    }
+    if (!mcts.root.children.length) {
+      return false;
+    }
+    const best = mcts.selectBestMove();
+    if (!best || best.n < 100) {
+      return false;
+    }
+    const wr = best.wins / best.n;
+    if (best.n >= 300 && wr >= 0.98) {
+      return true;
+    }
+    if (best.n >= 150 && wr >= 0.99) {
+      return true;
+    }
+    if (mcts.root.children.length === 1 && best.n >= 500 && wr >= 0.95) {
+      return true;
+    }
+    return false;
+  }
+
   function searchForTime(game, uctConst, timeMs, maxSimulations) {
     const opening = chooseOpeningPawnMove(game);
     if (opening) {
       return { move: opening, simulations: 0, stoppedBy: 'opening' };
+    }
+
+    const immediateWin = findImmediateWinMove(game);
+    if (immediateWin) {
+      return { move: immediateWin, simulations: 0, stoppedBy: 'win-in-1' };
     }
 
     const mcts = new MonteCarloTreeSearch(game, uctConst);
@@ -139,13 +189,22 @@ const bootstrap = new Function(
       mcts.search(batch);
       simulations += batch;
       tick += 1;
+
+      if (shouldStopGorisansonSearch(mcts, game, simulations)) {
+        break;
+      }
+
       if (tick % 5 === 0) {
         const elapsed = performance.now() - started;
         postMessage({ type: 'progress', value: Math.min(0.99, elapsed / timeMs), simulations });
       }
     }
 
-    const stoppedBy = simulations >= simCap ? 'visits' : 'time';
+    const stoppedBy = shouldStopGorisansonSearch(mcts, game, simulations)
+      ? 'forced'
+      : simulations >= simCap
+        ? 'visits'
+        : 'time';
     const move = pickBestMoveFromTree(mcts, game);
     if (!move) {
       throw new Error('no legal move');

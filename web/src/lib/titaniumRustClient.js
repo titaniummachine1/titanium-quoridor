@@ -123,6 +123,7 @@ export class TitaniumEngineClient {
                 whiteDist: data.whiteDist,
                 blackDist: data.blackDist,
                 rootWinRate: data.rootWinRate,
+                rootMoves: data.rootMoves,
               });
               continue;
             }
@@ -145,6 +146,7 @@ export class TitaniumEngineClient {
                 whiteDist: finalMeta.whiteDist,
                 blackDist: finalMeta.blackDist,
                 rootWinRate: finalMeta.rootWinRate,
+                rootMoves: finalMeta.rootMoves,
                 progress: 1,
               });
               const action = parseAlgebraic(data.algebraic);

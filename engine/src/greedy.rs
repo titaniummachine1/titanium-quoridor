@@ -6,8 +6,16 @@ use crate::path::BfsScratch;
 
 const DIST_PENALTY: u8 = 255;
 
-pub(crate) fn greedy_eval_for_player(board: &Board, player: Player, scratch: &mut BfsScratch) -> i32 {
-    let our_dist = i32::from(scratch.shortest_distance(board, player).unwrap_or(DIST_PENALTY));
+pub(crate) fn greedy_eval_for_player(
+    board: &Board,
+    player: Player,
+    scratch: &mut BfsScratch,
+) -> i32 {
+    let our_dist = i32::from(
+        scratch
+            .shortest_distance(board, player)
+            .unwrap_or(DIST_PENALTY),
+    );
     let opp_dist = i32::from(
         scratch
             .shortest_distance(board, player.opposite())

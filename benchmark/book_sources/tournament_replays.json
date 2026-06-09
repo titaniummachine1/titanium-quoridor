@@ -1,0 +1,14 @@
+{
+  "note": "BGA tournament tables — manual transcription or future scrape into opening book",
+  "games": [
+    { "label": "GridGlitch vs Mikk Final G1", "url": "https://boardgamearena.com/table?table=507957212" },
+    { "label": "GridGlitch vs Mikk Final G2", "url": "https://boardgamearena.com/table?table=507958293" },
+    { "label": "GridGlitch vs Mikk Final G3", "url": "https://boardgamearena.com/table?table=507958416" },
+    { "label": "GridGlitch vs Mikk Final G4", "url": "https://boardgamearena.com/table?table=507953358" },
+    { "label": "GridGlitch vs Mikk Final G5", "url": "https://boardgamearena.com/table?table=507961930" },
+    { "label": "Loulou131313 vs Mikk Semi G1", "url": "https://boardgamearena.com/table?table=497533894" },
+    { "label": "Loulou131313 vs Mikk Semi G2", "url": "https://boardgamearena.com/table?table=497537126" },
+    { "label": "Loulou131313 vs Mikk Semi G3", "url": "https://boardgamearena.com/table?table=497537487" },
+    { "label": "GridGlitch vs jebach_ Semi", "url": "resigned", "note": "jebach resigned" }
+  ]
+}

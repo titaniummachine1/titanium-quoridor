@@ -51,10 +51,10 @@ export class AppController {
     this.engineConfigs = getAllEngineConfigs();
 
     this.settings = {
-      players: [PlayerType.Human, PlayerType.IshtarV3],
+      players: [PlayerType.TitaniumMinimax, PlayerType.GorisansonMCTS],
       playerAiSettings: [
-        null,
-        defaultPlayerAiSettings(PlayerType.IshtarV3, this.engineConfigs),
+        defaultPlayerAiSettings(PlayerType.TitaniumMinimax, this.engineConfigs),
+        defaultPlayerAiSettings(PlayerType.GorisansonMCTS, this.engineConfigs),
       ],
       playerAiSettingsMemory: [{}, {}],
       rotateBoard: false,
@@ -69,6 +69,7 @@ export class AppController {
     this.engineStatus = {};
     this.engineErrors = {};
     this.searchInfo = {};
+    this.moveThinkLog = [];
     this.eval = { score: 0.5, p1: 0.5, pv: [] };
     this.aiThinking = false;
     this.liveSearch = null;
@@ -111,6 +112,7 @@ export class AppController {
         this.searchInfo,
         this.engineConfigs,
       ),
+      moveThinkLog: this.moveThinkLog,
       uiMode: this.settings.uiMode,
       replay: this.replay
         ? {
@@ -310,6 +312,7 @@ export class AppController {
     this.liveSearch = null;
     this.engineErrors = {};
     this.replay = null;
+    this.moveThinkLog = [];
     this.settings.uiMode = 'play';
     this.eval = { score: 0.5, p1: 0.5, pv: [] };
     for (const engine of this.engines.values()) {
@@ -456,6 +459,7 @@ export class AppController {
             rootWinRate: info.rootWinRate,
             whiteDist: info.whiteDist,
             blackDist: info.blackDist,
+            rootMoves: info.rootMoves,
           };
           const now = performance.now();
           if (now - this._liveUpdateLastMs >= 250) {
@@ -481,6 +485,7 @@ export class AppController {
             rootWinRate: info.rootWinRate,
             whiteDist: info.whiteDist,
             blackDist: info.blackDist,
+            rootMoves: info.rootMoves,
           };
         }
         this.onChange?.();
@@ -620,6 +625,24 @@ export class AppController {
       }
 
       const applied = this.session.applyAction(action);
+      if (applied) {
+        const plyNum = this.session.actions.length;
+        const si = this.searchInfo[playerType] ?? {};
+        this.moveThinkLog.push({
+          ply: plyNum,
+          move: this.session.actionToLabel(action),
+          engine: this.engineLabel(playerType),
+          stoppedBy: si.stoppedBy ?? si.mode ?? '?',
+          nodes: si.nodes ?? si.simulations ?? 0,
+          searchDepth: si.searchDepth,
+          whiteDist: si.whiteDist,
+          blackDist: si.blackDist,
+          rootScore: si.rootScore,
+          rootWinRate: si.rootWinRate,
+          depthLog: si.depthLog ? [...si.depthLog] : [],
+          rootMoves: si.rootMoves ? [...si.rootMoves] : [],
+        });
+      }
       if (!applied) {
         const snapshot = this.session.getSnapshot();
         const suggested = this.session.actionToLabel(action);

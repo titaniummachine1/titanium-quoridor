@@ -36,11 +36,7 @@ pub fn generate_legal_moves_slice(
 }
 
 /// Reuses `out` buffer and `scratch` BFS pool — board restored after wall trials.
-pub fn generate_legal_moves_into(
-    board: &mut Board,
-    out: &mut Vec<Move>,
-    scratch: &mut BfsScratch,
-) {
+pub fn generate_legal_moves_into(board: &mut Board, out: &mut Vec<Move>, scratch: &mut BfsScratch) {
     out.clear();
     let mut buf = [Move::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
     let n = generate_legal_moves_slice(board, &mut buf, scratch);
@@ -217,12 +213,7 @@ impl WallPathCache {
     }
 
     #[inline]
-    fn wall_intersects_either_path(
-        &self,
-        row: u8,
-        col: u8,
-        orientation: WallOrientation,
-    ) -> bool {
+    fn wall_intersects_either_path(&self, row: u8, col: u8, orientation: WallOrientation) -> bool {
         wall_intersects_path(row, col, orientation, &self.p1, self.p1_len)
             || wall_intersects_path(row, col, orientation, &self.p2, self.p2_len)
     }
@@ -278,13 +269,7 @@ fn wall_intersects_path(
 }
 
 #[inline]
-fn wall_blocks_path_step(
-    row: u8,
-    col: u8,
-    orientation: WallOrientation,
-    sq1: u8,
-    sq2: u8,
-) -> bool {
+fn wall_blocks_path_step(row: u8, col: u8, orientation: WallOrientation, sq1: u8, sq2: u8) -> bool {
     let (r1, c1) = unpack_square(sq1);
     let (r2, c2) = unpack_square(sq2);
     match orientation {
@@ -375,15 +360,51 @@ fn touching_side_a(board: &Board, row: u8, col: u8, orientation: WallOrientation
     match orientation {
         WallOrientation::Horizontal => {
             wall_at_offset(board, row, col, &[(0, -1)], WallOrientation::Vertical)
-                || wall_at_offset(board, row, col, &[(1, 0), (0, -1)], WallOrientation::Vertical)
-                || wall_at_offset(board, row, col, &[(-1, 0), (0, -1)], WallOrientation::Vertical)
-                || wall_at_offset(board, row, col, &[(0, -1), (0, -1)], WallOrientation::Horizontal)
+                || wall_at_offset(
+                    board,
+                    row,
+                    col,
+                    &[(1, 0), (0, -1)],
+                    WallOrientation::Vertical,
+                )
+                || wall_at_offset(
+                    board,
+                    row,
+                    col,
+                    &[(-1, 0), (0, -1)],
+                    WallOrientation::Vertical,
+                )
+                || wall_at_offset(
+                    board,
+                    row,
+                    col,
+                    &[(0, -1), (0, -1)],
+                    WallOrientation::Horizontal,
+                )
         }
         WallOrientation::Vertical => {
             wall_at_offset(board, row, col, &[(1, 0)], WallOrientation::Horizontal)
-                || wall_at_offset(board, row, col, &[(0, -1), (1, 0)], WallOrientation::Horizontal)
-                || wall_at_offset(board, row, col, &[(0, 1), (1, 0)], WallOrientation::Horizontal)
-                || wall_at_offset(board, row, col, &[(1, 0), (1, 0)], WallOrientation::Vertical)
+                || wall_at_offset(
+                    board,
+                    row,
+                    col,
+                    &[(0, -1), (1, 0)],
+                    WallOrientation::Horizontal,
+                )
+                || wall_at_offset(
+                    board,
+                    row,
+                    col,
+                    &[(0, 1), (1, 0)],
+                    WallOrientation::Horizontal,
+                )
+                || wall_at_offset(
+                    board,
+                    row,
+                    col,
+                    &[(1, 0), (1, 0)],
+                    WallOrientation::Vertical,
+                )
         }
     }
 }
@@ -392,15 +413,51 @@ fn touching_side_b(board: &Board, row: u8, col: u8, orientation: WallOrientation
     match orientation {
         WallOrientation::Horizontal => {
             wall_at_offset(board, row, col, &[(0, 1)], WallOrientation::Vertical)
-                || wall_at_offset(board, row, col, &[(1, 0), (0, 1)], WallOrientation::Vertical)
-                || wall_at_offset(board, row, col, &[(-1, 0), (0, 1)], WallOrientation::Vertical)
-                || wall_at_offset(board, row, col, &[(0, 1), (0, 1)], WallOrientation::Horizontal)
+                || wall_at_offset(
+                    board,
+                    row,
+                    col,
+                    &[(1, 0), (0, 1)],
+                    WallOrientation::Vertical,
+                )
+                || wall_at_offset(
+                    board,
+                    row,
+                    col,
+                    &[(-1, 0), (0, 1)],
+                    WallOrientation::Vertical,
+                )
+                || wall_at_offset(
+                    board,
+                    row,
+                    col,
+                    &[(0, 1), (0, 1)],
+                    WallOrientation::Horizontal,
+                )
         }
         WallOrientation::Vertical => {
             wall_at_offset(board, row, col, &[(-1, 0)], WallOrientation::Horizontal)
-                || wall_at_offset(board, row, col, &[(0, -1), (-1, 0)], WallOrientation::Horizontal)
-                || wall_at_offset(board, row, col, &[(0, 1), (-1, 0)], WallOrientation::Horizontal)
-                || wall_at_offset(board, row, col, &[(-1, 0), (-1, 0)], WallOrientation::Vertical)
+                || wall_at_offset(
+                    board,
+                    row,
+                    col,
+                    &[(0, -1), (-1, 0)],
+                    WallOrientation::Horizontal,
+                )
+                || wall_at_offset(
+                    board,
+                    row,
+                    col,
+                    &[(0, 1), (-1, 0)],
+                    WallOrientation::Horizontal,
+                )
+                || wall_at_offset(
+                    board,
+                    row,
+                    col,
+                    &[(-1, 0), (-1, 0)],
+                    WallOrientation::Vertical,
+                )
         }
     }
 }

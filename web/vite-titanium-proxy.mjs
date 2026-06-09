@@ -4,6 +4,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -12,7 +13,13 @@ const binName = process.platform === 'win32' ? 'titanium.exe' : 'titanium';
 const defaultBin = path.join(repoRoot, 'engine', 'target', 'release', binName);
 
 function resolveBinary() {
-  return process.env.TITANIUM_BIN ?? defaultBin;
+  const bin = process.env.TITANIUM_BIN ?? defaultBin;
+  if (!existsSync(bin)) {
+    throw new Error(
+      `Titanium binary missing at ${bin} — run: cd engine && cargo build --release`,
+    );
+  }
+  return bin;
 }
 
 function parseProgressLine(line) {
@@ -59,7 +66,11 @@ function runGenmoveStreaming(moves, options, res) {
     args.push('--sims', String(maxSims), '--uct', String(uct));
   }
 
-  const child = spawn(bin, args, { cwd: repoRoot });
+  const childEnv = { ...process.env };
+  delete childEnv.TITANIUM_DISABLE_BOOK;
+  delete childEnv.TITANIUM_BRIDGE;
+
+  const child = spawn(bin, args, { cwd: repoRoot, env: childEnv });
   let stdout = '';
   let stderrBuf = '';
 
@@ -142,10 +153,15 @@ function runGenmoveSync(moves, options) {
     args.push('--sims', String(maxSims), '--uct', String(uct));
   }
 
+  const childEnv = { ...process.env };
+  delete childEnv.TITANIUM_DISABLE_BOOK;
+  delete childEnv.TITANIUM_BRIDGE;
+
   const result = spawnSync(bin, args, {
     encoding: 'utf8',
     cwd: repoRoot,
     maxBuffer: 4 * 1024 * 1024,
+    env: childEnv,
   });
 
   if (result.error) {

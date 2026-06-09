@@ -70,6 +70,51 @@ function pickBestMoveFromTree(mcts, game) {
   return fallbackMove(game);
 }
 
+function findImmediateWinMove(game) {
+  const valids = game.getArrOfValidNextPositionTuples();
+  for (const [row, col] of valids) {
+    const trial = g.Game.clone(game);
+    trial.doMove([[row, col], null, null], true);
+    if (trial.winner !== null) {
+      return [[row, col], null, null];
+    }
+  }
+  return null;
+}
+
+function stmOneStepFromGoal(game) {
+  const next = g.AI.chooseShortestPathNextPawnPosition(game);
+  const goalRow = game.pawnOfTurn === game.pawn1 ? 8 : 0;
+  return next.row === goalRow;
+}
+
+function shouldStopGorisansonSearch(mcts, game, simulations) {
+  if (simulations < 100) {
+    return false;
+  }
+  if (stmOneStepFromGoal(game)) {
+    return true;
+  }
+  if (!mcts.root.children.length) {
+    return false;
+  }
+  const best = mcts.selectBestMove();
+  if (!best || best.n < 100) {
+    return false;
+  }
+  const wr = best.wins / best.n;
+  if (best.n >= 300 && wr >= 0.98) {
+    return true;
+  }
+  if (best.n >= 150 && wr >= 0.99) {
+    return true;
+  }
+  if (mcts.root.children.length === 1 && best.n >= 500 && wr >= 0.95) {
+    return true;
+  }
+  return false;
+}
+
 /**
  * @param {object} game
  * @param {{ timeMs?: number, maxSimulations?: number, uct?: number, onProgress?: (p: { simulations: number, elapsedMs: number }) => void }} [budget]
@@ -86,6 +131,18 @@ export function chooseGorisansonMoveWithMeta(game, budget = {}) {
       move: opening,
       meta: {
         stoppedBy: 'opening',
+        simulations: 0,
+        elapsedMs: performance.now() - started,
+      },
+    };
+  }
+
+  const immediateWin = findImmediateWinMove(game);
+  if (immediateWin) {
+    return {
+      move: immediateWin,
+      meta: {
+        stoppedBy: 'win-in-1',
         simulations: 0,
         elapsedMs: performance.now() - started,
       },
@@ -111,6 +168,10 @@ export function chooseGorisansonMoveWithMeta(game, budget = {}) {
       mcts.search(batch);
       simulations += batch;
 
+      if (shouldStopGorisansonSearch(mcts, game, simulations)) {
+        break;
+      }
+
       if (typeof budget.onProgress === 'function') {
         const elapsedMs = Math.max(0, Math.round(performance.now() - started));
         if (lastProgressMs < 0 || elapsedMs - lastProgressMs >= 800) {
@@ -120,7 +181,11 @@ export function chooseGorisansonMoveWithMeta(game, budget = {}) {
       }
     }
 
-    const stoppedBy = simulations >= maxSimulations ? 'visits' : 'time';
+    const stoppedBy = shouldStopGorisansonSearch(mcts, game, simulations)
+      ? 'forced'
+      : simulations >= maxSimulations
+        ? 'visits'
+        : 'time';
     const move = pickBestMoveFromTree(mcts, game);
     if (!move) {
       throw new Error('gorisanson: no legal move');

@@ -28,16 +28,18 @@ export const WALL_CLOCK_RANGE = {
   min: 0.5,
   max: 60,
   step: 0.5,
-  defaultSeconds: 3,
+  defaultSeconds: 10,
 };
 
 /** Exponential visit cap for local MCTS — slider is linear, stored value is log-spaced. */
 export const LOCAL_VISITS_RANGE = {
   min: 1_000,
   max: 2_000_000_000,
-  default: 2_000_000_000,
+  default: 66_000,
   sliderSteps: 1_000,
 };
+
+export const TITANIUM_NODE_CAP = 2_000_000_000;
 
 export function clampVisits(visits) {
   const n = Number(visits);
@@ -109,7 +111,7 @@ export function defaultPlayerAiSettings(playerType, engineConfigs) {
     return {
       strengthLevel: StrengthLevel.Alpha,
       wallClockSeconds: WALL_CLOCK_RANGE.defaultSeconds,
-      visitsBudget: LOCAL_VISITS_RANGE.default,
+      visitsBudget: TITANIUM_NODE_CAP,
     };
   }
   if (isLocalEngine(playerType, engineConfigs)) {
@@ -177,7 +179,8 @@ export function describePlayerAiSettings(playerType, aiSettings, engineConfigs) 
     const time = formatWallClock(aiSettings.wallClockSeconds ?? WALL_CLOCK_RANGE.defaultSeconds);
     const cap = formatVisitsCap(aiSettings.visitsBudget ?? LOCAL_VISITS_RANGE.default);
     if (isTitaniumEngine(playerType, engineConfigs)) {
-      const modeLabel = config.engineMode === 'minimax' ? 'Rust Minimax' : 'Rust MCTS';
+      const modeLabel =
+        config.engineMode === 'minimax' ? 'Hybrid MCTS opening→AB' : 'Rust MCTS only';
       const budgetLabel = config.engineMode === 'minimax' ? 'nodes' : 'sims';
       return `${config.name}: ${time} · ${cap} ${budgetLabel} · ${modeLabel}`;
     }

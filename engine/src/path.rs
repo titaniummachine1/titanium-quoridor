@@ -7,30 +7,91 @@
 //!
 //! See `docs/video/PERFT-OPTIMIZATIONS.md` Layer 4 for timings and oracles.
 
-use crate::board::{Board, Player};
+use crate::board::{Board, Player, WallOrientation};
 use crate::grid::{
     can_step, flood_bit_sq, flood_sq_from_bit, goal_row, pack_flood_mask, square_index,
     unpack_square, FLOOD_PLAYABLE, FLOOD_STRIDE,
 };
+use std::ops::Index;
 
 /// Per-square attention scores for move ordering / LMR (centi-units, not eval).
-pub type ConsensusAttention = [u16; 81];
-
-const CAT_BASE_CM: u16 = 100;
-const CAT_DIST_PENALTY_CM: u16 = 3;
-const CAT_MAX_PENALTY_CM: u16 = 30;
-
-/// CAT weight for a square at `dist` steps from the pawn (centi-units).
-///
-/// `weight = 100 - clamp(dist * 3, 0, 30)`
-/// - dist 0 → 100 cm, dist 10+ → 70 cm (floor).
-#[inline]
-pub fn attention_weight_cm(dist: u8) -> u16 {
-    let penalty = u16::from(dist)
-        .saturating_mul(CAT_DIST_PENALTY_CM)
-        .min(CAT_MAX_PENALTY_CM);
-    CAT_BASE_CM.saturating_sub(penalty)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CorridorAttention {
+    /// Search heat for each square. Zero means unreachable or too far from any reasonable route.
+    square_heat: [u16; 81],
+    /// Number of reasonable forward continuations through this square, summed over both players.
+    route_flex: [u8; 81],
+    /// Extra pressure on low-flex near-shortest corridors.
+    bottleneck_heat: [u16; 81],
 }
+
+impl Default for CorridorAttention {
+    fn default() -> Self {
+        Self {
+            square_heat: [0; 81],
+            route_flex: [0; 81],
+            bottleneck_heat: [0; 81],
+        }
+    }
+}
+
+impl Index<usize> for CorridorAttention {
+    type Output = u16;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.square_heat[index]
+    }
+}
+
+impl CorridorAttention {
+    pub fn square_heat(&self, row: u8, col: u8) -> u16 {
+        self.square_heat[square_index(row, col) as usize]
+    }
+
+    pub fn route_flex(&self, row: u8, col: u8) -> u8 {
+        self.route_flex[square_index(row, col) as usize]
+    }
+
+    pub fn wall_edge_heat(&self, row: u8, col: u8, orientation: WallOrientation) -> u16 {
+        let edge_heat = |a: (u8, u8), b: (u8, u8)| -> u16 {
+            let ai = square_index(a.0, a.1) as usize;
+            let bi = square_index(b.0, b.1) as usize;
+            let corridor = self.square_heat[ai].min(self.square_heat[bi]);
+            if corridor == 0 {
+                return 0;
+            }
+            let bottleneck = self.bottleneck_heat[ai].min(self.bottleneck_heat[bi]);
+            corridor.saturating_add(bottleneck)
+        };
+
+        let (a, b) = match orientation {
+            WallOrientation::Horizontal => (
+                edge_heat((row, col), (row + 1, col)),
+                edge_heat((row, col + 1), (row + 1, col + 1)),
+            ),
+            WallOrientation::Vertical => (
+                edge_heat((row, col), (row, col + 1)),
+                edge_heat((row + 1, col), (row + 1, col + 1)),
+            ),
+        };
+        // A wall blocks two adjacent pawn edges.  The max edge is the main reason
+        // to search it; the weaker edge adds local interpolation without making
+        // unrelated walls hot.
+        a.max(b).saturating_add(a.min(b) / 4)
+    }
+}
+
+// ── Corridor attention constants ───────────────────────────────────────────────
+
+/// Heat given to any square on a player's shortest path (delta = 0).
+/// Combined two-player ceiling: `2 × CAT_CORRIDOR_CM = 400 cm`.
+const CAT_CORRIDOR_CM: u16 = 200;
+
+/// Exact and near-shortest corridors are considered search-relevant.
+/// Larger detours are deliberately zero so attention does not bleed across the board.
+const MAX_RELEVANT_CORRIDOR_DELTA: u16 = 3;
+const BOTTLENECK_CORRIDOR_DELTA: u16 = 2;
+const BOTTLENECK_BONUS_CM: u16 = 40;
 
 /// Bit `sq` set iff a pawn on `sq` may step in that direction.
 #[derive(Clone, Copy, Default)]
@@ -120,108 +181,190 @@ fn flood_to_goal(start_sq: u8, masks: DirMasks, goal_mask: u128) -> (bool, u128)
     (false, reached)
 }
 
-#[inline]
-fn predecessor_flood(bit: u32, reached: u128, masks: DirMasks) -> u32 {
-    if bit >= FLOOD_STRIDE {
-        let p = bit - FLOOD_STRIDE;
-        if reached & (1u128 << p) != 0 && masks.south & (1u128 << p) != 0 {
-            return p;
-        }
-    }
-    if bit + FLOOD_STRIDE < 128 {
-        let p = bit + FLOOD_STRIDE;
-        if reached & (1u128 << p) != 0 && masks.north & (1u128 << p) != 0 {
-            return p;
-        }
-    }
-    if bit > 0 {
-        let p = bit - 1;
-        if reached & (1u128 << p) != 0 && masks.east & (1u128 << p) != 0 {
-            return p;
-        }
-    }
-    if bit + 1 < 128 {
-        let p = bit + 1;
-        if reached & (1u128 << p) != 0 && masks.west & (1u128 << p) != 0 {
-            return p;
-        }
-    }
-    bit
-}
+// ── Corridor attention distance-field helpers ─────────────────────────────────
 
-/// Accumulate one player's contribution into `out` (CAT forward pass + back-prop).
-///
-/// **Forward pass** — level-BFS from the player's pawn:
-///   Each reached square accumulates `attention_weight_cm(dist)` = `100 - min(dist*3, 30)`.
-///   Adjacent squares score 100 cm; squares ≥10 steps away floor at 70 cm.
-///
-/// **Back-propagation** — shortest-path reconstruction:
-///   After the goal row is first touched, walk `parent[]` back to the pawn and add
-///   the same `attention_weight_cm(dist)` a second time to every square on that path.
-///   On-path squares near the pawn thus score up to 200 cm; far ones 140 cm.
-///
-/// Call twice (P1, P2) and sum into the same `out` array → unified heat map.
-fn add_player_attention(
-    board: &Board,
-    player: Player,
-    masks: DirMasks,
-    out: &mut ConsensusAttention,
-    dist: &mut [u8; 81],
-    parent: &mut [u8; 81],
-) {
-    let (sr, sc) = board.pawn(player);
-    let start = square_index(sr, sc);
-    let goal_mask = goal_square_mask(player);
-
-    dist.fill(u8::MAX);
-    parent.fill(u8::MAX);
-    dist[start as usize] = 0;
-
+/// Fill `dist_from[sq]` with the BFS distance from `start` to every reachable square.
+/// Unreachable squares keep `u8::MAX`.
+fn fill_dist_from_sq(start: u8, masks: DirMasks, dist_from: &mut [u8; 81]) {
+    dist_from.fill(u8::MAX);
+    dist_from[start as usize] = 0;
     let mut reached = flood_bit_sq(start);
-    out[start as usize] = out[start as usize].saturating_add(attention_weight_cm(0));
-
     let mut frontier = reached;
     let mut layer = 0u8;
-    let mut goal_sq = None;
-
-    while frontier != 0 && goal_sq.is_none() {
+    while frontier != 0 {
         layer += 1;
         let new = expand_frontier(frontier, masks) & !reached & FLOOD_PLAYABLE;
         if new == 0 {
             break;
         }
-
-        let w = attention_weight_cm(layer);
         let mut bits = new;
         while bits != 0 {
             let fb = bits.trailing_zeros();
             bits &= bits - 1;
             let sq = flood_sq_from_bit(fb).expect("playable flood bit");
-            dist[sq as usize] = layer;
-            parent[sq as usize] = flood_sq_from_bit(predecessor_flood(fb, reached, masks))
-                .expect("predecessor on playable square");
-            out[sq as usize] = out[sq as usize].saturating_add(w);
-            if goal_sq.is_none() && goal_mask & (1u128 << fb) != 0 {
-                goal_sq = Some(sq);
-            }
+            dist_from[sq as usize] = layer;
         }
-
         reached |= new;
         frontier = new;
     }
+}
 
-    if let Some(mut sq) = goal_sq {
-        loop {
-            let w = attention_weight_cm(dist[sq as usize]);
-            out[sq as usize] = out[sq as usize].saturating_add(w);
-            if sq == start {
-                break;
-            }
-            let p = parent[sq as usize];
-            if p == u8::MAX {
-                break;
-            }
-            sq = p;
+/// Fill `dist_to[sq]` with the BFS distance from `sq` to any goal-row cell for
+/// `player`.  Since Quoridor movement is symmetric (walls block both directions),
+/// this equals a forward BFS seeded from all nine goal squares.
+/// Unreachable squares keep `u8::MAX`.
+fn fill_dist_to_goal_row(player: Player, masks: DirMasks, dist_to: &mut [u8; 81]) {
+    let grow = goal_row(player);
+    dist_to.fill(u8::MAX);
+
+    let mut reached = 0u128;
+    for c in 0..9u8 {
+        let sq = square_index(grow, c);
+        dist_to[sq as usize] = 0;
+        reached |= flood_bit_sq(sq);
+    }
+
+    let mut frontier = reached;
+    let mut layer = 0u8;
+    while frontier != 0 {
+        layer += 1;
+        let new = expand_frontier(frontier, masks) & !reached & FLOOD_PLAYABLE;
+        if new == 0 {
+            break;
+        }
+        let mut bits = new;
+        while bits != 0 {
+            let fb = bits.trailing_zeros();
+            bits &= bits - 1;
+            let sq = flood_sq_from_bit(fb).expect("playable flood bit");
+            dist_to[sq as usize] = layer;
+        }
+        reached |= new;
+        frontier = new;
+    }
+}
+
+fn corridor_heat(delta: u16) -> u16 {
+    if delta > MAX_RELEVANT_CORRIDOR_DELTA {
+        return 0;
+    }
+    // Focused log-shaped decay: exact shortest corridors stay hot, delta 1-3
+    // stays searchable, and anything farther is zero instead of polluting LMR.
+    let denom = 1.0 + f32::from(delta) * f32::from(delta + 2).log2();
+    (f32::from(CAT_CORRIDOR_CM) / denom).round().max(1.0) as u16
+}
+
+fn neighbor_squares(sq: u8, masks: DirMasks, out: &mut [u8; 4]) -> usize {
+    let bit = flood_bit_sq(sq);
+    let mut n = 0usize;
+    if masks.north & bit != 0 {
+        out[n] = sq - 9;
+        n += 1;
+    }
+    if masks.south & bit != 0 {
+        out[n] = sq + 9;
+        n += 1;
+    }
+    if masks.east & bit != 0 {
+        out[n] = sq + 1;
+        n += 1;
+    }
+    if masks.west & bit != 0 {
+        out[n] = sq - 1;
+        n += 1;
+    }
+    n
+}
+
+fn corridor_delta(
+    sq: u8,
+    dist_from_pawn: &[u8; 81],
+    dist_to_goal: &[u8; 81],
+    shortest_to_goal: u8,
+) -> Option<u16> {
+    let from = dist_from_pawn[sq as usize];
+    let to = dist_to_goal[sq as usize];
+    if from == u8::MAX || to == u8::MAX || shortest_to_goal == u8::MAX {
+        return None;
+    }
+    Some((u16::from(from) + u16::from(to)).saturating_sub(u16::from(shortest_to_goal)))
+}
+
+fn reasonable_forward_continuations(
+    sq: u8,
+    masks: DirMasks,
+    dist_from_pawn: &[u8; 81],
+    dist_to_goal: &[u8; 81],
+    shortest_to_goal: u8,
+) -> u8 {
+    let from = dist_from_pawn[sq as usize];
+    let to = dist_to_goal[sq as usize];
+    if from == u8::MAX || to == 0 || to == u8::MAX {
+        return 0;
+    }
+    let mut neighbors = [0u8; 4];
+    let n = neighbor_squares(sq, masks, &mut neighbors);
+    let mut count = 0u8;
+    for &next in &neighbors[..n] {
+        let next_from = dist_from_pawn[next as usize];
+        let next_to = dist_to_goal[next as usize];
+        if next_from == from.saturating_add(1)
+            && next_to < to
+            && corridor_delta(next, dist_from_pawn, dist_to_goal, shortest_to_goal)
+                .is_some_and(|d| d <= MAX_RELEVANT_CORRIDOR_DELTA)
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
+/// Accumulate one player's corridor heat into `out`.
+///
+/// For each reachable square `sq`:
+///   - `delta = dist_from[sq] + dist_to[sq] - shortest`
+///   - `delta == 0`: square lies on at least one shortest path to any goal square.
+///   - small delta: square lies on a near-shortest route.
+///   - large delta or unreachable: zero heat, so dead walls can be pruned hard.
+///
+/// Squares not reachable from the pawn contribute nothing.
+fn add_player_corridor_attention(
+    board: &Board,
+    player: Player,
+    masks: DirMasks,
+    out: &mut CorridorAttention,
+    dist_from_pawn: &mut [u8; 81],
+    dist_to_goal: &mut [u8; 81],
+) {
+    let (sr, sc) = board.pawn(player);
+    let start = square_index(sr, sc);
+
+    fill_dist_from_sq(start, masks, dist_from_pawn);
+    fill_dist_to_goal_row(player, masks, dist_to_goal);
+
+    let shortest_to_goal = dist_to_goal[start as usize]; // u8::MAX if pawn is trapped
+
+    for sq in 0u8..81 {
+        let Some(delta) = corridor_delta(sq, dist_from_pawn, dist_to_goal, shortest_to_goal) else {
+            continue;
+        };
+        let heat = corridor_heat(delta);
+        if heat == 0 {
+            continue;
+        }
+
+        let idx = sq as usize;
+        let flex = reasonable_forward_continuations(
+            sq,
+            masks,
+            dist_from_pawn,
+            dist_to_goal,
+            shortest_to_goal,
+        );
+        out.square_heat[idx] = out.square_heat[idx].saturating_add(heat);
+        out.route_flex[idx] = out.route_flex[idx].saturating_add(flex);
+        if delta <= BOTTLENECK_CORRIDOR_DELTA && flex <= 1 && dist_to_goal[idx] > 0 {
+            out.bottleneck_heat[idx] = out.bottleneck_heat[idx].saturating_add(BOTTLENECK_BONUS_CM);
         }
     }
 }
@@ -231,8 +374,10 @@ fn add_player_attention(
 pub struct BfsScratch {
     visited: u128,
     queue: [u8; 81],
-    depth: [u8; 81],
-    parent: [u8; 81],
+    /// Scratch for corridor forward BFS (distance from pawn to each square).
+    dist_from_pawn: [u8; 81],
+    /// Scratch for corridor reverse BFS (distance from each square to goal row).
+    dist_to_goal: [u8; 81],
 }
 
 impl Default for BfsScratch {
@@ -246,43 +391,84 @@ impl BfsScratch {
         Self {
             visited: 0,
             queue: [0; 81],
-            depth: [0; 81],
-            parent: [0; 81],
+            dist_from_pawn: [0; 81],
+            dist_to_goal: [0; 81],
         }
     }
 
-    /// Build the Consensus Attention Table (CAT) for this position.
+    /// Build corridor attention for search ordering, LMR, and futility.
     ///
-    /// Runs `add_player_attention` for both players and sums the results into a
-    /// single `[u16; 81]` heat map (centi-units).  Used in search for move ordering
-    /// and LMR only — never called from perft or move generation.
+    /// For each player, runs a forward BFS from its pawn and a backward BFS from
+    /// all cells in its goal row. This considers every reachable winning square,
+    /// not the first goal touched by BFS.
     ///
-    /// Score ranges per square:
-    /// - On-path, close (dist ≤ 1): up to **200 cm** per player → 400 cm combined.
-    /// - On-path, far (dist ≥ 10): 140 cm per player.
-    /// - Off-path, any dist: 70–100 cm per player.
+    /// ```text
+    /// delta = dist_from_pawn[sq] + dist_to_goal[sq] - shortest
+    /// heat  = logarithmic_decay(delta), for delta <= MAX_RELEVANT_CORRIDOR_DELTA
+    /// ```
     ///
-    /// See `docs/video/CAT-SPEC.md` for full specification.
-    pub fn build_consensus_attention(&mut self, board: &Board) -> ConsensusAttention {
+    /// Unreachable and far-detour squares stay at zero so dead walls can be
+    /// reduced or pruned aggressively.
+    pub fn build_corridor_attention(&mut self, board: &Board) -> CorridorAttention {
         let masks = DirMasks::from_board(board);
-        let mut cat = [0u16; 81];
-        add_player_attention(
+        let mut attention = CorridorAttention::default();
+        add_player_corridor_attention(
             board,
             Player::One,
             masks,
-            &mut cat,
-            &mut self.depth,
-            &mut self.parent,
+            &mut attention,
+            &mut self.dist_from_pawn,
+            &mut self.dist_to_goal,
         );
-        add_player_attention(
+        add_player_corridor_attention(
             board,
             Player::Two,
             masks,
-            &mut cat,
-            &mut self.depth,
-            &mut self.parent,
+            &mut attention,
+            &mut self.dist_from_pawn,
+            &mut self.dist_to_goal,
         );
-        cat
+        attention
+    }
+
+    /// Count low-flex squares on this player's exact/near-shortest corridors.
+    /// Higher means the player is easier to cage if the opponent still has walls.
+    pub fn corridor_bottleneck_count(&mut self, board: &Board, player: Player) -> u8 {
+        let masks = DirMasks::from_board(board);
+        let (sr, sc) = board.pawn(player);
+        let start = square_index(sr, sc);
+        fill_dist_from_sq(start, masks, &mut self.dist_from_pawn);
+        fill_dist_to_goal_row(player, masks, &mut self.dist_to_goal);
+        let shortest_to_goal = self.dist_to_goal[start as usize];
+        if shortest_to_goal == u8::MAX {
+            return 8;
+        }
+
+        let mut bottlenecks = 0u8;
+        for sq in 0u8..81 {
+            let Some(delta) = corridor_delta(
+                sq,
+                &self.dist_from_pawn,
+                &self.dist_to_goal,
+                shortest_to_goal,
+            ) else {
+                continue;
+            };
+            if delta > BOTTLENECK_CORRIDOR_DELTA || self.dist_to_goal[sq as usize] == 0 {
+                continue;
+            }
+            let flex = reasonable_forward_continuations(
+                sq,
+                masks,
+                &self.dist_from_pawn,
+                &self.dist_to_goal,
+                shortest_to_goal,
+            );
+            if flex <= 1 {
+                bottlenecks = bottlenecks.saturating_add(1);
+            }
+        }
+        bottlenecks.min(8)
     }
 
     /// Reachability only — bitwise flood to goal row.
@@ -549,11 +735,11 @@ mod naive_reference {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::naive_reference::{
         both_players_reach_goals_naive, can_reach_goal_naive, flood_fill_naive,
         shortest_distance_naive,
     };
+    use super::*;
     use crate::board::WallOrientation;
     use crate::grid::set_wall;
 
@@ -759,26 +945,112 @@ mod tests {
     }
 
     #[test]
-    fn cat_startpos_has_hot_center() {
-        let board = Board::new();
-        let mut scratch = BfsScratch::new();
-        let cat = scratch.build_consensus_attention(&board);
-        assert!(cat[square_index(0, 4) as usize] > 0);
-        assert!(cat[square_index(8, 4) as usize] > 0);
-        assert!(cat[square_index(4, 4) as usize] > 0);
-    }
-
-    #[test]
-    fn attention_weight_clamps_at_distance_10() {
-        assert_eq!(attention_weight_cm(0), 100);
-        assert_eq!(attention_weight_cm(10), 70);
-        assert_eq!(attention_weight_cm(20), 70);
-    }
-
-    #[test]
     fn ishtar_component_reuse_same_board() {
         let board = Board::new();
         let mut scratch = BfsScratch::new();
         assert!(scratch.both_players_reach_goals(&board));
+    }
+
+    // ── Corridor attention tests ──────────────────────────────────────────────
+
+    #[test]
+    fn corridor_attention_startpos_center_hotter_than_corner() {
+        let board = Board::new();
+        let mut scratch = BfsScratch::new();
+        let cat = scratch.build_corridor_attention(&board);
+        // e5 (row 4, col 4) is on the shortest path for both players → max heat.
+        let center = cat.square_heat(4, 4);
+        // a1 (row 0, col 0) is too far from both shortest corridors → zero heat.
+        let corner = cat.square_heat(0, 0);
+        assert!(
+            center > corner,
+            "center={center} should be hotter than corner={corner}"
+        );
+        assert_eq!(corner, 0, "far detours should not bleed attention");
+    }
+
+    #[test]
+    fn corridor_attention_on_path_squares_at_max_heat() {
+        let board = Board::new();
+        let mut scratch = BfsScratch::new();
+        let cat = scratch.build_corridor_attention(&board);
+        // At startpos the e-file (col 4) is the direct path for both pawns.
+        // e1..e9 (rows 0..8, col 4) are all delta=0 for both → 200+200 = 400 cm.
+        for row in 0u8..9 {
+            let heat = cat.square_heat(row, 4);
+            assert_eq!(
+                heat, 400,
+                "e-file row {row} should be 400 cm (on-path for both), got {heat}"
+            );
+        }
+    }
+
+    #[test]
+    fn corridor_attention_near_path_decays_then_cuts_off() {
+        let board = Board::new();
+        let mut scratch = BfsScratch::new();
+        let cat = scratch.build_corridor_attention(&board);
+        let on_path = cat.square_heat(4, 4);
+        let near_path = cat.square_heat(4, 3);
+        let far_path = cat.square_heat(4, 0);
+        assert!(
+            near_path < on_path && near_path > 0,
+            "near-path col3 row4 ({near_path}) should be nonzero and below on-path {on_path}"
+        );
+        assert_eq!(far_path, 0, "delta-4 detours should be cold, got {far_path}");
+    }
+
+    #[test]
+    fn corridor_attention_dist_fields_match_naive_distances() {
+        // Verify fill_dist_from_sq agrees with shortest_distance_naive.
+        let board = Board::new();
+        let masks = DirMasks::from_board(&board);
+        let mut dist_from = [u8::MAX; 81];
+        let start = square_index(0, 4); // e1
+        fill_dist_from_sq(start, masks, &mut dist_from);
+
+        // e9 (row 8, col 4) should be 8 steps from e1.
+        assert_eq!(dist_from[square_index(8, 4) as usize], 8);
+        // a1 (row 0, col 0) is 4 steps from e1.
+        assert_eq!(dist_from[square_index(0, 0) as usize], 4);
+
+        // Verify fill_dist_to_goal_row agrees with shortest_distance for P1.
+        let mut dist_to = [u8::MAX; 81];
+        fill_dist_to_goal_row(Player::One, masks, &mut dist_to);
+        // e1 (start, row 0, col 4) is 8 steps from P1's goal row 8.
+        assert_eq!(dist_to[square_index(0, 4) as usize], 8);
+        // Goal row itself is 0 steps away.
+        assert_eq!(dist_to[square_index(8, 4) as usize], 0);
+    }
+
+    #[test]
+    fn corridor_attention_marks_multiple_equal_lanes() {
+        let mut board = Board::new();
+        set_wall(&mut board, 3, 4, WallOrientation::Horizontal, true);
+        let mut scratch = BfsScratch::new();
+        let cat = scratch.build_corridor_attention(&board);
+
+        let left_lane = cat.square_heat(4, 3);
+        let right_lane = cat.square_heat(4, 5);
+        assert!(left_lane > 0, "left detour lane should be searchable");
+        assert!(right_lane > 0, "right detour lane should be searchable");
+    }
+
+    #[test]
+    fn corridor_wall_heat_prefers_shared_corridor_edges() {
+        let board = Board::new();
+        let mut scratch = BfsScratch::new();
+        let cat = scratch.build_corridor_attention(&board);
+
+        let central = cat.wall_edge_heat(3, 4, WallOrientation::Horizontal);
+        let passive = cat.wall_edge_heat(0, 0, WallOrientation::Horizontal);
+        assert!(
+            central > passive,
+            "central corridor wall {central} should outrank passive wall {passive}"
+        );
+        assert!(
+            passive <= 50,
+            "passive delta-3 wall should only have tiny heat, got {passive}"
+        );
     }
 }

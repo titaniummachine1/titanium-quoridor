@@ -26,7 +26,10 @@ pub enum WallOrientation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Move {
-    Pawn { row: Row, col: Column },
+    Pawn {
+        row: Row,
+        col: Column,
+    },
     Wall {
         row: Row,
         col: Column,
@@ -220,5 +223,4 @@ mod tests {
         assert_eq!(board, before);
         assert_eq!(board.hash, before.hash);
     }
-
 }

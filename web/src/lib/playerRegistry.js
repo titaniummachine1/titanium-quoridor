@@ -32,10 +32,11 @@ const TITANIUM_ENGINE = {
 
 const TITANIUM_MINIMAX_ENGINE = {
   kind: 'titanium',
-  name: 'Titanium (Minimax, Rust)',
+  name: 'Titanium Hybrid (strongest)',
   key: PlayerType.TitaniumMinimax,
   engineMode: 'minimax',
-  tooltip: 'Local Rust minimax engine — `titanium genmove --engine minimax`',
+  tooltip:
+    'Full pipeline: MCTS opening/book → minimax+CAT v2 (`cargo build --release` in engine/)',
 };
 
 const PLACEHOLDER_ENGINES = [
@@ -79,7 +80,7 @@ export function getPlayerOptionGroups() {
         },
         {
           value: PlayerType.TitaniumMinimax,
-          label: 'Titanium (Minimax, Rust)',
+          label: 'Titanium Hybrid (strongest)',
           disabled: false,
           tooltip: TITANIUM_MINIMAX_ENGINE.tooltip,
         },

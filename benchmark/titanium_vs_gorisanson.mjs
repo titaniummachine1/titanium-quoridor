@@ -33,7 +33,7 @@ async function main() {
   const opts = parseArgs(process.argv);
   const budget = { timeSec: BENCH_TIME_SEC, maxSimulations: BENCH_MAX_SIMULATIONS };
 
-  const titanium = { id: RUST_TITANIUM_ID };
+  const titanium = { id: RUST_TITANIUM_ID, engine: 'minimax' };
   const gorisanson = { id: GORISANSON_ID };
 
   const live = {

@@ -217,13 +217,7 @@ mod tests {
     #[test]
     fn vertical_d8v_blocks_black_left_from_e9() {
         let mut board = Board::new();
-        set_wall(
-            &mut board,
-            7,
-            3,
-            WallOrientation::Vertical,
-            true,
-        );
+        set_wall(&mut board, 7, 3, WallOrientation::Vertical, true);
         board.side_to_move = crate::board::Player::Two;
         // P2 at e9 (internal 8,4) — left to d9 must be blocked by d8v.
         assert!(!can_step(&board, 8, 4, 0, -1));

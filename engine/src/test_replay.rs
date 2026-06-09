@@ -10,24 +10,28 @@ fn parse_algebraic(move_str: &str) -> Option<Move> {
     if chars.len() < 2 {
         return None;
     }
-    
+
     let col = (chars[0] as u8).saturating_sub(b'a') as u8;
     if col > 8 {
         return None;
     }
-    
+
     let row = (chars[1] as u8).saturating_sub(b'1') as u8;
     if row > 8 {
         return None;
     }
-    
+
     if chars.len() >= 3 {
         let orientation = match chars.get(2) {
             Some(&'h') => WallOrientation::Horizontal,
             Some(&'v') => WallOrientation::Vertical,
             _ => return None,
         };
-        Some(Move::Wall { row, col, orientation })
+        Some(Move::Wall {
+            row,
+            col,
+            orientation,
+        })
     } else {
         Some(Move::Pawn { row, col })
     }
@@ -75,26 +79,37 @@ fn test_replay_legality() {
 
     for (i, move_str) in moves.iter().enumerate() {
         let legal_count = generate_legal_moves_slice(&mut board, &mut buf, &mut bfs);
-        
+
         // Parse the move
-        let mv = parse_algebraic(move_str).expect(&format!("Failed to parse move {}: {}", i, move_str));
-        
+        let mv =
+            parse_algebraic(move_str).expect(&format!("Failed to parse move {}: {}", i, move_str));
+
         // Check if move is in legal moves
         let is_legal = buf[..legal_count].contains(&mv);
-        
+
         if !is_legal {
-            panic!("Move {} ({}) is not legal! Legal moves: {:?}", i, move_str, 
-                   buf[..legal_count].iter().map(|m| format_move(*m)).collect::<Vec<_>>());
+            panic!(
+                "Move {} ({}) is not legal! Legal moves: {:?}",
+                i,
+                move_str,
+                buf[..legal_count]
+                    .iter()
+                    .map(|m| format_move(*m))
+                    .collect::<Vec<_>>()
+            );
         }
-        
+
         // Make the move
         let _undo = board.make_move(mv);
-        
+
         // Verify both players can still reach goals after each move
         if !bfs.both_players_reach_goals(&board) {
-            panic!("After move {} ({}), one player cannot reach their goal!", i, move_str);
+            panic!(
+                "After move {} ({}), one player cannot reach their goal!",
+                i, move_str
+            );
         }
     }
-    
+
     println!("All {} moves in replay are legal", moves.len());
 }

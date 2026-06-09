@@ -4,9 +4,9 @@ use std::env;
 use std::time::Instant;
 
 use titanium::{
-    Board, Engine, GenmoveConfig, GenmoveEngine, MctsConfig, SearchConfig, generate_legal_moves,
-    genmove_algebraic, perft_divide, DEFAULT_MAX_NODES, DEFAULT_TIME_MS, MCTS_DEFAULT_MAX_SIMULATIONS,
-    MCTS_DEFAULT_UCT,
+    generate_legal_moves, genmove_algebraic, perft_divide, Board, Engine, GenmoveConfig,
+    GenmoveEngine, MctsConfig, SearchConfig, DEFAULT_MAX_NODES, DEFAULT_TIME_MS,
+    MCTS_DEFAULT_MAX_SIMULATIONS, MCTS_DEFAULT_UCT,
 };
 
 fn main() {
@@ -38,7 +38,7 @@ fn print_usage() {
     println!("  titanium perft-race <sec>              — max depth within time budget");
     println!("  titanium perft-id [depth]              — iterative deepening perft 0..depth");
     println!("  titanium moves                         — list legal moves at startpos");
-    println!("  titanium genmove [moves...] [--engine mcts|minimax|greedy]");
+    println!("  titanium genmove [moves...] [--engine mcts|minimax|greedy] [--cat]");
     println!("              [--time SEC] [--sims N] [--uct F] [--nodes N] [--log]");
     println!("              — default: Gorisanson-style MCTS in Rust");
 }
@@ -57,7 +57,11 @@ fn parse_cli(args: &[String]) -> CliArgs {
     let mut i = 0usize;
     while i < args.len() {
         if args[i] == "--threads" {
-            threads = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+            threads = args
+                .get(i + 1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1)
+                .max(1);
             i += 2;
             continue;
         }
@@ -128,7 +132,11 @@ fn run_bench(args: &[String]) {
         .get(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PERFT_DEPTH);
-    let iterations: u32 = cli.positional.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let iterations: u32 = cli
+        .positional
+        .get(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
     let board = Board::new();
     let mut engine = make_engine(cli.threads);
 
@@ -248,11 +256,14 @@ fn parse_genmove_config(args: &[String]) -> (GenmoveConfig, Vec<String>) {
             max_simulations: MCTS_DEFAULT_MAX_SIMULATIONS,
             uct: MCTS_DEFAULT_UCT,
             log,
+            use_cat_guidance: false, // bridge is activated by the genmove handoff
+            book_hint: None,
         },
         minimax: SearchConfig {
             time_ms: DEFAULT_TIME_MS,
             max_nodes: DEFAULT_MAX_NODES,
             log,
+            book_hint: None,
         },
     };
     let mut moves = Vec::new();
@@ -299,6 +310,10 @@ fn parse_genmove_config(args: &[String]) -> (GenmoveConfig, Vec<String>) {
         } else if arg == "--log" {
             config.mcts.log = true;
             config.minimax.log = true;
+            i += 1;
+            continue;
+        } else if arg == "--cat" || arg == "--cat-guidance" || arg == "--bridge-mcts" {
+            config.mcts.use_cat_guidance = true;
             i += 1;
             continue;
         } else if arg.starts_with("--") {

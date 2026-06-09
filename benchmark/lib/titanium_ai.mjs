@@ -43,7 +43,28 @@ function metaFromInfo(info) {
     whiteDist: info?.whiteDist,
     blackDist: info?.blackDist,
     rootWinRate: info?.rootWinRate,
+    rootScore: info?.rootScore,
+    searchDepth: info?.searchDepth,
+    depthLog: info?.depthLog,
+    aspirationFails: info?.aspirationFails,
+    lmrReSearches: info?.lmrReSearches,
+    mateExtensions: info?.mateExtensions,
+    pvMateFailures: info?.pvMateFailures,
     elapsedMs: info?.elapsedMs,
+  };
+}
+
+function parseDepthLine(line) {
+  const m = /^info depth (\d+) score (-?\d+) nodes (\d+) asp (\d+) lmr (\d+)/.exec(line.trim());
+  if (!m) {
+    return null;
+  }
+  return {
+    depth: Number(m[1]),
+    score: Number(m[2]),
+    nodes: Number(m[3]),
+    aspirationFails: Number(m[4]),
+    lmrReSearches: Number(m[5]),
   };
 }
 
@@ -64,7 +85,7 @@ function parseProgressLine(line) {
 
 /**
  * @param {string[]} algebraicMoves
- * @param {{ timeSec?: number, maxSims?: number, uct?: number, engine?: string, log?: boolean, onProgress?: (p: { simulations: number, elapsedMs: number, rootWinRate?: number }) => void }} [opts]
+ * @param {{ timeSec?: number, maxSims?: number, uct?: number, engine?: string, log?: boolean, useCatGuidance?: boolean, onProgress?: (p: { simulations: number, elapsedMs: number, rootWinRate?: number }) => void }} [opts]
  */
 export async function chooseTitaniumMove(algebraicMoves = [], opts = {}) {
   const bin = resolveBinary();
@@ -90,10 +111,22 @@ export async function chooseTitaniumMove(algebraicMoves = [], opts = {}) {
   if (log) {
     args.push('--log');
   }
+  if (opts.useCatGuidance) {
+    args.push('--cat');
+  }
+
+  const childEnv = { ...process.env };
+  if (opts.disableBridge) {
+    childEnv.TITANIUM_BRIDGE = '0';
+  }
+  if (opts.disableBook) {
+    childEnv.TITANIUM_DISABLE_BOOK = '1';
+  }
 
   const child = spawn(bin, args, {
     cwd: ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: childEnv,
   });
 
   let stdoutText = '';
@@ -117,6 +150,10 @@ export async function chooseTitaniumMove(algebraicMoves = [], opts = {}) {
       const progress = parseProgressLine(line);
       if (progress && typeof opts.onProgress === 'function') {
         opts.onProgress(progress);
+      }
+      const depth = parseDepthLine(line);
+      if (depth && typeof opts.onDepth === 'function') {
+        opts.onDepth(depth);
       }
     }
   });

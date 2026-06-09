@@ -13,7 +13,7 @@ import {
   createGorisansonGame,
   winnerIndex,
 } from './lib/gorisanson_ai.mjs';
-import { ISHTAR_VISITS, requestIshtarMove } from './lib/ishtar_remote.mjs';
+import { requestIshtarMove, resolveIshtarOptions } from './lib/ishtar_remote.mjs';
 import { chooseTitaniumMove } from './lib/titanium_ai.mjs';
 import { BENCH_MAX_SIMULATIONS, BENCH_TIME_SEC } from './lib/bench_limits.mjs';
 import {
@@ -61,7 +61,7 @@ async function playOneGame(titaniumSide, opts) {
   const algebraicHistory = [];
   let plies = 0;
   const stats = { ishtarMs: 0, titaniumMs: 0, rustMoves: 0 };
-  const ishtarVisits = ISHTAR_VISITS[opts.ishtarPreset] ?? ISHTAR_VISITS.short;
+  const ishtarOpts = resolveIshtarOptions(opts.ishtarPreset);
 
   while (winnerIndex(game) === null && plies < MAX_PLIES) {
     const side = game.pawnOfTurn.index;
@@ -83,11 +83,15 @@ async function playOneGame(titaniumSide, opts) {
       result = meta;
     } else {
       const started = performance.now();
-      const algebraic = await requestIshtarMove(algebraicHistory, { visits: ishtarVisits });
+      const algebraic = await requestIshtarMove(algebraicHistory, { preset: opts.ishtarPreset });
       elapsedMs = performance.now() - started;
       stats.ishtarMs += elapsedMs;
       move = actionToGorisansonMove(parseAlgebraic(algebraic));
-      result = { stoppedBy: 'remote', simulations: ishtarVisits };
+      result = {
+        stoppedBy: 'remote',
+        simulations: ishtarOpts.visits,
+        parallelism: ishtarOpts.parallelism,
+      };
     }
 
     applyGorisansonMove(game, move);
@@ -125,11 +129,11 @@ async function playOneGame(titaniumSide, opts) {
 
 async function main() {
   const opts = parseArgs(process.argv);
-  const ishtarVisits = ISHTAR_VISITS[opts.ishtarPreset] ?? ISHTAR_VISITS.short;
+  const ishtarOpts = resolveIshtarOptions(opts.ishtarPreset);
 
   console.log('Rust Titanium vs Ishtar');
   console.log(
-    `  ${opts.games} games · Rust genmove · Ishtar ${opts.ishtarPreset} (${ishtarVisits} visits)`,
+    `  ${opts.games} games · Rust genmove · Ishtar ${ishtarOpts.label} (${ishtarOpts.visits.toLocaleString()} visits · ${ishtarOpts.parallelism} threads)`,
   );
 
   let titaniumWins = 0;

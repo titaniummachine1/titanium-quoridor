@@ -50,7 +50,7 @@ export function formatScore(score) {
   if (score == null || !Number.isFinite(score)) {
     return '?';
   }
-  if (Math.abs(score) >= 1000) {
+  if (Math.abs(score) >= 19_500) {
     return score > 0 ? '#+' : '#-';
   }
   return score > 0 ? `+${score}` : String(score);

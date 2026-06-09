@@ -15,7 +15,7 @@ import { chooseTitaniumMove } from './titanium_ai.mjs';
 import { RUST_TITANIUM_ID, GORISANSON_ID, assertRustTitaniumId } from './engine_ids.mjs';
 import { encodeReplayFromAlgebraic, formatReplayBlock } from './replay_code.mjs';
 import { termLine, termThinking } from './terminal_log.mjs';
-import { printPlyCompact, printFinalPosition } from './terminal_reporter.mjs';
+import { printPlyCompact, printFinalPosition, printSearchDepth } from './terminal_reporter.mjs';
 import { resolveThinkBudget } from './bench_limits.mjs';
 
 const MAX_PLIES = 250;
@@ -25,7 +25,8 @@ function engineLabel(cfg, budget) {
     return `Gorisanson MCTS (${budget.timeSec}s/${formatSimsCap(budget.maxSimulations)})`;
   }
   if (cfg.id === RUST_TITANIUM_ID) {
-    return `Rust Titanium MCTS (${budget.timeSec}s/${formatSimsCap(budget.maxSimulations)})`;
+    const mode = cfg.engine === 'minimax' ? 'Minimax' : 'MCTS';
+    return `Rust Titanium ${mode} (${budget.timeSec}s/${formatSimsCap(budget.maxSimulations)})`;
   }
   return cfg.id;
 }
@@ -86,15 +87,29 @@ async function chooseMove(game, algebraicHistory, playerConfig, ply, options) {
     const log = options.logSearch !== false;
     const started = performance.now();
     let lastProgressMs = -1;
+    const engineMode = playerConfig.engine ?? options.engine;
     const { move: algebraic, meta } = await chooseTitaniumMove(algebraicHistory, {
       log,
       ply,
+      engine: engineMode,
       timeSec: budget.timeSec,
       maxSims: budget.maxSimulations,
       uct: playerConfig.uct,
+      disableBook: playerConfig.disableBook ?? options.disableBook,
+      disableBridge: playerConfig.disableBridge ?? options.disableBridge,
+      useCatGuidance: playerConfig.useCatGuidance ?? options.useCatGuidance,
+      onDepth:
+        logMoves && engineMode === 'minimax'
+          ? (depth) => {
+            printSearchDepth({ ply, ...depth });
+          }
+          : undefined,
       onProgress: logMoves
         ? (progress) => {
           const elapsedMs = progress.elapsedMs ?? 0;
+          if (engineMode === 'minimax') {
+            return;
+          }
           if (lastProgressMs >= 0 && elapsedMs - lastProgressMs < 900) {
             return;
           }

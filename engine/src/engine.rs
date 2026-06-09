@@ -1,9 +1,7 @@
 //! `Engine` — coordinates perft today, αβ + Lazy SMP tomorrow.
 
 use crate::board::Board;
-use crate::context::{
-    EngineLimits, SharedState, ThreadBenchResult, WorkerContext,
-};
+use crate::context::{EngineLimits, SharedState, ThreadBenchResult, WorkerContext};
 use crate::perft::{perft_fast_ctx, perft_iterative as perft_iterative_inner, perft_parallel_root};
 
 /// Titanium entry point — perft now, search later on the same layout.
@@ -30,13 +28,12 @@ impl Engine {
 
     pub fn with_threads(threads: usize) -> Self {
         let limits = EngineLimits::with_threads(threads);
-        let pool = (limits.threads > 1)
-            .then(|| {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(limits.threads)
-                    .build()
-                    .expect("rayon thread pool")
-            });
+        let pool = (limits.threads > 1).then(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(limits.threads)
+                .build()
+                .expect("rayon thread pool")
+        });
         Self {
             shared: SharedState::new(),
             limits,
@@ -93,11 +90,7 @@ impl Engine {
 
     /// Run perft at `depth` with 1 thread vs `parallel_threads` — same nodes, compare wall time.
     /// Both paths disable TT so parallel workers are not penalized vs a cached single thread.
-    pub fn bench_threads(
-        board: &Board,
-        depth: u32,
-        parallel_threads: usize,
-    ) -> ThreadBenchResult {
+    pub fn bench_threads(board: &Board, depth: u32, parallel_threads: usize) -> ThreadBenchResult {
         let parallel_threads = parallel_threads.max(2);
 
         let mut copy = board.clone();

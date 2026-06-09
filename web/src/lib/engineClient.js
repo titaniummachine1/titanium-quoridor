@@ -53,6 +53,8 @@ export class EngineClient {
     this.hasSynced = false;
     this.lastTimeMode = null;
     this.pendingSearch = null;
+    this._lastSearch = null;
+    this._reconnectAttempts = 0;
 
     this.onInfo = null;
     this.onBestMove = null;
@@ -102,13 +104,33 @@ export class EngineClient {
       }
     });
     socket.addEventListener('close', () => {
-      if (this.ws === socket) {
-        this.setStatus('error');
-        this.ws = null;
-        if (this.pendingSearch) {
-          this.pendingSearch = null;
-          this.onError?.(new Error('WebSocket closed before bestmove'));
-        }
+      if (this.ws !== socket) {
+        return;
+      }
+      const wasSearching = this.outstandingSearches > 0;
+      this.ws = null;
+
+      if (wasSearching && this._lastSearch && this._reconnectAttempts < 3) {
+        this._reconnectAttempts += 1;
+        this.hasSynced = false;
+        this.outstandingSearches = 0;
+        this.pendingSearch = () => {
+          const ctx = this._lastSearch;
+          this.syncGameState({
+            moveHistory: ctx.moveHistory,
+            gameSnapshot: ctx.gameSnapshot,
+            isFreshGame: ctx.isFreshGame,
+          });
+          this.go(ctx.timeMode);
+        };
+        this.connect();
+        return;
+      }
+
+      this.setStatus('error');
+      if (this.pendingSearch || wasSearching) {
+        this.pendingSearch = null;
+        this.onError?.(new Error('WebSocket closed before bestmove'));
       }
     });
   }
@@ -164,6 +186,8 @@ export class EngineClient {
 
   requestMove({ aiSettings, gameSnapshot, moveHistory, isFreshGame }) {
     const timeMode = aiSettings?.timeToMove;
+    this._lastSearch = { aiSettings, gameSnapshot, moveHistory, isFreshGame, timeMode };
+    this._reconnectAttempts = 0;
     const runSearch = () => {
       if (!this.hasSynced) {
         this.syncGameState({ moveHistory, gameSnapshot, isFreshGame });
@@ -232,7 +256,11 @@ export class EngineClient {
   }
 
   onMessage(rawMessage) {
-    if (/log Error/i.test(rawMessage) && !/log Error: WARNING:tensorflow/i.test(rawMessage)) {
+    const isBenignLog =
+      /\bWARN\b/i.test(rawMessage) ||
+      /already-known hash/i.test(rawMessage) ||
+      /tensorflow/i.test(rawMessage);
+    if (/log Error/i.test(rawMessage) && !isBenignLog) {
       this.setStatus('error');
       this.onError?.(new Error(rawMessage));
       return;
@@ -260,6 +288,7 @@ export class EngineClient {
     }
 
     this.outstandingSearches = Math.max(0, this.outstandingSearches - 1);
+    this._reconnectAttempts = 0;
     this.setStatus('idle');
 
     const moveText = bestMoveMatch[1].trim().split(/\s+/)[0];
