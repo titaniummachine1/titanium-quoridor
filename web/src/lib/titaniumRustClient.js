@@ -112,17 +112,18 @@ export class TitaniumEngineClient {
             }
 
             if (data.type === 'info') {
-              finalMeta = { ...finalMeta, ...data, stoppedBy: data.stoppedBy ?? 'mcts' };
+              const stoppedBy = data.stoppedBy ?? engineMode;
+              finalMeta = { ...finalMeta, ...data, stoppedBy };
               this.onInfo?.({
                 thinking: true,
-                mode: data.stoppedBy ?? engineMode,
+                mode: stoppedBy,
                 simulations: data.simulations,
                 nodes: data.nodes,
                 searchDepth: data.searchDepth,
                 depthLog: data.depthLog,
                 whiteDist: data.whiteDist,
                 blackDist: data.blackDist,
-                rootWinRate: data.rootWinRate,
+                rootWinRate: stoppedBy === 'minimax' ? null : data.rootWinRate,
                 rootMoves: data.rootMoves,
               });
               continue;
@@ -136,16 +137,17 @@ export class TitaniumEngineClient {
               const elapsed = performance.now() - started;
               this.pendingRequest = null;
               this.setStatus('idle');
+              const stoppedBy = finalMeta.stoppedBy ?? data.stoppedBy ?? engineMode;
               this.onInfo?.({
                 time: elapsed,
-                stoppedBy: data.stoppedBy ?? finalMeta.stoppedBy ?? engineMode,
+                stoppedBy,
                 simulations: finalMeta.simulations ?? 0,
                 nodes: finalMeta.nodes ?? 0,
                 searchDepth: finalMeta.searchDepth,
                 depthLog: finalMeta.depthLog,
                 whiteDist: finalMeta.whiteDist,
                 blackDist: finalMeta.blackDist,
-                rootWinRate: finalMeta.rootWinRate,
+                rootWinRate: stoppedBy === 'minimax' ? null : finalMeta.rootWinRate,
                 rootMoves: finalMeta.rootMoves,
                 progress: 1,
               });

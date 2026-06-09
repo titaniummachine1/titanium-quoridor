@@ -36,7 +36,7 @@ const TITANIUM_MINIMAX_ENGINE = {
   key: PlayerType.TitaniumMinimax,
   engineMode: 'minimax',
   tooltip:
-    'Full pipeline: MCTS opening/book → minimax+CAT v2 (`cargo build --release` in engine/)',
+    'Full pipeline: MCTS opening/book → minimax+CAT v3 (`cargo build --release` in engine/)',
 };
 
 const PLACEHOLDER_ENGINES = [
@@ -131,12 +131,12 @@ export function describeSearchInfo(playerType, searchInfo, engineConfigs) {
       ? `${(searchInfo.nodes ?? 0).toLocaleString()} nodes`
       : `${searchInfo.simulations?.toLocaleString() ?? '?'} sims`;
     const winPart =
-      searchInfo.rootWinRate != null
+      !isMinimax && searchInfo.rootWinRate != null
         ? ` · wr ${(searchInfo.rootWinRate * 100).toFixed(0)}%`
         : '';
     const depthPart =
       searchInfo.depthLog?.length > 0
-        ? ` · ${searchInfo.depthLog.map((e) => `d${e.depth}=${e.score > 0 ? '+' : ''}${e.score}`).join(' ')}`
+        ? ` · ${searchInfo.depthLog.map((e) => `d${e.depth}=${formatEngineScore(e.score)}`).join(' ')}`
         : searchInfo.searchDepth
           ? ` · d${searchInfo.searchDepth}`
           : '';
@@ -175,4 +175,17 @@ export function describeSearchInfo(playerType, searchInfo, engineConfigs) {
     return parts.length ? `Last think: ${parts.join(' · ')}` : '';
   }
   return '';
+}
+
+function formatEngineScore(score) {
+  if (score == null || !Number.isFinite(Number(score))) {
+    return '?';
+  }
+  const n = Number(score);
+  if (Math.abs(n) >= 19_500) {
+    const sign = n > 0 ? '+' : '-';
+    return `${sign}M${Math.max(0, 20_000 - Math.abs(n))}`;
+  }
+  const meters = n / 100;
+  return `${meters > 0 ? '+' : ''}${meters.toFixed(2)}`;
 }

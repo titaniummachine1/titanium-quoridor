@@ -44,8 +44,7 @@ export function renderGameFooter(container, state) {
       }
       if (liveSearch.depthLog?.length) {
         const last = liveSearch.depthLog[liveSearch.depthLog.length - 1];
-        const scoreStr = last.score > 0 ? '+' : '';
-        liveLine += ` · eval=${scoreStr}${last.score}`;
+        liveLine += ` · eval=${formatEngineScore(last.score)}`;
       } else if (liveSearch.rootWinRate != null) {
         liveLine += ` · wr ${(liveSearch.rootWinRate * 100).toFixed(0)}%`;
       }
@@ -116,6 +115,29 @@ function escapeHtml(text) {
     .replaceAll('>', '&gt;');
 }
 
+function isMateScore(score) {
+  return Math.abs(Number(score) || 0) >= 19_500;
+}
+
+function formatEngineScore(score) {
+  if (score == null || !Number.isFinite(Number(score))) {
+    return '?';
+  }
+  const n = Number(score);
+  if (isMateScore(n)) {
+    const sign = n > 0 ? '+' : '-';
+    return `${sign}M${Math.max(0, 20_000 - Math.abs(n))}`;
+  }
+  const meters = n / 100;
+  return `${meters > 0 ? '+' : ''}${meters.toFixed(2)}`;
+}
+
+function formatDepthLog(depthLog) {
+  return depthLog
+    .map((e) => `d${e.depth}=${formatEngineScore(e.score)}`)
+    .join(' ');
+}
+
 function isTitaniumThinkEntry(entry) {
   return entry.engine?.includes('Titanium');
 }
@@ -128,7 +150,7 @@ function formatRootMovesSummary(rootMoves) {
   const roots = [...rootMoves]
     .sort((a, b) => b.score - a.score)
     .slice(0, 5)
-    .map((r) => `${r.move}=${r.score} W${r.whiteDist}/B${r.blackDist} g${r.gain ?? 0}`)
+    .map((r) => `${r.move}=${formatEngineScore(r.score)} W${r.whiteDist}/B${r.blackDist} g${r.gain ?? 0}`)
     .join('; ');
   return ` roots: ${roots}`;
 }
@@ -142,7 +164,7 @@ function formatThinkEntry(entry) {
       ? ` W${entry.whiteDist} B${entry.blackDist}`
       : '';
 
-  const isMcts = !entry.searchDepth || entry.stoppedBy === 'mcts' || entry.stoppedBy === 'time' ||
+  const isMcts = entry.stoppedBy === 'mcts' || entry.stoppedBy === 'time' ||
     entry.stoppedBy === 'visits' || entry.stoppedBy === 'bridge' || entry.stoppedBy === 'bridge-visits' ||
     entry.stoppedBy === 'forced' || entry.stoppedBy === 'win-in-1' || entry.stoppedBy === 'opening';
 
@@ -161,7 +183,7 @@ function formatThinkEntry(entry) {
   const depth = entry.searchDepth ? ` d${entry.searchDepth}` : '';
   const dlog =
     entry.depthLog?.length
-      ? ' ' + entry.depthLog.map((e) => `d${e.depth}=${e.score > 0 ? '+' : ''}${e.score}`).join(' ')
+      ? ' ' + formatDepthLog(entry.depthLog)
       : '';
 
   return `ply${entry.ply} ${who}${engine} ${entry.move}${dist}${depth}${sims}${dlog}${rootCands}`;
