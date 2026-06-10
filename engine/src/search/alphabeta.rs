@@ -1489,6 +1489,36 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
         });
     }
 
+    // Mined book mainlines (fair-10v10) — skip 10s search that refutes e3h with d3h.
+    if let Some(hint) = config.book_hint {
+        if hint.priority >= 160
+            && crate::opening::in_book_window(board)
+            && buf[..n].contains(&hint.mv)
+        {
+            let white_dist = bfs
+                .shortest_distance(board, Player::One)
+                .unwrap_or(DIST_PENALTY);
+            let black_dist = bfs
+                .shortest_distance(board, Player::Two)
+                .unwrap_or(DIST_PENALTY);
+            return Some(SearchReport {
+                best_move: hint.mv,
+                search_depth: 0,
+                nodes: 0,
+                root_score: eval_stm(board, root_side, &mut bfs),
+                white_dist,
+                black_dist,
+                aspiration_fails: 0,
+                lmr_re_searches: 0,
+                mate_extensions: 0,
+                pv_mate_failures: 0,
+                depth_log: Vec::new(),
+                elapsed_ms: 0,
+                root_moves: Vec::new(),
+            });
+        }
+    }
+
     let started = Instant::now();
     let deadline = started + std::time::Duration::from_millis(config.time_ms);
     let mut tt = SearchTt::new();

@@ -250,7 +250,8 @@ function needsConfirm(analysis) {
 }
 
 function pierceEnv(state) {
-  const base = state.bestPierce?.env ?? {};
+  const fromFile = loadBestPierce();
+  const base = { ...fromFile.env, ...(state.bestPierce?.env ?? {}) };
   return {
     TITANIUM_ENGINE: 'minimax',
     TITANIUM_MAX_NODES: '10000000000',

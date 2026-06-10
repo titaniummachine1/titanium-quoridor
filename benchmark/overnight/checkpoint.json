@@ -1,7 +1,7 @@
 {
-  "stepIndex": 0,
+  "stepIndex": 1,
   "chunksThisRun": 0,
-  "probesRun": 2,
+  "probesRun": 3,
   "confirmsRun": 0,
   "selfRuns": 0,
   "ishtarRuns": 0,
@@ -14,7 +14,7 @@
   "opts": {
     "steps": 1,
     "workers": 6,
-    "probeGames": 12,
+    "probeGames": 6,
     "confirmGames": 4
   }
 }

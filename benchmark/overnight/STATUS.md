@@ -1,14 +1,14 @@
 # Overnight tournament
 
-Updated: 2026-06-10T01:09:33.740Z
+Updated: 2026-06-10T01:27:01.022Z
 
 | Metric | Value |
 |--------|-------|
-| Step | 0 |
+| Step | 1 |
 | Chunks this run | 0 / 1 |
 | Last | — |
 | Last score | — |
-| Probes run | 2 |
+| Probes run | 3 |
 | Confirms run | 0 |
 | Self-play | 0 |
 | Ishtar | 0 |
