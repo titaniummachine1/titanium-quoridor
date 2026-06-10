@@ -38,6 +38,10 @@ export class TitaniumEngineClient {
 
     this.appliedPlies = 0;
 
+    /** Serialize position sync vs search so makemove/position never races `go`. */
+
+    this._syncChain = Promise.resolve();
+
   }
 
 
@@ -92,15 +96,13 @@ export class TitaniumEngineClient {
 
     if (!actions?.length) {
 
-      return;
+      return Promise.resolve();
 
     }
 
     const moves = actions.map((action) => toAlgebraic(action));
 
-    this.syncMovesToSession(moves, { incremental: true }).catch(() => {});
-
-    this.setStatus('idle');
+    return this.enqueueSync(() => this.syncMovesToSession(moves, { incremental: true }));
 
   }
 
@@ -182,9 +184,47 @@ export class TitaniumEngineClient {
 
 
 
-  async syncMovesToSession(algebraicMoves, { incremental = false } = {}) {
+  enqueueSync(fn) {
 
-    if (!algebraicMoves?.length && this.appliedPlies === 0) {
+    this._syncChain = this._syncChain.then(fn).catch((err) => {
+
+      this.appliedPlies = 0;
+
+      throw err;
+
+    });
+
+    return this._syncChain;
+
+  }
+
+
+
+  /**
+
+   * @param {string[]} algebraicMoves
+
+   * @param {{ incremental?: boolean, forceFull?: boolean }} [opts]
+
+   */
+
+  async syncMovesToSession(algebraicMoves, { incremental = false, forceFull = false } = {}) {
+
+    const moves = algebraicMoves ?? [];
+
+    if (!forceFull && !incremental && moves.length === 0 && this.appliedPlies === 0) {
+
+      return;
+
+    }
+
+    // Full replay before search — never trust appliedPlies alone (session respawn / race).
+
+    if (forceFull || !incremental || moves.length < this.appliedPlies) {
+
+      await this.sessionOp({ op: 'position', moves });
+
+      this.appliedPlies = moves.length;
 
       return;
 
@@ -192,19 +232,13 @@ export class TitaniumEngineClient {
 
 
 
-    if (!incremental || algebraicMoves.length < this.appliedPlies) {
+    const delta = moves.slice(this.appliedPlies);
 
-      await this.sessionOp({ op: 'position', moves: algebraicMoves });
-
-      this.appliedPlies = algebraicMoves.length;
+    if (delta.length === 0) {
 
       return;
 
     }
-
-
-
-    const delta = algebraicMoves.slice(this.appliedPlies);
 
     for (const move of delta) {
 
@@ -212,7 +246,7 @@ export class TitaniumEngineClient {
 
     }
 
-    this.appliedPlies = algebraicMoves.length;
+    this.appliedPlies = moves.length;
 
   }
 
@@ -290,7 +324,11 @@ export class TitaniumEngineClient {
 
       }
 
-      await this.syncMovesToSession(history, { incremental: !isFreshGame });
+      await this.enqueueSync(() =>
+
+        this.syncMovesToSession(history, { forceFull: true }),
+
+      );
 
 
 

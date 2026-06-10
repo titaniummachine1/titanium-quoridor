@@ -1,0 +1,15 @@
+{
+  "diag": {
+    "turn": "White",
+    "error": "",
+    "footer": "\n    \n      Turn: White\n    \n    —\n    \n      Copy game\n      Copy game report\n    \n  ",
+    "thinkCards": "<div class=\"engine-think-cards\">\n    <article class=\"think-card think-card--white think-card--idle\" data-seat=\"0\">\n      <header class=\"think-card__head\">\n        <span class=\"think-card__seat\">White</span>\n        <span class=\"think-card__engine\" data-field=\"engine\">—</span>\n        <span class=\"think-card__pulse\" data-field=\"pulse\" hidden=\"\">live</span>\n      </header>\n\n      <div class=\"think-card__played think-card__slot think-card__slot--hidden\" data-field=\"played-slot\">\n        <span class=\"think-card__played-label\">played</span>\n        <span class=\"think-card__played-move\" data-field=\"played-move\">&nbsp;</span>\n        <span class=\"think-card__ply\" data-field=\"played-ply\"></span>\n      </div>\n\n      <div class=\"think-card__hero think-card__hero--even\" data-field=\"hero\">\n        <di",
+    "playersPanel": "\n    \n      \n        White (moves first)\n        \n      \n        Human\n      \n      \n        Gorisanson (JS, original)Titanium αβ + CAT\n      \n      \n        IshtarKa\n      \n      \n        pavlosdais C\n      \n        \n      \n        Gorisanson (JS, original)\n        \n        Time · Gorisanson (JS, original)\n        \n          \n          10s\n        \n        Rollouts · Gorisanson (JS, original)\n   ",
+    "whiteLabel": ""
+  },
+  "network": [],
+  "logs": [
+    "[debug] [vite] connecting...",
+    "[debug] [vite] connected."
+  ]
+}

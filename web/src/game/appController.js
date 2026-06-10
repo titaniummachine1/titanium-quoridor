@@ -1015,15 +1015,14 @@ export class AppController {
       return;
     }
 
-    if (!freePlay) {
-      this.syncRemoteEnginesAfterMove(action);
-    }
     this.onChange?.();
     if (freePlay) {
       return;
     }
-    this.maybeRequestAiMove();
-    this.maybePonderInactiveEngines();
+    void this.syncRemoteEnginesAfterMove(action).then(() => {
+      this.maybeRequestAiMove();
+      this.maybePonderInactiveEngines();
+    });
   }
 
   onSessionChange() {
@@ -1233,12 +1232,19 @@ export class AppController {
   }
 
   /** Keep engine clients in sync after every ply (incremental makemove or full replay). */
-  syncRemoteEnginesAfterMove(action) {
+  async syncRemoteEnginesAfterMove(action) {
+    const ops = [];
     for (let seat = 0; seat < this.settings.players.length; seat++) {
       if (this.settings.players[seat] === PlayerType.Human) {
         continue;
       }
-      this.getEngineForSeat(seat)?.makeMoves([action]);
+      const p = this.getEngineForSeat(seat)?.makeMoves?.([action]);
+      if (p?.then) {
+        ops.push(p);
+      }
+    }
+    if (ops.length) {
+      await Promise.all(ops);
     }
   }
 
@@ -1393,6 +1399,10 @@ export class AppController {
     this._thinkAiSettings = null;
 
     if (retries <= this._maxIllegalRetries) {
+      const engine = this.getEngineForSeat(seatIndex);
+      if (engine) {
+        engine.appliedPlies = 0;
+      }
       this.moveThinkLog.push({
         ply,
         move: null,
@@ -1693,10 +1703,11 @@ export class AppController {
       this.engineErrors[seatIndex] = null;
       this.engineStatus[seatIndex] = 'idle';
 
-      this.syncRemoteEnginesAfterMove(action);
-      this.onChange?.();
-      this.maybeRequestAiMove();
-      this.maybePonderInactiveEngines();
+      void this.syncRemoteEnginesAfterMove(action).then(() => {
+        this.onChange?.();
+        this.maybeRequestAiMove();
+        this.maybePonderInactiveEngines();
+      });
       return true;
     };
 

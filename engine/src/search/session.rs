@@ -1,6 +1,7 @@
 //! Persistent search state across plies — TT, killers, history, PV (Stockfish-style).
 
 use crate::core::board::{Board, Move};
+use crate::movegen::generate_legal_moves;
 use crate::search::alphabeta::{run_search, SearchConfig, SearchReport};
 use crate::search::move_pack::{pack_move, unpack_move};
 use crate::search::search_tt::SearchTt;
@@ -52,8 +53,11 @@ impl GameSearchSession {
     pub fn set_position(&mut self, moves: &[String]) {
         self.board = Board::new();
         for mv in moves {
-            if !mv.is_empty() {
-                self.board.apply_algebraic(mv);
+            if mv.is_empty() {
+                continue;
+            }
+            if !self.apply_algebraic(mv) {
+                break;
             }
         }
     }
@@ -65,16 +69,20 @@ impl GameSearchSession {
         if self.board.is_terminal().is_some() {
             return false;
         }
-        self.board.apply_algebraic(algebraic);
+        let legal = generate_legal_moves(&self.board);
+        let Some(mv) = legal
+            .iter()
+            .find(|m| crate::util::perft::format_move(**m).eq_ignore_ascii_case(algebraic))
+        else {
+            return false;
+        };
+        let _ = self.board.make_move(*mv);
         true
     }
 
     pub fn killers_at(&self, ply: usize) -> [Option<Move>; 2] {
         let slot = self.killers.get(ply).copied().unwrap_or([0, 0]);
-        [
-            unpack_move(slot[0]),
-            unpack_move(slot[1]),
-        ]
+        [unpack_move(slot[0]), unpack_move(slot[1])]
     }
 
     pub fn record_killer(&mut self, ply: usize, mv: Move) {
