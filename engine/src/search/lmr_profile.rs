@@ -18,9 +18,24 @@ pub const MATE_MAX_TRUSTED_DIST: u32 = 64;
 pub const EVAL_SPIN_STABLE_ITERS: u32 = 3;
 /// Centipawns (×100 cm) — max root-score change to count as "stable".
 pub const EVAL_STABLE_SCORE_DELTA: i32 = 200;
+/// Flat eval alone is not enough to stop — only when the last depth was cheap (no value left).
+pub const EVAL_SPIN_MAX_MARGINAL_NODES: u64 = 45_000;
+
+/// Pierce peak: fewest CAT-hot walls at root (opening race).
+pub const PIERCE_WALL_CAP_MIN: usize = 2;
+/// Pierce peak: most walls when position is tactically spread (midgame).
+pub const PIERCE_WALL_CAP_PEAK: usize = 12;
+/// Fully relaxed: widest root wall window (still CAT-ranked).
+pub const PIERCE_WALL_CAP_RELAXED_OPEN: usize = 26;
+pub const PIERCE_WALL_CAP_RELAXED_MID: usize = 38;
 
 /// Reference think budget for neutral LMR (10s/move in UI/benchmarks).
 pub const TIME_REFERENCE_MS: u64 = 10_000;
+
+/// Fraction of think elapsed before pierce relaxes into width (verify/refute phase).
+pub const PIERCE_RELAX_START: f32 = 0.40;
+/// Extra hot-ratio points at pierce peak (only CAT-top moves full-depth).
+pub const PIERCE_HOT_BONUS: f32 = 5.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MateStopReason {
@@ -41,6 +56,10 @@ pub struct LmrProfile {
     pub depth_balance_floor: u32,
     /// Marginal-node ceiling for depth-push feedback (opening layers are expensive).
     pub depth_push_marginal_cap: u64,
+    /// 1 = pierce peak (hyper-narrow), 0 = fully relaxed within this think.
+    pub pierce_t: f32,
+    /// Full-depth move slots (pawn + CAT-hot) targeted this ID iteration.
+    pub move_window: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -119,6 +138,8 @@ impl LmrProfile {
             cold_cm: cold,
             depth_balance_floor: if stage_t < 0.25 { 56 } else { 40 },
             depth_push_marginal_cap: push_cap,
+            pierce_t: 0.0,
+            move_window: 8,
         }
     }
 
@@ -138,6 +159,8 @@ impl LmrProfile {
             cold_cm: cold,
             depth_balance_floor: 70,
             depth_push_marginal_cap: push_cap,
+            pierce_t: 0.0,
+            move_window: 12,
         }
     }
 
@@ -152,6 +175,8 @@ impl LmrProfile {
             cold_cm: cold,
             depth_balance_floor: 0,
             depth_push_marginal_cap: 8_000,
+            pierce_t: 0.0,
+            move_window: 20,
         }
     }
 
@@ -206,19 +231,104 @@ impl LmrProfile {
             ((self.depth_balance_floor as f32) * (1.0 - t * 0.25)).max(24.0) as u32;
     }
 
-    /// Extra pruning when the clock is running low within a move.
-    pub fn apply_time_urgency(&mut self, fraction_elapsed: f32, time_ms: u64) {
-        let base = time_pressure_from_ms(time_ms);
-        let urgency = ((fraction_elapsed - 0.55) / 0.45).clamp(0.0, 1.0);
-        let t = (base + urgency * (1.0 - base * 0.5)).clamp(0.0, 1.0);
-        let extra = (t - base).max(0.0);
-        if extra < 0.04 {
-            return;
+    /// Pierce-first schedule within one think: start hyper-narrow on CAT-hot PV
+    /// (chase depth toward terminal races), then relax LMR as the clock advances
+    /// so secondary lines get verified without a late-clock choke.
+    pub fn apply_pierce_schedule(&mut self, fraction_elapsed: f32) {
+        let tunables = pierce_tunables_from_env();
+        let f = fraction_elapsed.clamp(0.0, 1.0);
+        let pierce = (1.0 - f).powf(tunables.pierce_pow);
+        self.pierce_t = pierce;
+
+        if pierce > 0.02 {
+            let boost = 1.0 + pierce * tunables.aggr_boost;
+            self.aggression = (self.aggression * boost).min(3.8);
+            self.hot_ratio_pct =
+                (self.hot_ratio_pct as f32 + pierce * tunables.hot_bonus).min(99.0) as u16;
+            self.cold_cm = (self.cold_cm as f32 + pierce * 18.0).min(165.0) as u16;
+            let cut = ((pierce * 2.8) as usize).min(self.lmr_after_move.saturating_sub(1));
+            self.lmr_after_move = self.lmr_after_move.saturating_sub(cut).max(1);
+            self.cat_heat_lmr_slope = (self.cat_heat_lmr_slope * (1.0 + pierce * 0.38)).min(0.095);
         }
-        self.aggression = (self.aggression * (1.0 + extra * 0.35)).min(3.6);
-        self.hot_ratio_pct = (self.hot_ratio_pct as f32 + extra * 3.0).min(99.0) as u16;
-        self.cold_cm = (self.cold_cm as f32 + extra * 12.0).min(160.0) as u16;
+
+        let relax_start = tunables.relax_start;
+        if f > relax_start {
+            let widen = ((f - relax_start) / (1.0 - relax_start)).clamp(0.0, 1.0);
+            let widen = widen * widen;
+            self.aggression = lerp(self.aggression, self.aggression * 0.82, widen);
+            self.lmr_after_move = (self.lmr_after_move as f32 + widen * 3.0).min(8.0) as usize;
+            let hot_floor = lerp(
+                HOT_RATIO_OPENING_PCT as f32,
+                HOT_RATIO_MID_PCT as f32,
+                self.stage_t,
+            ) - 8.0;
+            self.hot_ratio_pct = (self.hot_ratio_pct as f32 - widen * 6.0).max(hot_floor) as u16;
+            self.cat_heat_lmr_slope = lerp(
+                self.cat_heat_lmr_slope,
+                self.cat_heat_lmr_slope * 0.75,
+                widen,
+            );
+            self.cold_cm =
+                (self.cold_cm as f32 * (1.0 - widen * 0.25)).max(COLD_CM_MID as f32) as u16;
+            self.aggression = self.aggression.max(aggression_tactical_wide() - 0.05);
+        }
+
+        self.move_window = pierce_move_window(self.stage_t, pierce);
+        self.lmr_after_move = self.lmr_after_move.min(self.move_window);
     }
+
+    /// CAT-ranked root wall cap — 2 walls at pierce peak in quiet races, up to relaxed mid cap.
+    pub fn root_wall_cap(&self) -> usize {
+        let relaxed = if self.stage_t < 0.40 {
+            PIERCE_WALL_CAP_RELAXED_OPEN
+        } else {
+            PIERCE_WALL_CAP_RELAXED_MID
+        };
+        let spread = (1.0 - self.stage_t * 0.55).clamp(0.0, 1.0);
+        let tight = lerp(
+            PIERCE_WALL_CAP_PEAK as f32,
+            PIERCE_WALL_CAP_MIN as f32,
+            spread,
+        ) as usize;
+        lerp(relaxed as f32, tight as f32, self.pierce_t) as usize
+    }
+
+    /// Pierce strength after schedule (1 = full pierce, 0 = fully relaxed).
+    pub fn pierce_strength(fraction_elapsed: f32) -> f32 {
+        let pow = pierce_tunables_from_env().pierce_pow;
+        (1.0 - fraction_elapsed.clamp(0.0, 1.0)).powf(pow)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PierceTunables {
+    pub relax_start: f32,
+    pub hot_bonus: f32,
+    pub aggr_boost: f32,
+    pub pierce_pow: f32,
+}
+
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+pub fn pierce_tunables_from_env() -> PierceTunables {
+    PierceTunables {
+        relax_start: env_f32("TITANIUM_PIERCE_RELAX", PIERCE_RELAX_START),
+        hot_bonus: env_f32("TITANIUM_PIERCE_HOT", PIERCE_HOT_BONUS),
+        aggr_boost: env_f32("TITANIUM_PIERCE_AGGR", 0.48),
+        pierce_pow: env_f32("TITANIUM_PIERCE_POW", 1.15),
+    }
+}
+
+/// Full-depth move window (pawn + CAT-hot) — 2 at pierce peak, ~20 when relaxed.
+pub fn pierce_move_window(stage_t: f32, pierce: f32) -> usize {
+    let relaxed = lerp(14.0, 20.0, stage_t);
+    let tight = lerp(2.0, 10.0, stage_t);
+    lerp(relaxed, tight, pierce).round().clamp(2.0, 20.0) as usize
 }
 
 /// 0 = full 10s budget, 1 = severe crunch (~2s). Linear in budget fraction —
@@ -376,8 +486,9 @@ impl EvalZoneState {
         }
         self.last_score = Some(verified);
 
-        let _ = marginal_nodes;
-        self.stable_iters >= EVAL_SPIN_STABLE_ITERS && depth >= 12
+        self.stable_iters >= EVAL_SPIN_STABLE_ITERS
+            && depth >= 12
+            && marginal_nodes < EVAL_SPIN_MAX_MARGINAL_NODES
     }
 }
 
@@ -423,6 +534,33 @@ mod tests {
         assert!(p10 < p8, "10s={p10} 8s={p8}");
         assert!(p8 < p3, "8s={p8} 3s={p3}");
         assert!((p8 - 0.2).abs() < 0.01, "8s pressure ~0.2 got {p8}");
+    }
+
+    #[test]
+    fn pierce_schedule_narrows_early_and_relaxes_late() {
+        let mut early = LmrProfile::depth_first_default(0.2);
+        early.apply_time_budget(10_000);
+        let base_aggr = early.aggression;
+        let base_hot = early.hot_ratio_pct;
+        let base_after = early.lmr_after_move;
+
+        let mut pierced = early;
+        pierced.apply_pierce_schedule(0.05);
+        assert!(
+            pierced.aggression > base_aggr,
+            "early pierce should raise aggression"
+        );
+        assert!(pierced.hot_ratio_pct > base_hot);
+        assert!(pierced.lmr_after_move <= base_after);
+
+        let mut relaxed = pierced;
+        relaxed.apply_pierce_schedule(0.85);
+        assert!(
+            relaxed.aggression < pierced.aggression,
+            "late think should relax aggression"
+        );
+        assert!(relaxed.lmr_after_move >= pierced.lmr_after_move);
+        assert!(relaxed.hot_ratio_pct < pierced.hot_ratio_pct);
     }
 
     #[test]
@@ -488,21 +626,35 @@ mod tests {
     }
 
     #[test]
-    fn eval_zone_stops_even_when_depth_is_expensive() {
+    fn eval_zone_keeps_going_when_depth_is_expensive() {
         let mut zone = EvalZoneState::default();
         let score = -169;
         let mut stopped = false;
         for depth in 1..=40 {
             if zone.update_after_depth(score, depth, 800_000) {
                 stopped = true;
-                assert!(depth >= 12);
                 break;
             }
         }
         assert!(
-            stopped,
-            "stable eval should stop ID even when each depth is costly"
+            !stopped,
+            "expensive stable eval should not stop ID — pierce must keep adding depth value"
         );
+    }
+
+    #[test]
+    fn eval_zone_stops_on_cheap_flat_spin() {
+        let mut zone = EvalZoneState::default();
+        let score = -169;
+        let mut stopped = false;
+        for depth in 1..=40 {
+            if zone.update_after_depth(score, depth, 5_000) {
+                stopped = true;
+                assert!(depth >= 12);
+                break;
+            }
+        }
+        assert!(stopped, "cheap flat eval should stop idle depth spin");
     }
 
     #[test]

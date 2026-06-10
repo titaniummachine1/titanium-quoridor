@@ -1,0 +1,11 @@
+{
+  "name": "balanced",
+  "env": {
+    "TITANIUM_PIERCE_RELAX": "0.40",
+    "TITANIUM_PIERCE_HOT": "5",
+    "TITANIUM_PIERCE_AGGR": "0.48"
+  },
+  "score": 0,
+  "updated": "2026-06-10T01:10:00.000Z",
+  "note": "manual: probe-10v10 1-3 — pierce too narrow, relax earlier/wider"
+}

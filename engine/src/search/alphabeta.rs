@@ -320,9 +320,10 @@ fn update_lmr_profile_for_depth(
         state.lmr_profile = LmrProfile::mate_refine();
     } else if depth == 1 {
         state.lmr_profile = LmrProfile::first_iteration();
+        state.lmr_profile.apply_time_budget(state.config.time_ms);
         state
             .lmr_profile
-            .apply_time_budget(state.config.time_ms);
+            .apply_pierce_schedule(state.fraction_elapsed());
     } else {
         let mut buf = [Move::Pawn { row: 1, col: 4 }; MAX_LEGAL_MOVES];
         let n = generate_legal_moves_slice(board, &mut buf, state.bfs);
@@ -330,9 +331,7 @@ fn update_lmr_profile_for_depth(
         let (cat_max, cat_p75) = root_cat_heat_stats(board, &buf, n, &cat);
         let stage_t = compute_stage_t(board, state.our_root_dist, opp_root_dist, cat_max, cat_p75);
         state.lmr_profile = LmrProfile::from_stage(stage_t, endgame_race, false);
-        state
-            .lmr_profile
-            .apply_time_budget(state.config.time_ms);
+        state.lmr_profile.apply_time_budget(state.config.time_ms);
 
         let log = &state.depth_log;
         let (marginal, prev_marginal) = if log.len() >= 2 {
@@ -356,9 +355,7 @@ fn update_lmr_profile_for_depth(
             state.last_iter_score_delta,
             state.last_iter_asp_fails,
         );
-        state
-            .lmr_profile
-            .apply_time_urgency(fraction, state.config.time_ms);
+        state.lmr_profile.apply_pierce_schedule(fraction);
     }
 
     state.lmr_table = build_lmr_table(state.lmr_profile.aggression);
@@ -366,8 +363,10 @@ fn update_lmr_profile_for_depth(
     if state.log && std::env::var("TITANIUM_LOG").is_ok() {
         let p = state.lmr_profile;
         let time_p = crate::search::lmr_profile::time_pressure_from_ms(state.config.time_ms);
+        let pierce =
+            crate::search::lmr_profile::LmrProfile::pierce_strength(state.fraction_elapsed());
         eprintln!(
-            "info lmr_profile depth={} t={:.2} aggression={:.2} after={} slope={:.3} hot_pct={} cold={} floor={} push_cap={} time_p={:.2} remaining_ms={}",
+            "info lmr_profile depth={} t={:.2} aggression={:.2} after={} slope={:.3} hot_pct={} cold={} floor={} push_cap={} time_p={:.2} pierce={:.2} remaining_ms={}",
             depth,
             p.stage_t,
             p.aggression,
@@ -378,6 +377,7 @@ fn update_lmr_profile_for_depth(
             p.depth_balance_floor,
             p.depth_push_marginal_cap,
             time_p,
+            pierce,
             state.remaining_budget_ms()
         );
     }
@@ -981,11 +981,11 @@ fn negamax_inner(
     let profile = state.lmr_profile;
 
     if ply == 0 && depth >= 3 {
-        let cap = if profile.stage_t < 0.40 {
+        let cap = profile.root_wall_cap().min(if profile.stage_t < 0.40 {
             ROOT_WALL_CAP_OPENING
         } else {
             ROOT_WALL_CAP_MID
-        };
+        });
         cap_root_wall_moves(&mut buf, &mut n, &cat, cap);
     }
 
@@ -1002,9 +1002,10 @@ fn negamax_inner(
         let heat_ratio_hot = cat_max > 0
             && (cat_cm.max(0) as u32) * 100 >= (cat_max as u32) * u32::from(profile.hot_ratio_pct);
         let corridor_relevant = cat_cm >= i32::from(profile.cold_cm);
+        let full_depth_slots = profile.move_window.max(profile.lmr_after_move);
         let is_tactical = if moves_searched == 0
             || depth < LMR_MIN_DEPTH
-            || (ply > 0 && moves_searched < profile.lmr_after_move)
+            || (ply > 0 && moves_searched < full_depth_slots)
             || heat_ratio_hot
         {
             true
@@ -1544,8 +1545,13 @@ pub fn search_best_move(board: &mut Board, config: SearchConfig) -> Option<Searc
 
     let static_eval = eval_stm(board, root_side, state.bfs);
     let mut prev_score = if let Some(hint) = config.book_hint {
-        // Soft aspiration toward book PV — search can refute if eval disagrees.
-        static_eval.saturating_add(i32::from(hint.stm_bias) / 4)
+        // Soft aspiration toward book PV — mined lines (priority≥150) get stronger pull.
+        let book_pull = if hint.priority >= 150 {
+            80 + i32::from(hint.stm_bias) / 2
+        } else {
+            i32::from(hint.stm_bias) / 4
+        };
+        static_eval.saturating_add(book_pull)
     } else {
         static_eval
     };

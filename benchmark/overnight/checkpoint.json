@@ -1,13 +1,20 @@
 {
   "stepIndex": 0,
-  "probesRun": 1,
+  "chunksThisRun": 0,
+  "probesRun": 2,
   "confirmsRun": 0,
-  "deadline": 1781087346878,
-  "opts": {
-    "workers": 6,
-    "probeGames": 2,
-    "confirmGames": 4
+  "selfRuns": 0,
+  "ishtarRuns": 0,
+  "deadline": null,
+  "bestPierce": {
+    "name": "default",
+    "env": {},
+    "score": null
   },
-  "lastScore": "4-0",
-  "lastLabel": "fair-10v10 (recovered)"
+  "opts": {
+    "steps": 1,
+    "workers": 6,
+    "probeGames": 12,
+    "confirmGames": 4
+  }
 }
