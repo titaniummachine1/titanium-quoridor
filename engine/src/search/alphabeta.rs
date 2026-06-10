@@ -20,6 +20,7 @@ use crate::search::lmr_profile::{
 };
 use crate::search::move_pack::{pack_move, unpack_move};
 use crate::search::search_tt::{SearchTt, TtBound};
+use crate::search::root_cap::cap_root_wall_moves;
 use crate::search::session::GameSearchSession;
 use crate::util::grid::is_goal;
 use crate::util::perft::format_move;
@@ -579,42 +580,6 @@ fn eval_stm(board: &Board, stm: Player, bfs: &mut BfsScratch) -> i32 {
 
 fn terminal_score(ply: u32) -> i32 {
     -MATE + ply as i32
-}
-
-/// Keep every pawn; retain only the hottest `max_walls` walls by CAT edge heat.
-fn cap_root_wall_moves(buf: &mut [Move], n: &mut usize, cat: &CorridorAttention, max_walls: usize) {
-    if *n == 0 {
-        return;
-    }
-    let mut ranked = [(0usize, 0u16); MAX_LEGAL_MOVES];
-    let mut wall_count = 0usize;
-    for i in 0..*n {
-        if let Move::Wall {
-            row,
-            col,
-            orientation,
-        } = buf[i]
-        {
-            ranked[wall_count] = (i, cat.wall_edge_heat(row, col, orientation));
-            wall_count += 1;
-        }
-    }
-    if wall_count <= max_walls {
-        return;
-    }
-    ranked[..wall_count].sort_by(|a, b| b.1.cmp(&a.1));
-    let mut keep = [false; MAX_LEGAL_MOVES];
-    for &(i, _) in &ranked[..max_walls] {
-        keep[i] = true;
-    }
-    let mut out = 0usize;
-    for i in 0..*n {
-        if matches!(buf[i], Move::Pawn { .. }) || keep[i] {
-            buf[out] = buf[i];
-            out += 1;
-        }
-    }
-    *n = out;
 }
 
 /// Leaf score: stand-pat eval plus at most one ply of **forward pawn** pushes.

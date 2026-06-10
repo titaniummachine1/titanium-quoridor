@@ -131,8 +131,12 @@ function minCutToShow(viz) {
  * `−1` in the UI means "1 ply LMR cut", not a leaf-node flag; we hide lone 1-ply plan noise.
  */
 export function lmrEntryWorthShowing(entry, viz) {
-  if (!entry || entry.pruned) {
+  if (!entry) {
     return false;
+  }
+  // Pierce cap dropout — still paint in shallow when CAT says the wall matters.
+  if (entry.pruned) {
+    return Boolean(viz?.shallow && entry.catCm > 0);
   }
   const cold = coldCmThreshold(viz);
   const minCut = minCutToShow(viz);
