@@ -29,7 +29,7 @@ fn build_search(engine_flag: &str, g: AceGame) -> Box<AceSearch> {
         _ => AceSearch::new(g),
     };
     if engine_flag.contains("pmc") {
-        search.enable_pseudo_mcts();
+        search.enable_eme();
     }
     search
 }

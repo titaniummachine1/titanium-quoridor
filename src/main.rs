@@ -58,9 +58,7 @@ fn print_usage() {
     println!(
         "  titanium session [--engine ace-v8-ti-pmc] — long-lived REPL (TT persists between plies)"
     );
-    println!(
-        "  titanium ace-perft [depth] [--iters N] — ACE vs Titanium movegen perft compare"
-    );
+    println!("  titanium ace-perft [depth] [--iters N] — ACE vs Titanium movegen perft compare");
 }
 
 const DEFAULT_PERFT_DEPTH: u32 = 3;
@@ -452,7 +450,7 @@ fn run_genmove_ace(args: &[String]) {
     let mut params = titanium::ace::AceParams {
         cat: mode == "ace-cat",
         ti_movegen: mode == "ace-ti",
-        pseudo_mcts: label.contains("pmc"),
+        eme: label.contains("pmc"),
         ..Default::default()
     };
     let mut moves = Vec::new();
@@ -479,8 +477,8 @@ fn run_genmove_ace(args: &[String]) {
             params.log = true;
             i += 1;
             continue;
-        } else if arg == "--pseudo-mcts" {
-            params.pseudo_mcts = true;
+        } else if arg == "--eme" || arg == "--pseudo-mcts" {
+            params.eme = true;
             i += 1;
             continue;
         } else if arg == "--engine" {
@@ -598,8 +596,7 @@ fn run_ace_perft(args: &[String]) {
 
     println!(
         "ace-perft depth={} timeout={}s (oracle perft_fast + TT vs ACE v7 wall_legal)",
-        depth,
-        timeout_secs
+        depth, timeout_secs
     );
 
     let ti = titanium::ace::perft_titanium_timed(depth, timeout);
@@ -626,7 +623,10 @@ fn run_ace_perft(args: &[String]) {
             }
         }
         if ace.timed_out {
-            println!("  ace-v7-native: TIMEOUT — ported wall_legal path unusable at depth {}", depth);
+            println!(
+                "  ace-v7-native: TIMEOUT — ported wall_legal path unusable at depth {}",
+                depth
+            );
         } else if let (Some(an), Some(ati_n)) = (ace.nodes, ace_ti.nodes) {
             if an == ati_n {
                 let ratio = ace.elapsed_ms as f64 / ace_ti.elapsed_ms.max(1) as f64;

@@ -16,11 +16,35 @@ pub mod session;
 
 pub use game::AceGame;
 pub use perft::{
-    default_timeout, oracle_nodes, perft_ace_timed, perft_ace_ti_timed, perft_engine_timed,
-    perft_titanium_timed, ACE_PERFT4_STARTPOS, TimedPerftResult,
+    default_timeout, oracle_nodes, perft_ace_ti_timed, perft_ace_timed, perft_engine_timed,
+    perft_titanium_timed, TimedPerftResult, ACE_PERFT4_STARTPOS,
 };
 pub use search::{board_move_to_ace, AceSearch, ThinkResult};
 pub use session::run_ace_session_stdio;
+
+use crate::core::board::{Move as BoardMove, WallOrientation};
+
+/// ACE move encoding → Titanium board move (row flip between coordinate systems).
+pub fn ace_move_to_board(m: i16) -> BoardMove {
+    if m < 100 {
+        BoardMove::Pawn {
+            row: 8 - (m / 9) as u8,
+            col: (m % 9) as u8,
+        }
+    } else {
+        let (base, orientation) = if m < 200 {
+            (100, WallOrientation::Horizontal)
+        } else {
+            (200, WallOrientation::Vertical)
+        };
+        let slot = m - base;
+        BoardMove::Wall {
+            row: 7 - (slot / 8) as u8,
+            col: (slot % 8) as u8,
+            orientation,
+        }
+    }
+}
 
 /// Algebraic ("e2", "e3h") → ACE move encoding.
 pub fn algebraic_to_ace(text: &str) -> i16 {
@@ -66,10 +90,8 @@ pub struct AceParams {
     pub ti_movegen: bool,
     /// Stream iterative-deepening progress on stderr (`info json`).
     pub log: bool,
-    /// Pseudo-MCTS: verify the root best move with greedy rollouts to
-    /// terminal positions between ID iterations; contradictions force the
-    /// αβ search to deepen and prove the move right or reject it.
-    pub pseudo_mcts: bool,
+    /// Early Move Extensions on ordered wall moves (mirror of graduated LMR).
+    pub eme: bool,
 }
 
 impl Default for AceParams {
@@ -81,7 +103,7 @@ impl Default for AceParams {
             cat: false,
             ti_movegen: false,
             log: false,
-            pseudo_mcts: false,
+            eme: false,
         }
     }
 }
@@ -108,8 +130,8 @@ pub fn ace_genmove(
     } else {
         AceSearch::new(g)
     };
-    if params.pseudo_mcts {
-        search.enable_pseudo_mcts();
+    if params.eme {
+        search.enable_eme();
     }
     let result = search.think(
         params.time_ms,
@@ -160,5 +182,80 @@ mod tests {
             }
         }
         assert_eq!(walls, 128);
+    }
+
+    #[test]
+    fn h6h_legal_after_a2h_line() {
+        use crate::core::board::Board;
+        use crate::movegen::generate_legal_moves;
+        use crate::util::perft::format_move;
+
+        let moves = [
+            "e2", "e8", "e3", "e7", "e4", "e6", "d3h", "d6h", "f3h", "f6h", "b3h", "b6h", "h3h",
+            "d4v", "a2h",
+        ];
+        let mut g = AceGame::new();
+        let mut board = Board::new();
+        for m in moves {
+            g.make_move(algebraic_to_ace(m));
+            board.apply_algebraic(m);
+        }
+        let slot = (algebraic_to_ace("h6h") - 100) as usize;
+        assert!(
+            g.wall_legal(0, slot),
+            "ACE must accept h6h (off-topology fast path)"
+        );
+        let ti_legal: Vec<_> = generate_legal_moves(&board)
+            .iter()
+            .map(|mv| format_move(*mv))
+            .collect();
+        assert!(
+            ti_legal.iter().any(|m| m == "h6h"),
+            "Titanium oracle must accept h6h after onB edge fix"
+        );
+    }
+
+    #[test]
+    fn a6h_path_parity_after_h3v_line() {
+        use crate::core::board::Board;
+        use crate::core::board::WallOrientation;
+        use crate::movegen::generate_legal_moves;
+        use crate::movegen::legal::can_wall_block_topology;
+        use crate::util::perft::format_move;
+
+        let moves = [
+            "e2", "e8", "e3", "e7", "e4", "e6", "e3h", "e6h", "c3h", "c6h", "g3h", "g6h", "a3h",
+            "e4v", "h3v",
+        ];
+        let mut g = AceGame::new();
+        let mut board = Board::new();
+        for m in moves {
+            g.make_move(algebraic_to_ace(m));
+            board.apply_algebraic(m);
+        }
+        let slot = (algebraic_to_ace("a6h") - 100) as usize;
+        let row = 7 - (slot / 8) as u8;
+        let col = (slot % 8) as u8;
+        let ti_legal: Vec<_> = generate_legal_moves(&board)
+            .iter()
+            .map(|mv| format_move(*mv))
+            .collect();
+        let ace_ok = g.wall_legal(0, slot);
+        let can_block = can_wall_block_topology(&board, row, col, WallOrientation::Horizontal);
+        eprintln!(
+            "ti={} ace={} can_block={} ti_count={}",
+            ti_legal.iter().any(|m| m == "a6h"),
+            ace_ok,
+            can_block,
+            ti_legal.len()
+        );
+        assert!(
+            !g.wall_legal(0, slot),
+            "ACE must reject a6h when Titanium path check fails"
+        );
+        assert!(
+            !ti_legal.iter().any(|m| m == "a6h"),
+            "Titanium oracle must reject a6h on h3v line"
+        );
     }
 }

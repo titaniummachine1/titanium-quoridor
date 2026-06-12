@@ -60,6 +60,61 @@ fn d3h_legal_off_topology_matches_js() {
 }
 
 #[test]
+fn user_replay_a5h_ply14_js_mismatch() {
+    let prefix = [
+        "e2", "e8", "e3", "e7", "e4", "e6", "e5", "e4", "e3h", "e5h", "c3h", "c5h", "g3h",
+    ];
+    let mut board = Board::new();
+    let mut bfs = BfsScratch::new();
+    let mut buf = [Move::Pawn { row: 0, col: 0 }; crate::movegen::MAX_LEGAL_MOVES];
+
+    for move_str in prefix {
+        let mv = parse_algebraic(move_str).unwrap();
+        let n = generate_legal_moves_slice(&mut board, &mut buf, &mut bfs);
+        assert!(buf[..n].contains(&mv), "{move_str} must be legal in prefix");
+        let _ = board.make_move(mv);
+    }
+
+    let a5h = parse_algebraic("a5h").unwrap();
+    let n = generate_legal_moves_slice(&mut board, &mut buf, &mut bfs);
+    let legal_a5h = buf[..n].contains(&a5h);
+
+    use crate::path::flood::{flood_to_goal, goal_square_mask};
+    use crate::path::masks::DirMasks;
+    use crate::util::grid::{flood_bit_sq, square_index};
+    use crate::core::board::Player;
+
+    let masks = DirMasks::from_board(&board);
+    let (w1, sc1) = board.pawn(Player::One);
+    let (w2, sc2) = board.pawn(Player::Two);
+    let start1 = square_index(w1, sc1);
+    let start2 = square_index(w2, sc2);
+    let (ok1, comp1) = flood_to_goal(start1, masks, goal_square_mask(Player::One));
+    let in_comp = comp1 & flood_bit_sq(start2) != 0;
+    let goal2_in = comp1 & goal_square_mask(Player::Two) != 0;
+    eprintln!(
+        "ply13 a5h legal={legal_a5h} ok1={ok1} black_in_white_comp={in_comp} goal2_in_comp={goal2_in} both={}",
+        bfs.both_players_reach_goals(&board)
+    );
+
+    let mut trial = board.clone();
+    let _ = trial.make_move(a5h);
+    let masks2 = DirMasks::from_board(&trial);
+    let (ok1b, comp1b) = flood_to_goal(start1, masks2, goal_square_mask(Player::One));
+    let in_comp_b = comp1b & flood_bit_sq(start2) != 0;
+    let goal2_in_b = comp1b & goal_square_mask(Player::Two) != 0;
+    eprintln!(
+        "after a5h ok1={ok1b} black_in_white_comp={in_comp_b} goal2_in_comp={goal2_in_b} both={}",
+        bfs.both_players_reach_goals(&trial)
+    );
+
+    assert!(
+        !legal_a5h,
+        "a5h must be rejected at ply 14 — blocks a goal path (JS incorrectly allows this)"
+    );
+}
+
+#[test]
 fn a5h_correctly_rejected_after_tq1_ply19() {
     let prefix = [
         "e2", "e8", "e3", "e7", "e4", "e6", "c3h", "e7h", "e3h", "c7h", "f4", "g7h", "f5", "h8h",

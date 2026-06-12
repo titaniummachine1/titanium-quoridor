@@ -1,27 +1,55 @@
 //! ACE v7 search — 1:1 port of the JS `Search` object.
 //!
 //! Iterative-deepening αβ with aspiration windows, typed TT, killers/history/
-//! countermoves, null move, graduated LMR, frontier LMP, reverse futility,
+//! countermoves, null move, graduated LMR / EME, frontier LMP, reverse futility,
 //! lazy wall legality, repetition detection, wall-stamp dist caching,
 //! easy-move early stop, HalfPW net eval. Mirrors the JS node-for-node.
 
+use crate::ace::ace_move_to_board;
 use crate::util::clock::{Duration, Instant};
 
 use crate::ace::game::{AceGame, ZOBRIST};
 use crate::ace::net::{net, Net, NET_BKT, NET_H, NET_MIRC, NET_MIRS};
-use crate::cat::build::build_corridor_attention;
 use crate::cat::prune::{gap_play_zone_mask, get_shortest_path, wall_should_search};
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move as BoardMove, Player, Undo, WallOrientation};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::path::BfsScratch;
-use crate::util::grid::{square_index, unpack_square};
-
 pub const MATE: i32 = 100_000;
 pub const MAX_PLY: usize = 64;
 const INF: i32 = 2 * MATE;
-/// αβ plies from the reply position to catch one-wall race traps shallow ID misses.
-const TRAP_PROOF_PLIES: i32 = 10;
+
+/// Graduated LMR starts after this move index (JS acev10: `i >= 4`).
+const ACE_LMR_AFTER_MOVE: usize = 4;
+/// Both LMR and EME require at least this remaining depth.
+const ACE_LMR_MIN_DEPTH: i32 = 3;
+
+/// Late-move reduction plies — same formula as JS graduated LMR.
+fn ace_graduated_lmr_reduction(move_index: usize, depth: i32) -> i32 {
+    let mut red = 1;
+    if move_index >= 12 {
+        red += 1;
+    }
+    if depth >= 6 && move_index >= 24 {
+        red += 1;
+    }
+    red
+}
+
+/// EME extends only the first ordered wall moves after the TT/best move.
+/// Index 0 (TT move) already gets full depth; extending more siblings
+/// compounds multiplicatively down the tree and explodes the node count.
+const ACE_EME_TOP_MOVES: usize = 2;
+
+/// Early Move Extension — +1 ply for the top ordered walls; +2 only for
+/// the very first non-TT wall when there is real depth left to spend.
+fn ace_graduated_eme_extension(move_index: usize, depth: i32) -> i32 {
+    if move_index == 1 && depth >= 8 {
+        2
+    } else {
+        1
+    }
+}
 
 const TT_BITS: usize = 20;
 const TT_SIZE: usize = 1 << TT_BITS;
@@ -29,28 +57,6 @@ const TT_MASK: u32 = (TT_SIZE - 1) as u32;
 
 /// Time-abort marker — propagates like the JS `throw "time"`.
 pub struct TimeUp;
-
-/// ACE move encoding → Titanium board move (row flip between coordinate systems).
-pub fn ace_move_to_board(m: i16) -> BoardMove {
-    if m < 100 {
-        BoardMove::Pawn {
-            row: 8 - (m / 9) as u8,
-            col: (m % 9) as u8,
-        }
-    } else {
-        let (base, orientation) = if m < 200 {
-            (100, WallOrientation::Horizontal)
-        } else {
-            (200, WallOrientation::Vertical)
-        };
-        let slot = m - base;
-        BoardMove::Wall {
-            row: 7 - (slot / 8) as u8,
-            col: (slot % 8) as u8,
-            orientation,
-        }
-    }
-}
 
 /// Titanium `Board` kept in sync with the ACE game — fast movegen + optional CAT.
 pub struct TiBridge {
@@ -169,76 +175,6 @@ fn emit_ace_progress(
     let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
-/// xorshift64 — deterministic, allocation-free playout randomness.
-#[inline(always)]
-fn next_rand(rng: &mut u64) -> u64 {
-    let mut x = *rng;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *rng = x;
-    x
-}
-
-/// CAT heat threshold for tactically hot rollout moves (matches MCTS rollouts).
-const ROLLOUT_HOT_CM: u16 = 160;
-
-fn cat_heat_board_move(mv: BoardMove, cat: &CorridorAttention) -> u16 {
-    match mv {
-        BoardMove::Pawn { row, col } => cat.square_heat(row, col),
-        BoardMove::Wall {
-            row,
-            col,
-            orientation,
-        } => cat.wall_edge_heat(row, col, orientation),
-    }
-}
-
-fn pick_hot_rollout_board(
-    legal: &[BoardMove; MAX_LEGAL_MOVES],
-    n: usize,
-    cat: &CorridorAttention,
-    rng: &mut u64,
-) -> BoardMove {
-    const MAX_HOT: usize = 64;
-    let mut hot = [BoardMove::Pawn { row: 0, col: 0 }; MAX_HOT];
-    let mut hot_n = 0usize;
-    for i in 0..n {
-        if cat_heat_board_move(legal[i], cat) >= ROLLOUT_HOT_CM && hot_n < MAX_HOT {
-            hot[hot_n] = legal[i];
-            hot_n += 1;
-        }
-    }
-    if hot_n > 0 && next_rand(rng) % 3 < 2 {
-        return hot[(next_rand(rng) as usize) % hot_n];
-    }
-    legal[(next_rand(rng) as usize) % n]
-}
-
-/// Stream rollout verification stats as an `info json` line on stderr.
-#[allow(clippy::too_many_arguments)]
-fn emit_rollout_stats(
-    engine_label: &str,
-    mv: i16,
-    attempts: u32,
-    spine_plies: u32,
-    leaf_score: i32,
-    search_score: i32,
-    verdict: &str,
-) {
-    eprintln!(
-        "info json {{\"engine\":\"{}\",\"rolloutMove\":\"{}\",\"rolloutAttempts\":{},\"rolloutSpinePlies\":{},\"rolloutLeafScore\":{},\"rolloutSearchScore\":{},\"rolloutVerdict\":\"{}\"}}",
-        engine_label,
-        super::ace_to_algebraic(mv),
-        attempts,
-        spine_plies,
-        leaf_score,
-        search_score,
-        verdict
-    );
-    let _ = std::io::Write::flush(&mut std::io::stderr());
-}
-
 pub struct AceSearch {
     pub g: AceGame,
     tt_key_hi: Vec<u32>,
@@ -269,15 +205,28 @@ pub struct AceSearch {
     ti_movegen: bool,
     /// CAT-filter walls at inner nodes (requires `bridge`).
     cat_walls: bool,
-    /// Rollout verification of the root best move (minimax-MCTS hybrid):
-    /// greedy playouts to terminal positions confirm or contest the αβ choice
-    /// and steer deepening/early-stop. αβ keeps final move authority.
-    pseudo_mcts: bool,
+    /// Early Move Extensions on the first ordered wall moves (mirror of graduated LMR).
+    eme: bool,
     pub nodes: u64,
     deadline: Instant,
     root_best: i16,
     root_score: i32,
+    /// Live `info json` during `think(..., log=true)` — cleared when search ends.
+    stream_log: bool,
+    stream_label: String,
+    stream_t0: Instant,
+    stream_root_score: i32,
+    stream_search_depth: i32,
+    stream_depth_log: Vec<AceDepthLogEntry>,
+    stream_last_emit_nodes: u64,
+    stream_last_emit_ms: u64,
+    stream_last_best: i16,
 }
+
+/// Periodic progress cadence: every 64K nodes AND ≥ 100ms apart — stdout/stderr
+/// writes are expensive; spamming them steals think time from the search.
+const STREAM_EMIT_NODE_MASK: u64 = 65535;
+const STREAM_EMIT_MIN_INTERVAL_MS: u64 = 100;
 
 impl AceSearch {
     pub fn new(g: AceGame) -> Box<Self> {
@@ -307,19 +256,26 @@ impl AceSearch {
             bridge: None,
             ti_movegen: false,
             cat_walls: false,
-            pseudo_mcts: false,
+            eme: false,
             nodes: 0,
             deadline: Instant::now(),
             root_best: 0,
             root_score: 0,
+            stream_log: false,
+            stream_label: String::new(),
+            stream_t0: Instant::now(),
+            stream_root_score: 0,
+            stream_search_depth: 0,
+            stream_depth_log: Vec::new(),
+            stream_last_emit_nodes: 0,
+            stream_last_emit_ms: 0,
+            stream_last_best: 0,
         })
     }
 
-    /// Enable rollout verification of the root best move (pseudo-MCTS):
-    /// between ID iterations the main move is played out to terminal
-    /// positions; contradictions force deeper αβ proof instead of early stop.
-    pub fn enable_pseudo_mcts(&mut self) {
-        self.pseudo_mcts = true;
+    /// Enable Early Move Extensions — same gates/tuning as graduated LMR, early indices.
+    pub fn enable_eme(&mut self) {
+        self.eme = true;
     }
 
     /// Titanium movegen on a mirrored board — same legal set, much faster than `wall_legal`.
@@ -368,12 +324,78 @@ impl AceSearch {
         self.np_b1v = -1;
     }
 
+    fn sync_stream_meta(
+        &mut self,
+        depth_log: &[AceDepthLogEntry],
+        search_depth: i32,
+        root_score: i32,
+    ) {
+        self.stream_depth_log.clear();
+        self.stream_depth_log.extend_from_slice(depth_log);
+        self.stream_search_depth = search_depth;
+        self.stream_root_score = root_score;
+    }
+
+    /// Periodic + forced progress for website SSE (matches JS cumulative `search.nodes`).
+    /// Periodic emits are throttled by node count AND wall time; forced emits
+    /// (depth complete, root best-move change, deadline) always go out.
+    fn emit_stream_progress(&mut self, force: bool) {
+        if !self.stream_log {
+            return;
+        }
+        let elapsed_ms = self.stream_t0.elapsed().as_millis() as u64;
+        if !force {
+            if self.nodes == 0 || self.nodes == self.stream_last_emit_nodes {
+                return;
+            }
+            if (self.nodes & STREAM_EMIT_NODE_MASK) != 0 {
+                return;
+            }
+            if elapsed_ms.saturating_sub(self.stream_last_emit_ms) < STREAM_EMIT_MIN_INTERVAL_MS {
+                return;
+            }
+        }
+        self.stream_last_emit_ms = elapsed_ms;
+        self.stream_last_emit_nodes = self.nodes;
+        self.refresh_dist(0);
+        let white_dist = self.d0[self.dist0_idx][self.g.pawn[0]];
+        let black_dist = self.d1[self.dist1_idx][self.g.pawn[1]];
+        let elapsed_ms = self.stream_t0.elapsed().as_millis() as u64;
+        emit_ace_progress(
+            &self.stream_label,
+            &self.stream_depth_log,
+            self.stream_search_depth,
+            self.nodes,
+            self.stream_root_score,
+            white_dist,
+            black_dist,
+            elapsed_ms,
+        );
+    }
+
     #[inline(always)]
-    fn check_time(&self) -> Result<(), TimeUp> {
-        if (self.nodes & 1023) == 0 && Instant::now() > self.deadline {
-            return Err(TimeUp);
+    fn check_time(&mut self) -> Result<(), TimeUp> {
+        if (self.nodes & 1023) == 0 {
+            if Instant::now() > self.deadline {
+                self.emit_stream_progress(true);
+                return Err(TimeUp);
+            }
+            self.emit_stream_progress(false);
         }
         Ok(())
+    }
+
+    fn ace_time_fraction(last_score: i32) -> f64 {
+        if last_score < -80 {
+            0.92
+        } else {
+            0.85
+        }
+    }
+
+    fn ace_over_time_budget(t0: Instant, time_ms: u64, last_score: i32) -> bool {
+        let budget = time_ms as f64 * Self::ace_time_fraction(last_score);
+        t0.elapsed().as_millis() as f64 > budget
     }
 
     fn refresh_dist(&mut self, ply: usize) {
@@ -570,7 +592,11 @@ impl AceSearch {
 
     fn gen_moves(&mut self, ply: usize, depth: i32, tt_move: i16, out: &mut [i16; 160]) -> usize {
         let check_legal = ply == 0;
-        if self.ti_movegen && check_legal {
+        // MoveGen+ : Titanium legal movegen at EVERY node (perft-parity search).
+        // Fully legal walls — no lazy seal checks needed downstream, and inner
+        // nodes can never search (or suggest via TT) a Titanium-illegal move.
+        // The CAT hybrid keeps its own filtered path at inner nodes.
+        if self.ti_movegen && (check_legal || !self.cat_walls) {
             return self
                 .bridge
                 .as_mut()
@@ -881,7 +907,10 @@ impl AceSearch {
             {
                 continue;
             }
-            if m >= 100 && ply > 0 {
+            // Seal check only needed for ACE's lazy pseudo-legal walls; with
+            // MoveGen+ (Titanium legal gen at every node) all walls are legal.
+            let lazy_walls = !(self.ti_movegen && !self.cat_walls);
+            if m >= 100 && ply > 0 && lazy_walls {
                 let wt = if m < 200 { 0 } else { 1 };
                 let slot = (m % 100) as usize;
                 if self.g.wall_needs_path_check(wt, slot) {
@@ -898,10 +927,24 @@ impl AceSearch {
                 bridge.push(m);
             }
             let new_depth = depth - 1;
-            let result = if i >= 4 && depth >= 3 && m >= 100 && m != tt_move {
+            let result = if self.eme
+                && i > 0
+                && i <= ACE_EME_TOP_MOVES
+                && depth >= ACE_LMR_MIN_DEPTH
+                && m >= 100
+                && m != tt_move
+            {
+                // EME — extend only the top ordered walls (see ACE_EME_TOP_MOVES)
+                let ext = ace_graduated_eme_extension(i, depth);
+                let ed = new_depth + ext;
+                self.ab(ed, -beta, -alpha, ply + 1, true, m).map(|s| -s)
+            } else if i >= ACE_LMR_AFTER_MOVE
+                && depth >= ACE_LMR_MIN_DEPTH
+                && m >= 100
+                && m != tt_move
+            {
                 // graduated LMR
-                let red =
-                    1 + if i >= 12 { 1 } else { 0 } + if depth >= 6 && i >= 24 { 1 } else { 0 };
+                let red = ace_graduated_lmr_reduction(i, depth);
                 let rd = (new_depth - red).max(0);
                 match self.ab(rd, -alpha - 1, -alpha, ply + 1, true, m) {
                     Ok(s) => {
@@ -964,6 +1007,13 @@ impl AceSearch {
                     if ply == 0 {
                         self.root_best = m;
                         self.root_score = score;
+                        // New best move at root → push an info-card update now
+                        // (forced; bypasses the periodic throttle).
+                        if self.stream_last_best != m {
+                            self.stream_last_best = m;
+                            self.stream_root_score = score;
+                            self.emit_stream_progress(true);
+                        }
                     }
                     if alpha >= beta {
                         flag = 1;
@@ -1015,489 +1065,6 @@ impl AceSearch {
         self.cached_stamp = nst;
     }
 
-    // ── Rollout verification (minimax-MCTS hybrid) ──────────────────────────
-    //
-    // Between ID depths (≥6) the current best move is rolled along the search
-    // PV then continued to terminal with Gorisanson + CAT guidance. αβ then
-    // tries to refute that line; if the rollout is cut completely we retry
-    // with a different stochastic branch until αβ accepts the path or time
-    // runs out. Only AB-validated rollouts gate the easy-move stop.
-
-    fn tt_best_move(&self) -> i16 {
-        let idx = (self.g.hash_lo & TT_MASK) as usize;
-        if self.tt_meta[idx] != 0
-            && self.tt_key_hi[idx] == self.g.hash_hi
-            && self.tt_key_lo[idx] == self.g.hash_lo
-        {
-            (self.tt_meta[idx] & 1023) as i16
-        } else {
-            0
-        }
-    }
-
-    /// Best sequence from search TT: forced root move + PV continuation.
-    fn extract_search_pv(&mut self, root_move: i16, max_plies: usize) -> Vec<i16> {
-        let mut pv = vec![root_move];
-        let nd0 = self.dist0_idx;
-        let nd1 = self.dist1_idx;
-        let nst = self.cached_stamp;
-
-        self.g.make_move(root_move);
-        if let Some(bridge) = self.bridge.as_mut() {
-            bridge.push(root_move);
-        }
-
-        for _ in 1..max_plies {
-            if self.g.winner() >= 0 {
-                break;
-            }
-            let m = self.tt_best_move();
-            if m == 0 {
-                break;
-            }
-            let mut legal = [0i16; 160];
-            let n = self.gen_moves(0, 1, 0, &mut legal);
-            if !legal[..n].contains(&m) {
-                break;
-            }
-            pv.push(m);
-            self.g.make_move(m);
-            if let Some(bridge) = self.bridge.as_mut() {
-                bridge.push(m);
-            }
-        }
-
-        for _ in 0..pv.len() {
-            self.g.unmake_move();
-            if let Some(bridge) = self.bridge.as_mut() {
-                bridge.pop();
-            }
-        }
-        self.dist0_idx = nd0;
-        self.dist1_idx = nd1;
-        self.cached_stamp = nst;
-        pv
-    }
-
-    fn leaf_score_root_pov(&mut self, root_side: usize, ply: usize) -> i32 {
-        let w = self.g.winner();
-        if w >= 0 {
-            if w as usize == root_side {
-                MATE - ply as i32
-            } else {
-                -(MATE - ply as i32)
-            }
-        } else {
-            self.refresh_dist(ply);
-            let ev = self.evaluate();
-            if self.g.turn == root_side {
-                ev
-            } else {
-                -ev
-            }
-        }
-    }
-
-    /// Gorisanson shortest-path step via mirrored Titanium board (80% branch).
-    fn gori_bridge_step(
-        bridge: &mut TiBridge,
-        rng: &mut u64,
-        next_p1: &mut [u8; 81],
-        next_p2: &mut [u8; 81],
-        p1_valid: &mut bool,
-        p2_valid: &mut bool,
-        cat: Option<&CorridorAttention>,
-    ) -> Option<i16> {
-        let board = &mut bridge.board;
-        let stm = board.side();
-        if !*p1_valid {
-            bridge
-                .bfs
-                .fill_next_toward_goal(board, Player::One, next_p1);
-            *p1_valid = true;
-        }
-        if !*p2_valid {
-            bridge
-                .bfs
-                .fill_next_toward_goal(board, Player::Two, next_p2);
-            *p2_valid = true;
-        }
-
-        if next_rand(rng) % 10 < 8 {
-            let (pr, pc) = board.pawn(stm);
-            let sq = square_index(pr, pc);
-            let next_sq = if stm == Player::One {
-                next_p1[sq as usize]
-            } else {
-                next_p2[sq as usize]
-            };
-            if next_sq != u8::MAX {
-                let (nr, nc) = unpack_square(next_sq);
-                return Some(board_move_to_ace(BoardMove::Pawn { row: nr, col: nc }));
-            }
-        }
-
-        let mut legal = [BoardMove::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
-        let n = generate_legal_moves_slice(board, &mut legal, &mut bridge.bfs);
-        if n == 0 {
-            return None;
-        }
-        let mv = if let Some(cat) = cat {
-            pick_hot_rollout_board(&legal, n, cat, rng)
-        } else {
-            legal[(next_rand(rng) as usize) % n]
-        };
-        if matches!(mv, BoardMove::Wall { .. }) {
-            *p1_valid = false;
-            *p2_valid = false;
-        }
-        Some(board_move_to_ace(mv))
-    }
-
-    /// Gorisanson + CAT when bridge exists; ACE greedy policy otherwise.
-    fn rollout_policy_move_guided(
-        &mut self,
-        rng: &mut u64,
-        cat: Option<&CorridorAttention>,
-        next_p1: &mut [u8; 81],
-        next_p2: &mut [u8; 81],
-        p1_valid: &mut bool,
-        p2_valid: &mut bool,
-    ) -> i16 {
-        if let Some(bridge) = self.bridge.as_mut() {
-            if let Some(m) =
-                Self::gori_bridge_step(bridge, rng, next_p1, next_p2, p1_valid, p2_valid, cat)
-            {
-                return m;
-            }
-        }
-        self.rollout_policy_move(rng)
-    }
-
-    /// Whether a rollout checkpoint is worth the time (minimax keeps priority).
-    fn rollout_checkpoint_warranted(
-        d: i32,
-        stable: i32,
-        last_best: i16,
-        last_score: i32,
-        ver_passed_move: i16,
-        rollout_done: bool,
-        elapsed_ms: u64,
-        time_ms: u64,
-        g: &AceGame,
-    ) -> bool {
-        if rollout_done || last_best == 0 || ver_passed_move == last_best {
-            return false;
-        }
-        if d < 6 || stable < 2 {
-            return false;
-        }
-        if last_score > MATE - 500 || last_score < -(MATE - 500) {
-            return false;
-        }
-        if elapsed_ms.saturating_mul(100) > time_ms.saturating_mul(75) {
-            return false;
-        }
-        let walls_left = g.wl[0] + g.wl[1];
-        if walls_left <= 4 {
-            return false;
-        }
-        true
-    }
-
-    /// Play PV prefix then a bounded guided continuation (not always to terminal).
-    fn rollout_pv_to_terminal(
-        &mut self,
-        pv_prefix: &[i16],
-        root_side: usize,
-        rng: &mut u64,
-        max_extra_guided: usize,
-    ) -> Option<(Vec<i16>, i32, bool)> {
-        let cap = (pv_prefix.len() + max_extra_guided)
-            .min(48)
-            .min(200usize.min(1000usize.saturating_sub(self.g.hist_len)));
-        let nd0 = self.dist0_idx;
-        let nd1 = self.dist1_idx;
-        let nst = self.cached_stamp;
-        let mut reached_terminal = false;
-        let mut spine = Vec::with_capacity(cap);
-        let mut next_p1 = [u8::MAX; 81];
-        let mut next_p2 = [u8::MAX; 81];
-        let mut p1_valid = false;
-        let mut p2_valid = false;
-        let mut cat: Option<CorridorAttention> = None;
-
-        for &m in pv_prefix {
-            if spine.len() >= cap {
-                break;
-            }
-            self.g.make_move(m);
-            if let Some(bridge) = self.bridge.as_mut() {
-                bridge.push(m);
-                if matches!(ace_move_to_board(m), BoardMove::Wall { .. }) {
-                    p1_valid = false;
-                    p2_valid = false;
-                }
-            }
-            spine.push(m);
-            if self.g.winner() >= 0 {
-                reached_terminal = true;
-                break;
-            }
-        }
-        let mut guided = 0usize;
-
-        loop {
-            if self.g.winner() >= 0 {
-                reached_terminal = true;
-                break;
-            }
-            if spine.len() >= cap {
-                break;
-            }
-            if guided >= max_extra_guided {
-                break;
-            }
-            if Instant::now() > self.deadline {
-                for _ in 0..spine.len() {
-                    self.g.unmake_move();
-                    if let Some(bridge) = self.bridge.as_mut() {
-                        bridge.pop();
-                    }
-                }
-                self.dist0_idx = nd0;
-                self.dist1_idx = nd1;
-                self.cached_stamp = nst;
-                return None;
-            }
-            if self.bridge.is_some() && cat.is_none() {
-                if let Some(bridge) = self.bridge.as_mut() {
-                    cat = Some(build_corridor_attention(&mut bridge.bfs, &bridge.board));
-                }
-            }
-            let m = self.rollout_policy_move_guided(
-                rng,
-                cat.as_ref(),
-                &mut next_p1,
-                &mut next_p2,
-                &mut p1_valid,
-                &mut p2_valid,
-            );
-            if m == 0 {
-                break;
-            }
-            self.g.make_move(m);
-            if let Some(bridge) = self.bridge.as_mut() {
-                bridge.push(m);
-                if matches!(ace_move_to_board(m), BoardMove::Wall { .. }) {
-                    p1_valid = false;
-                    p2_valid = false;
-                    cat = None;
-                }
-            }
-            spine.push(m);
-            guided += 1;
-        }
-
-        let leaf = self.leaf_score_root_pov(root_side, spine.len());
-        for _ in 0..spine.len() {
-            self.g.unmake_move();
-            if let Some(bridge) = self.bridge.as_mut() {
-                bridge.pop();
-            }
-        }
-        self.dist0_idx = nd0;
-        self.dist1_idx = nd1;
-        self.cached_stamp = nst;
-        Some((spine, leaf, reached_terminal))
-    }
-
-    /// αβ trap check: walk the search PV, then 10-ply null-window proof from the
-    /// leaf — catches wall blocks deep in the expected line (d9 blind spots).
-    fn rollout_survives_ab(&mut self, pv: &[i16], root_side: usize, search_score: i32) -> bool {
-        if pv.is_empty() {
-            return false;
-        }
-        let margin = 70;
-        let floor = search_score.saturating_sub(margin);
-        let nd0 = self.dist0_idx;
-        let nd1 = self.dist1_idx;
-        let nst = self.cached_stamp;
-        let mut played = 0usize;
-
-        for &m in pv {
-            if self.g.winner() >= 0 {
-                break;
-            }
-            self.g.make_move(m);
-            if let Some(bridge) = self.bridge.as_mut() {
-                bridge.push(m);
-            }
-            played += 1;
-        }
-
-        let survived = if self.g.winner() >= 0 {
-            self.g.winner() as usize == root_side
-        } else {
-            let ply = played;
-            let prev = pv[played.saturating_sub(1)];
-            self.refresh_dist(ply);
-            match self.ab(TRAP_PROOF_PLIES, floor - 1, floor, ply, true, prev) {
-                Ok(score_stm) => {
-                    let root_pov = if self.g.turn == root_side {
-                        score_stm
-                    } else {
-                        -score_stm
-                    };
-                    root_pov >= floor
-                }
-                Err(_) => false,
-            }
-        };
-
-        for _ in 0..played {
-            self.g.unmake_move();
-            if let Some(bridge) = self.bridge.as_mut() {
-                bridge.pop();
-            }
-        }
-        self.dist0_idx = nd0;
-        self.dist1_idx = nd1;
-        self.cached_stamp = nst;
-        survived
-    }
-
-    /// Greedy playout policy with light randomization: run along the shortest
-    /// path, or place a wall whose opponent-detour beats the race tempo.
-    /// Considers only walls cutting an opponent shortest-path edge.
-    fn rollout_policy_move(&mut self, rng: &mut u64) -> i16 {
-        let me = self.g.turn;
-        let opp = 1 - me;
-        let mut dm = [0u8; 81];
-        let mut dop = [0u8; 81];
-        self.g.compute_dist(me, &mut dm);
-        self.g.compute_dist(opp, &mut dop);
-        let my_d = dm[self.g.pawn[me]] as i32;
-        let opp_d = dop[self.g.pawn[opp]] as i32;
-
-        // candidate "lead after my turn" scores: pawn = opp_d - dist(target),
-        // wall = new_opp_d - new_my_d (tempo cost implicit: the pawn stands still)
-        let mut best_m: i16 = 0;
-        let mut best_s = i32::MIN;
-        let mut second_m: i16 = 0;
-        let mut second_s = i32::MIN;
-
-        let mut pawn = [0i16; 16];
-        let pn = self.g.gen_pawn_moves(&mut pawn, 0);
-        let opp_cell = self.g.pawn[opp] as i16;
-        for &p in &pawn[..pn] {
-            let mut s = opp_d - dm[p as usize] as i32;
-            // face-off tempo: stepping adjacent to the opponent gifts them a
-            // jump over us if the landing square advances them — dist can't
-            // see jumps, so charge the stolen tempo here
-            let diff = p - opp_cell;
-            if diff == 1 || diff == -1 || diff == 9 || diff == -9 {
-                // they jump from their cell over us, landing beyond us
-                let jump = p + diff;
-                let dir = match diff {
-                    -9 => 0,
-                    9 => 1,
-                    -1 => 2,
-                    _ => 3,
-                };
-                if (0..81).contains(&jump)
-                    && self.g.can_step(p as usize, dir)
-                    && (dop[jump as usize] as i32) < dop[opp_cell as usize] as i32 - 1
-                {
-                    s -= 1;
-                }
-            }
-            if s > best_s {
-                second_m = best_m;
-                second_s = best_s;
-                best_m = p;
-                best_s = s;
-            } else if s > second_s {
-                second_m = p;
-                second_s = s;
-            }
-        }
-        // a wall spends a scarce resource without advancing the pawn: it must
-        // strictly beat stepping, or greedy play degenerates into wall-spam
-        let wall_floor = best_s + 1;
-
-        if self.g.wl[me] > 0 {
-            for slot in 0..64usize {
-                let a = (slot >> 3) * 9 + (slot & 7);
-                for wt in 0..2usize {
-                    if !self.g.wall_fits(wt, slot) {
-                        continue;
-                    }
-                    // relevance: the wall must cut an opponent shortest-path edge
-                    let (e1a, e1b, e2a, e2b) = if wt == 0 {
-                        (a, a + 9, a + 1, a + 10) // hw blocks two vertical edges
-                    } else {
-                        (a, a + 1, a + 9, a + 10) // vw blocks two horizontal edges
-                    };
-                    let cuts = dop[e1a].abs_diff(dop[e1b]) == 1 || dop[e2a].abs_diff(dop[e2b]) == 1;
-                    if !cuts {
-                        continue;
-                    }
-                    let needs = self.g.wall_needs_path_check(wt, slot);
-                    self.g.set_wall_bits(wt, slot, true);
-                    let ok = !needs || (self.g.has_path(0) && self.g.has_path(1));
-                    if ok {
-                        let mut nd_op = [0u8; 81];
-                        let mut nd_me = [0u8; 81];
-                        self.g.compute_dist(opp, &mut nd_op);
-                        self.g.compute_dist(me, &mut nd_me);
-                        let new_opp_d = nd_op[self.g.pawn[opp]] as i32;
-                        let new_my_d = nd_me[self.g.pawn[me]] as i32;
-                        let s = (new_opp_d - new_my_d) - (new_my_d - my_d).max(0);
-                        if s >= wall_floor && s > best_s {
-                            second_m = best_m;
-                            second_s = best_s;
-                            best_m = (if wt == 0 { 100 } else { 200 }) + slot as i16;
-                            best_s = s;
-                        } else if s >= wall_floor && s > second_s {
-                            second_m = (if wt == 0 { 100 } else { 200 }) + slot as i16;
-                            second_s = s;
-                        }
-                    }
-                    self.g.set_wall_bits(wt, slot, false);
-                }
-            }
-        }
-
-        // Gorisanson-style randomization: 70% follow greedy best move,
-        // 30% take a random move to explore variation and avoid overfit
-        if next_rand(rng) % 100 >= 70 {
-            // 30% of the time: pick a random legal move instead of best_m
-            let mut moves = [0i16; 160];
-            let n = self.gen_moves(0, 1, 0, &mut moves);
-            if n > 0 {
-                return moves[(next_rand(rng) as usize) % n];
-            }
-        }
-        best_m
-    }
-
-    /// Ply-cap adjudication: side to move wins ties (it has the tempo).
-    fn rollout_adjudicate(&mut self, root_side: usize) -> bool {
-        let me = self.g.turn;
-        let opp = 1 - me;
-        let mut dm = [0u8; 81];
-        let mut dop = [0u8; 81];
-        self.g.compute_dist(me, &mut dm);
-        self.g.compute_dist(opp, &mut dop);
-        let winner = if (dm[self.g.pawn[me]] as i32) <= dop[self.g.pawn[opp]] as i32 {
-            me
-        } else {
-            opp
-        };
-        winner == root_side
-    }
-
     /// Entry: iterative deepening within `time_ms`. `full` disables the easy-move stop.
     pub fn think(
         &mut self,
@@ -1512,6 +1079,21 @@ impl AceSearch {
         self.nodes = 0;
         self.root_best = 0;
         self.root_score = 0;
+        self.stream_log = log;
+        self.stream_label = engine_label.to_string();
+        self.stream_t0 = t0;
+        self.stream_root_score = 0;
+        self.stream_search_depth = 0;
+        self.stream_depth_log.clear();
+        self.stream_last_emit_nodes = 0;
+        self.stream_last_emit_ms = 0;
+        self.stream_last_best = 0;
+        // Re-sync the mirrored Titanium board from the authoritative ACE game.
+        // Kills any drift left over from a previous search (e.g. an unbalanced
+        // push/pop on time-abort) before it can poison this move's root list.
+        if self.bridge.is_some() {
+            self.bridge = Some(TiBridge::from_game(&self.g));
+        }
         let mut last_best: i16 = 0;
         let mut last_score = 0;
         let mut last_depth = 0;
@@ -1519,22 +1101,15 @@ impl AceSearch {
         let mut depth_log: Vec<AceDepthLogEntry> = Vec::new();
         let max_depth = if max_depth > 0 { max_depth } else { 30 };
 
-        // Rollout verification: once per think when the root move is stable (≥2
-        // depths) at d≥6, roll a short PV continuation and run a cheap αβ check.
-        // Skipped in endgame / low time so minimax keeps most of the budget.
-        let mut ver_move: i16 = 0;
-        let mut ver_passed_move: i16 = 0;
-        let mut ver_attempts: u32 = 0;
-        let mut ver_spine_plies: u32 = 0;
-        let mut ver_leaf_score: i32 = 0;
-        let mut ver_confirmed = false;
-        let mut ver_suspect = false;
-        let mut rollout_done_this_think = false;
-        // position-seeded → deterministic per position, varied across the game
-        let mut rng: u64 =
-            (((self.g.hash_hi as u64) << 32) | self.g.hash_lo as u64) ^ 0x9E37_79B9_7F4A_7C15 | 1;
-
         for d in 1..=max_depth {
+            if d > 1 && Self::ace_over_time_budget(t0, time_ms, last_score) {
+                break;
+            }
+            if Instant::now() >= self.deadline {
+                break;
+            }
+            self.stream_root_score = last_score;
+            self.stream_search_depth = d;
             let nodes_at_depth = self.nodes;
             let result = if d >= 4 && last_score > -2000 && last_score < 2000 {
                 // aspiration
@@ -1582,111 +1157,17 @@ impl AceSearch {
                         pv,
                     });
                     if log {
-                        self.refresh_dist(0);
-                        let white_dist = self.d0[self.dist0_idx][self.g.pawn[0]];
-                        let black_dist = self.d1[self.dist1_idx][self.g.pawn[1]];
-                        emit_ace_progress(
-                            engine_label,
-                            &depth_log,
-                            d,
-                            self.nodes,
-                            last_score,
-                            white_dist,
-                            black_dist,
-                            elapsed_ms,
-                        );
+                        self.sync_stream_meta(&depth_log, d, last_score);
+                        self.emit_stream_progress(true);
                     }
                     if sc > MATE - 200 || sc < -(MATE - 200) {
                         break; // forced result
                     }
-                    // Rollout checkpoint: at most once per think, stable move only.
-                    let elapsed_ms = t0.elapsed().as_millis() as u64;
-                    if self.pseudo_mcts
-                        && Self::rollout_checkpoint_warranted(
-                            d,
-                            stable,
-                            last_best,
-                            last_score,
-                            ver_passed_move,
-                            rollout_done_this_think,
-                            elapsed_ms,
-                            time_ms,
-                            &self.g,
-                        )
-                    {
-                        rollout_done_this_think = true;
-                        ver_move = last_best;
-                        ver_attempts = 0;
-                        ver_confirmed = false;
-                        ver_suspect = false;
-                        let saved_deadline = self.deadline;
-                        let remaining_ms = self
-                            .deadline
-                            .saturating_duration_since(Instant::now())
-                            .as_millis() as u64;
-                        let batch_ms = (remaining_ms / 5).min(time_ms / 10).max(50).min(200);
-                        if batch_ms >= 60 {
-                            self.deadline = (Instant::now() + Duration::from_millis(batch_ms))
-                                .min(saved_deadline);
-                            let root_side = self.g.turn;
-                            let pv = self.extract_search_pv(last_best, d as usize + 4);
-                            let max_extra =
-                                ((d as usize) / 2).max(TRAP_PROOF_PLIES as usize).min(16);
-                            let max_tries = if remaining_ms < time_ms / 3 { 2 } else { 3 };
-                            loop {
-                                if Instant::now() >= self.deadline || ver_attempts >= max_tries {
-                                    break;
-                                }
-                                ver_attempts += 1;
-                                let Some((spine, leaf, _)) = self
-                                    .rollout_pv_to_terminal(&pv, root_side, &mut rng, max_extra)
-                                else {
-                                    break;
-                                };
-                                ver_spine_plies = spine.len() as u32;
-                                ver_leaf_score = leaf;
-                                if self.rollout_survives_ab(&pv, root_side, last_score) {
-                                    ver_confirmed = true;
-                                    ver_passed_move = last_best;
-                                    ver_suspect = false;
-                                    break;
-                                }
-                                ver_suspect = true;
-                                rng ^= next_rand(&mut rng) | 1;
-                            }
-                        } else {
-                            ver_passed_move = last_best;
-                        }
-                        self.deadline = saved_deadline;
-                        if log && ver_attempts > 0 {
-                            let verdict = if ver_confirmed {
-                                "confirmed-ab"
-                            } else if ver_suspect {
-                                "refuted-retry-exhausted"
-                            } else {
-                                "aborted"
-                            };
-                            emit_rollout_stats(
-                                engine_label,
-                                ver_move,
-                                ver_attempts,
-                                ver_spine_plies,
-                                ver_leaf_score,
-                                last_score,
-                                verdict,
-                            );
-                        }
-                    }
-                    // v8 easy-move stop (acev8_engine.js) — with pseudo-MCTS the
-                    // move must also be rollout-confirmed before banking time
+                    // v8 easy-move stop (acev8_engine.js)
                     if !full
                         && d >= 9
                         && stable >= 3
                         && last_score > -120
-                        && (!self.pseudo_mcts
-                            || ver_confirmed
-                            || ver_passed_move == last_best
-                            || !rollout_done_this_think)
                         && t0.elapsed().as_millis() as u64 > time_ms * 3 / 10
                     {
                         break;
@@ -1694,51 +1175,55 @@ impl AceSearch {
                 }
                 Err(TimeUp) => break, // state already restored by unwinding unmakes
             }
-            // suspect main move: stretch the budget so αβ must prove or reject it
-            let time_frac = if ver_suspect {
-                0.97
-            } else if last_score < -80 {
-                0.92
-            } else {
-                0.85
-            };
-            if t0.elapsed().as_millis() as f64 > time_ms as f64 * time_frac {
+            if Self::ace_over_time_budget(t0, time_ms, last_score) {
                 break;
             }
         }
 
-        if last_best == 0 {
-            self.refresh_dist(0);
-            let mut moves = [0i16; 160];
-            let n = self.gen_moves(0, 1, 0, &mut moves);
-            if n > 0 {
-                last_best = moves[0];
+        // Bridge desync detector: whenever control is back at the root the
+        // mirrored board's undo stack MUST be empty. If not, a make/unmake
+        // path leaked a frame (this is how "illegal move" crashes happen) —
+        // log it loudly and rebuild from the authoritative game.
+        if let Some(bridge) = self.bridge.as_ref() {
+            if !bridge.undo_stack.is_empty() {
+                eprintln!(
+                    "info string ace bridge DESYNC: {} unpopped frames after search — rebuilding",
+                    bridge.undo_stack.len()
+                );
+                self.bridge = Some(TiBridge::from_game(&self.g));
             }
         }
 
-        if self.pseudo_mcts && ver_move != 0 && ver_move == last_best && ver_attempts > 0 {
-            let verdict = if ver_confirmed {
-                "confirmed-played"
-            } else if ver_suspect {
-                "suspect-played-anyway"
+        // Root legality guard: never emit a move the true position rejects.
+        // Regenerates the legal root list from clean state; if the searched
+        // best move is not in it, substitute the best legal alternative.
+        self.refresh_dist(0);
+        let mut legal = [0i16; 160];
+        let nlegal = self.gen_moves(0, 1, last_best, &mut legal);
+        if last_best == 0 || !legal[..nlegal].contains(&last_best) {
+            if last_best != 0 {
+                eprintln!(
+                    "info string ace root guard: searched best {} is illegal in true position — substituting",
+                    super::ace_to_algebraic(last_best)
+                );
+            }
+            if nlegal > 0 {
+                self.order_moves(0, &mut legal[..nlegal], 0, 0);
+                last_best = legal[0];
             } else {
-                "inconclusive"
-            };
-            emit_rollout_stats(
-                engine_label,
-                ver_move,
-                ver_attempts,
-                ver_spine_plies,
-                ver_leaf_score,
-                last_score,
-                verdict,
-            );
+                last_best = 0;
+            }
         }
 
         self.refresh_dist(0);
         let white_dist = self.d0[self.dist0_idx][self.g.pawn[0]];
         let black_dist = self.d1[self.dist1_idx][self.g.pawn[1]];
         let ms = t0.elapsed().as_millis() as u64;
+
+        if log {
+            self.sync_stream_meta(&depth_log, last_depth, last_score);
+            self.emit_stream_progress(true);
+        }
 
         ThinkResult {
             mv: last_best,
@@ -1750,122 +1235,5 @@ impl AceSearch {
             black_dist,
             depth_log,
         }
-    }
-}
-
-#[cfg(test)]
-mod rollout_tests {
-    use super::*;
-
-    /// Dump one policy game to inspect degenerate play patterns.
-    #[test]
-    #[ignore]
-    fn rollout_policy_dump_game() {
-        let mut s = AceSearch::new(AceGame::new());
-        s.deadline = Instant::now() + Duration::from_secs(60);
-        let mut rng: u64 = 0xDEAD_BEEF_1234_5677 | 1;
-        let mut made = 0usize;
-        let mut line = String::new();
-        loop {
-            let w = s.g.winner();
-            if w >= 0 {
-                println!("winner: p{}", w);
-                break;
-            }
-            if made >= 300 {
-                println!("cap hit");
-                break;
-            }
-            let m = s.rollout_policy_move(&mut rng);
-            if m == 0 {
-                println!("no move");
-                break;
-            }
-            line.push_str(&super::super::ace_to_algebraic(m));
-            line.push(' ');
-            s.g.make_move(m);
-            made += 1;
-        }
-        println!("game ({} plies): {}", made, line);
-        for _ in 0..made {
-            s.g.unmake_move();
-        }
-    }
-
-    #[test]
-    fn extract_search_pv_restores_position() {
-        let mut s = AceSearch::with_ti_movegen(AceGame::new());
-        s.enable_pseudo_mcts();
-        s.g.make_move(super::super::algebraic_to_ace("c3h"));
-        s.position_changed();
-        s.g.make_move(super::super::algebraic_to_ace("e8"));
-        s.position_changed();
-        let hash_lo = s.g.hash_lo;
-        let hash_hi = s.g.hash_hi;
-        let turn = s.g.turn;
-        let pawn0 = s.g.pawn[0];
-        let pawn1 = s.g.pawn[1];
-        let _ = s.extract_search_pv(super::super::algebraic_to_ace("e2"), 8);
-        assert_eq!(s.g.hash_lo, hash_lo);
-        assert_eq!(s.g.hash_hi, hash_hi);
-        assert_eq!(s.g.turn, turn);
-        assert_eq!(s.g.pawn[0], pawn0);
-        assert_eq!(s.g.pawn[1], pawn1);
-        if let Some(bridge) = s.bridge.as_ref() {
-            assert_eq!(bridge.undo_stack.len(), 0);
-        }
-    }
-
-    /// Pure policy self-play from startpos must be near 50/50 — a skewed
-    /// winner split means the playout policy (not the position) decides games.
-    #[test]
-    #[ignore] // diagnostic, run with -- --ignored --nocapture
-    fn rollout_policy_selfplay_balance() {
-        let mut s = AceSearch::new(AceGame::new());
-        s.deadline = Instant::now() + Duration::from_secs(60);
-        let mut rng: u64 = 0x1234_5678_9ABC_DEF0 | 1;
-        let mut p0_wins = 0u32;
-        let mut games = 0u32;
-        let mut lens = 0u64;
-        for _ in 0..200 {
-            // play a full policy game from the root (both sides policy)
-            let mut made = 0usize;
-            let win: i32;
-            loop {
-                let w = s.g.winner();
-                if w >= 0 {
-                    win = w;
-                    break;
-                }
-                if made >= 300 {
-                    win = -1;
-                    break;
-                }
-                let m = s.rollout_policy_move(&mut rng);
-                if m == 0 {
-                    win = -1;
-                    break;
-                }
-                s.g.make_move(m);
-                made += 1;
-            }
-            lens += made as u64;
-            for _ in 0..made {
-                s.g.unmake_move();
-            }
-            if win == 0 {
-                p0_wins += 1;
-            }
-            if win >= 0 {
-                games += 1;
-            }
-        }
-        println!(
-            "policy selfplay: games={} p0_wins={} ({:.0}%), avg len={}",
-            games,
-            p0_wins,
-            100.0 * p0_wins as f64 / games.max(1) as f64,
-            lens / 200
-        );
     }
 }

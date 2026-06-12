@@ -383,6 +383,17 @@ fn path_ok_after_wall(
     ok
 }
 
+/// Trial wall placement — both players must still reach goals (website rules oracle).
+pub fn wall_path_ok_after_place(
+    board: &mut Board,
+    row: u8,
+    col: u8,
+    orientation: WallOrientation,
+) -> bool {
+    let mut scratch = BfsScratch::new();
+    path_ok_after_wall(board, row, col, orientation, &mut scratch)
+}
+
 /// Matches scraped `collidesWithExistingWall`.
 fn wall_collides(board: &Board, row: u8, col: u8, orientation: WallOrientation) -> bool {
     let perpendicular = match orientation {
@@ -416,12 +427,18 @@ fn wall_collides(board: &Board, row: u8, col: u8, orientation: WallOrientation) 
 }
 
 /// Matches scraped `canWallBlock` — wall must touch existing topology to matter.
-fn can_wall_block_topology(board: &Board, row: u8, col: u8, orientation: WallOrientation) -> bool {
+pub fn can_wall_block_topology(
+    board: &Board,
+    row: u8,
+    col: u8,
+    orientation: WallOrientation,
+) -> bool {
     let js_col = col + 1;
     let js_row = row + 1;
 
     let (on_a, on_b) = match orientation {
-        WallOrientation::Horizontal => (js_col == 1, js_col == 8),
+        // Scraped `sideOnEdge`: horizontal right edge is col 9 (`numCols`), not wall slot h (js_col 8).
+        WallOrientation::Horizontal => (js_col == 1, js_col == 9),
         WallOrientation::Vertical => (js_row == 8, js_row == 1),
     };
 
@@ -590,7 +607,6 @@ mod tests {
         let walls = generate_wall_moves(&board);
         assert!(walls.len() > 100);
     }
-
     #[test]
     fn slice_matches_vec_at_startpos() {
         let mut board = Board::new();

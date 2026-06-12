@@ -4,6 +4,8 @@
 //! Player 0 starts at 76 (bottom) and races to row 0; player 1 starts at 4
 //! and races to row 8. Moves: 0..80 pawn target, 100+slot hw, 200+slot vw.
 
+use crate::core::board::WallOrientation;
+
 pub const DELTA: [i16; 4] = [-9, 9, -1, 1];
 pub const DIRBIT: [u8; 4] = [1, 2, 4, 8];
 
@@ -306,6 +308,192 @@ impl AceGame {
         false
     }
 
+    fn ace_has_wall_ti(&self, ti_row: i8, ti_col: i8, orientation: WallOrientation) -> bool {
+        if ti_row < 0 || ti_row > 7 || ti_col < 0 || ti_col > 7 {
+            return false;
+        }
+        let slot = (7 - ti_row as usize) * 8 + ti_col as usize;
+        match orientation {
+            WallOrientation::Horizontal => self.hw[slot] != 0,
+            WallOrientation::Vertical => self.vw[slot] != 0,
+        }
+    }
+
+    fn ace_wall_at_offset(
+        &self,
+        row: u8,
+        col: u8,
+        offsets: &[(i8, i8)],
+        orientation: WallOrientation,
+    ) -> bool {
+        let mut r = i16::from(row);
+        let mut c = i16::from(col);
+        for (dr, dc) in offsets {
+            r += i16::from(*dr);
+            c += i16::from(*dc);
+        }
+        self.ace_has_wall_ti(r as i8, c as i8, orientation)
+    }
+
+    /// Titanium `can_wall_block_topology` / site `canWallBlock` on ACE wall slots.
+    pub fn wall_can_block_topology(&self, wall_type: usize, slot: usize) -> bool {
+        let row = 7 - (slot / 8) as u8;
+        let col = (slot % 8) as u8;
+        let orientation = if wall_type == 0 {
+            WallOrientation::Horizontal
+        } else {
+            WallOrientation::Vertical
+        };
+        let js_col = col + 1;
+        let js_row = row + 1;
+        let (on_a, on_b) = match orientation {
+            WallOrientation::Horizontal => (js_col == 1, js_col == 9),
+            WallOrientation::Vertical => (js_row == 8, js_row == 1),
+        };
+        let side_a = on_a || self.ace_touching_side_a(row, col, orientation);
+        let side_b = on_b || self.ace_touching_side_b(row, col, orientation);
+        let middle = self.ace_touching_middle(row, col, orientation);
+        (side_a && side_b) || (side_a && middle) || (side_b && middle)
+    }
+
+    fn ace_touching_side_a(&self, row: u8, col: u8, orientation: WallOrientation) -> bool {
+        match orientation {
+            WallOrientation::Horizontal => {
+                self.ace_wall_at_offset(row, col, &[(0, -1)], WallOrientation::Vertical)
+                    || self.ace_wall_at_offset(
+                        row,
+                        col,
+                        &[(1, 0), (0, -1)],
+                        WallOrientation::Vertical,
+                    )
+                    || self.ace_wall_at_offset(
+                        row,
+                        col,
+                        &[(-1, 0), (0, -1)],
+                        WallOrientation::Vertical,
+                    )
+                    || self.ace_wall_at_offset(
+                        row,
+                        col,
+                        &[(0, -1), (0, -1)],
+                        WallOrientation::Horizontal,
+                    )
+            }
+            WallOrientation::Vertical => {
+                self.ace_wall_at_offset(row, col, &[(1, 0)], WallOrientation::Horizontal)
+                    || self.ace_wall_at_offset(
+                        row,
+                        col,
+                        &[(0, -1), (1, 0)],
+                        WallOrientation::Horizontal,
+                    )
+                    || self.ace_wall_at_offset(
+                        row,
+                        col,
+                        &[(0, 1), (1, 0)],
+                        WallOrientation::Horizontal,
+                    )
+                    || self.ace_wall_at_offset(
+                        row,
+                        col,
+                        &[(1, 0), (1, 0)],
+                        WallOrientation::Vertical,
+                    )
+            }
+        }
+    }
+
+    fn ace_touching_side_b(&self, row: u8, col: u8, orientation: WallOrientation) -> bool {
+        match orientation {
+            WallOrientation::Horizontal => {
+                self.ace_wall_at_offset(row, col, &[(0, 1)], WallOrientation::Vertical)
+                    || self.ace_wall_at_offset(
+                        row,
+                        col,
+                        &[(1, 0), (0, 1)],
+                        WallOrientation::Vertical,
+                    )
+                    || self.ace_wall_at_offset(
+                        row,
+                        col,
+                        &[(-1, 0), (0, 1)],
+                        WallOrientation::Vertical,
+                    )
+                    || self.ace_wall_at_offset(
+                        row,
+                        col,
+                        &[(0, 1), (0, 1)],
+                        WallOrientation::Horizontal,
+                    )
+            }
+            WallOrientation::Vertical => {
+                self.ace_wall_at_offset(row, col, &[(-1, 0)], WallOrientation::Horizontal)
+                    || self.ace_wall_at_offset(
+                        row,
+                        col,
+                        &[(0, -1), (-1, 0)],
+                        WallOrientation::Horizontal,
+                    )
+                    || self.ace_wall_at_offset(
+                        row,
+                        col,
+                        &[(0, 1), (-1, 0)],
+                        WallOrientation::Horizontal,
+                    )
+                    || self.ace_wall_at_offset(
+                        row,
+                        col,
+                        &[(-1, 0), (-1, 0)],
+                        WallOrientation::Vertical,
+                    )
+            }
+        }
+    }
+
+    fn ace_touching_middle(&self, row: u8, col: u8, orientation: WallOrientation) -> bool {
+        match orientation {
+            WallOrientation::Horizontal => {
+                self.ace_wall_at_offset(row, col, &[(1, 0)], WallOrientation::Vertical)
+                    || self.ace_wall_at_offset(row, col, &[(-1, 0)], WallOrientation::Vertical)
+            }
+            WallOrientation::Vertical => {
+                self.ace_wall_at_offset(row, col, &[(0, -1)], WallOrientation::Horizontal)
+                    || self.ace_wall_at_offset(row, col, &[(0, 1)], WallOrientation::Horizontal)
+            }
+        }
+    }
+
+    fn titanium_board_snapshot(&self) -> crate::core::board::Board {
+        use super::ace_move_to_board;
+        let mut board = crate::core::board::Board::new();
+        for i in 0..self.hist_len {
+            let _ = board.make_move(ace_move_to_board(self.hist_m[i]));
+        }
+        board
+    }
+
+    fn wall_path_ok_titanium(&self, wall_type: usize, slot: usize) -> bool {
+        use super::ace_move_to_board;
+        use crate::core::board::Move as BoardMove;
+        use crate::movegen::legal::wall_path_ok_after_place;
+
+        let m = if wall_type == 0 {
+            100 + slot as i16
+        } else {
+            200 + slot as i16
+        };
+        let BoardMove::Wall {
+            row,
+            col,
+            orientation,
+        } = ace_move_to_board(m)
+        else {
+            return false;
+        };
+        let mut board = self.titanium_board_snapshot();
+        wall_path_ok_after_place(&mut board, row, col, orientation)
+    }
+
     pub fn wall_legal(&mut self, wall_type: usize, slot: usize) -> bool {
         if self.wl[self.turn] <= 0 {
             return false;
@@ -313,13 +501,10 @@ impl AceGame {
         if !self.wall_fits(wall_type, slot) {
             return false;
         }
-        if !self.wall_needs_path_check(wall_type, slot) {
+        if !self.wall_can_block_topology(wall_type, slot) {
             return true;
         }
-        self.set_wall_bits(wall_type, slot, true);
-        let ok = self.has_path(0) && self.has_path(1);
-        self.set_wall_bits(wall_type, slot, false);
-        ok
+        self.wall_path_ok_titanium(wall_type, slot)
     }
 
     // ── Pawn moves ──────────────────────────────────────────────────────────
