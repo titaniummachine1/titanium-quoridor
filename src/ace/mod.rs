@@ -1,4 +1,12 @@
-//! ACE v10 hybrid port — quoridor (8).html search (_vendor/acev10_engine.js) plus optional Titanium movegen.
+//! ACE v11 hybrid port — quoridor_5.html "pathfix gen11_ghi" search
+//! (_vendor/acev11_engine.js) plus optional Titanium movegen.
+//!
+//! v11 over the v10 base (same HalfPW net, byte-identical NET_DATA):
+//! ZeroFence-A GHI guard on the TT, RaceProof exact race endgames (root
+//! solve, eval verdicts, last-wall commitment gate), and the unsound
+//! `wallCanBlockTopology` fast path removed from `wall_legal`. ThreatPrice
+//! and WallSense ship disabled in the JS (falsifier/SPRT-killed) and are
+//! not ported.
 //!
 //! Self-contained: own board representation, search, and HalfPW net eval.
 //! Only this module's `genmove` entry translates between Titanium algebraic
@@ -11,6 +19,7 @@
 pub mod game;
 pub mod net;
 pub mod perft;
+pub mod race;
 pub mod search;
 pub mod session;
 

@@ -1,15 +1,30 @@
-//! ACE v7 search — 1:1 port of the JS `Search` object.
+//! ACE v11 search — 1:1 port of the JS `Search` object (quoridor_5.html,
+//! pathfix gen11_ghi).
 //!
 //! Iterative-deepening αβ with aspiration windows, typed TT, killers/history/
 //! countermoves, null move, graduated LMR / EME, frontier LMP, reverse futility,
 //! lazy wall legality, repetition detection, wall-stamp dist caching,
 //! easy-move early stop, HalfPW net eval. Mirrors the JS node-for-node.
+//!
+//! gen11 additions over the v10 base:
+//! - ZeroFence-A GHI guard (PLAIN variant, `ghiAnchor` shipped false): TT
+//!   entries whose subtree leaned on a path-dependent repetition-zero are
+//!   stored flag-demoted or tainted; tainted entries never give score cutoffs.
+//! - RaceProof (`raceProof = true`, SPRT-passed): exact race-endgame tables
+//!   when both hands are empty (eval verdicts, root solve, last-wall
+//!   commitment gate with the budget reserve).
+//! - ThreatPrice / WallSense ship FALSE in the JS (falsifier/SPRT-killed) and
+//!   no-op cleanly when false — their machinery is intentionally NOT ported.
+//! - RaceProof(c) certificates (`certify_win.js`) are node-only; the browser
+//!   build runs with `RP_CERT === null`, which this port mirrors (the
+//!   commitment gate keeps the wall when no certifier exists).
 
 use crate::ace::ace_move_to_board;
 use crate::util::clock::{Duration, Instant};
 
 use crate::ace::game::{AceGame, ZOBRIST};
 use crate::ace::net::{net, Net, NET_BKT, NET_H, NET_MIRC, NET_MIRS};
+use crate::ace::race::{solve_race_config, RaceScratch, RACE_MATE, RACE_STATES};
 use crate::cat::prune::{gap_play_zone_mask, get_shortest_path, wall_should_search};
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move as BoardMove, Player, Undo, WallOrientation};
@@ -175,12 +190,23 @@ fn emit_ace_progress(
     let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
+/// RaceProof race-table LRU slots (keyed by wall-config zobrist).
+const RC_SLOTS: usize = 64;
+
 pub struct AceSearch {
     pub g: AceGame,
     tt_key_hi: Vec<u32>,
     tt_key_lo: Vec<u32>,
     tt_meta: Vec<i32>, // move | flag<<10 | depth<<12, 0 = empty
     tt_score: Vec<i32>,
+    // ZeroFence-A: 1 = tainted-zero entry (move-only, never a score cutoff)
+    tt_rep: Vec<u8>,
+    tt_anc_lo: Vec<u32>,
+    tt_anc_hi: Vec<u32>,
+    // per-ply open-subtree dependency window: min external path-rep target ply
+    sub_min: [i32; MAX_PLY],
+    sub_anc_lo: [u32; MAX_PLY],
+    sub_anc_hi: [u32; MAX_PLY],
     history_tbl: [i32; 512],
     cm: [i16; 512], // countermove table
     killers: [[i16; 2]; MAX_PLY],
@@ -211,6 +237,44 @@ pub struct AceSearch {
     deadline: Instant,
     root_best: i16,
     root_score: i32,
+    // ---------- pathfix feature flags (gen11 shipping config) ----------
+    /// Exact k=0 race endgame + last-wall gate (JS `raceProof`, ships true).
+    race_proof: bool,
+    // ZeroFence diagnostics (parity-debug counters, match JS fields)
+    refused_cuts: u64,
+    rb1_stores: u64,
+    dg_el: u64,
+    dg_eu: u64,
+    rep_path_c: u64,
+    rep_game_c: u64,
+    // RaceProof: race-table LRU (keyed by wall-config zobrist = hash sans pawn/turn)
+    rc_key_lo: [u32; RC_SLOTS],
+    rc_key_hi: [u32; RC_SLOTS],
+    rc_tbl: Vec<Option<Box<[i16]>>>,
+    rc_use: [u64; RC_SLOTS],
+    rc_tick: u64,
+    rc_last: i32,
+    rc_build_ms: u64,
+    rc_hits: u64,
+    rc_solves: u64,
+    rc_budget_miss: u64,
+    rc_solve_ms: u64,
+    rc_think_solve_ms: u64,
+    rc_solve_cap: f64,
+    rc_blocked: bool,
+    rc_miss_lo: u32,
+    rc_miss_hi: u32,
+    rc_think_solves: u32,
+    /// deterministic per-think in-tree solve cap (LRU holds 64: stops config-thrash)
+    rc_count_cap: u32,
+    rp_build_ok: bool,
+    rp_root_empty: bool,
+    pub rp_demotions: u64,
+    pub rp_root_solves: u64,
+    /// -1 sentinel: cell 0 (a1) is a legal pawn-move id
+    root_pawn_best: i16,
+    root_pawn_score: i32,
+    race_scratch: Option<Box<RaceScratch>>,
     /// Live `info json` during `think(..., log=true)` — cleared when search ends.
     stream_log: bool,
     stream_label: String,
@@ -236,6 +300,12 @@ impl AceSearch {
             tt_key_lo: vec![0; TT_SIZE],
             tt_meta: vec![0; TT_SIZE],
             tt_score: vec![0; TT_SIZE],
+            tt_rep: vec![0; TT_SIZE],
+            tt_anc_lo: vec![0; TT_SIZE],
+            tt_anc_hi: vec![0; TT_SIZE],
+            sub_min: [MAX_PLY as i32; MAX_PLY],
+            sub_anc_lo: [0; MAX_PLY],
+            sub_anc_hi: [0; MAX_PLY],
             history_tbl: [0; 512],
             cm: [0; 512],
             killers: [[0; 2]; MAX_PLY],
@@ -261,6 +331,38 @@ impl AceSearch {
             deadline: Instant::now(),
             root_best: 0,
             root_score: 0,
+            race_proof: true,
+            refused_cuts: 0,
+            rb1_stores: 0,
+            dg_el: 0,
+            dg_eu: 0,
+            rep_path_c: 0,
+            rep_game_c: 0,
+            rc_key_lo: [0; RC_SLOTS],
+            rc_key_hi: [0; RC_SLOTS],
+            rc_tbl: (0..RC_SLOTS).map(|_| None).collect(),
+            rc_use: [0; RC_SLOTS],
+            rc_tick: 0,
+            rc_last: -1,
+            rc_build_ms: 6,
+            rc_hits: 0,
+            rc_solves: 0,
+            rc_budget_miss: 0,
+            rc_solve_ms: 0,
+            rc_think_solve_ms: 0,
+            rc_solve_cap: f64::INFINITY,
+            rc_blocked: false,
+            rc_miss_lo: 0,
+            rc_miss_hi: 0,
+            rc_think_solves: 0,
+            rc_count_cap: 48,
+            rp_build_ok: false,
+            rp_root_empty: false,
+            rp_demotions: 0,
+            rp_root_solves: 0,
+            root_pawn_best: -1,
+            root_pawn_score: i32::MIN,
+            race_scratch: None,
             stream_log: false,
             stream_label: String::new(),
             stream_t0: Instant::now(),
@@ -437,6 +539,100 @@ impl AceSearch {
         self.cached_stamp = stamp;
     }
 
+    /// RaceProof: race table for the CURRENT wall config — LRU slot index, or
+    /// `None` when the in-tree solve budget gates the build (JS `raceTbl`).
+    /// Key = position hash with pawns and turn XORed out (wall config only).
+    fn race_tbl(&mut self, force: bool) -> Option<usize> {
+        let z = &ZOBRIST;
+        let mut k_lo =
+            self.g.hash_lo ^ z.pawn_lo[0][self.g.pawn[0]] ^ z.pawn_lo[1][self.g.pawn[1]];
+        let mut k_hi =
+            self.g.hash_hi ^ z.pawn_hi[0][self.g.pawn[0]] ^ z.pawn_hi[1][self.g.pawn[1]];
+        if self.g.turn == 1 {
+            k_lo ^= z.turn_lo;
+            k_hi ^= z.turn_hi;
+        }
+        let li = self.rc_last;
+        if li >= 0 && self.rc_key_lo[li as usize] == k_lo && self.rc_key_hi[li as usize] == k_hi {
+            self.rc_hits += 1;
+            return Some(li as usize);
+        }
+        if !force && self.rc_blocked && k_lo == self.rc_miss_lo && k_hi == self.rc_miss_hi {
+            self.rc_budget_miss += 1;
+            return None;
+        }
+        for i in 0..RC_SLOTS {
+            if self.rc_tbl[i].is_some() && self.rc_key_lo[i] == k_lo && self.rc_key_hi[i] == k_hi {
+                self.rc_last = i as i32;
+                self.rc_tick += 1;
+                self.rc_use[i] = self.rc_tick;
+                self.rc_hits += 1;
+                return Some(i);
+            }
+        }
+        if !force {
+            // in-tree miss: build only when cheap to amortize (ticket16 SPRT-kill lesson)
+            if !self.rp_build_ok
+                || self.rc_think_solves >= self.rc_count_cap
+                || (self.rc_think_solve_ms + self.rc_build_ms) as f64 > self.rc_solve_cap
+                || Instant::now() + Duration::from_millis(self.rc_build_ms) > self.deadline
+            {
+                self.rc_blocked = true;
+                self.rc_miss_lo = k_lo;
+                self.rc_miss_hi = k_hi;
+                self.rc_budget_miss += 1;
+                return None;
+            }
+            self.rc_think_solves += 1;
+        }
+        let mut slot = 0usize;
+        let mut min_use = u64::MAX;
+        for i in 0..RC_SLOTS {
+            if self.rc_tbl[i].is_none() {
+                slot = i;
+                break;
+            }
+            if self.rc_use[i] < min_use {
+                min_use = self.rc_use[i];
+                slot = i;
+            }
+        }
+        let mut tbl = self.rc_tbl[slot]
+            .take()
+            .unwrap_or_else(|| vec![0i16; RACE_STATES].into_boxed_slice());
+        if self.race_scratch.is_none() {
+            self.race_scratch = Some(Box::new(RaceScratch::new()));
+        }
+        let t0 = Instant::now();
+        solve_race_config(
+            &mut self.g,
+            self.race_scratch.as_mut().expect("race scratch"),
+            &mut tbl,
+        );
+        let dt0 = t0.elapsed().as_millis() as u64;
+        self.rc_solve_ms += dt0;
+        self.rc_think_solve_ms += dt0;
+        let dt = dt0 + 1;
+        if dt > self.rc_build_ms {
+            self.rc_build_ms = dt.min(50); // conservative adaptive gate, capped
+        }
+        self.rc_tbl[slot] = Some(tbl);
+        self.rc_key_lo[slot] = k_lo;
+        self.rc_key_hi[slot] = k_hi;
+        self.rc_tick += 1;
+        self.rc_use[slot] = self.rc_tick;
+        self.rc_last = slot as i32;
+        self.rc_solves += 1;
+        Some(slot)
+    }
+
+    /// Race-table value for the game's current state (helper around a slot).
+    #[inline]
+    fn race_value(&self, slot: usize) -> i16 {
+        let idx = (self.g.pawn[0] * 81 + self.g.pawn[1]) * 2 + self.g.turn;
+        self.rc_tbl[slot].as_ref().expect("race slot")[idx]
+    }
+
     fn evaluate(&mut self) -> i32 {
         let me = self.g.turn;
         let opp = 1 - me;
@@ -455,7 +651,25 @@ impl AceSearch {
         let d_me_i = d_me_u as i32;
         let d_opp_i = d_opp_u as i32;
         if w_me_i == 0 && w_opp_i == 0 {
-            // pure race
+            if self.race_proof {
+                // pathfix/RaceProof(a): exact k=0 verdict; cached tables always usable
+                if let Some(slot) = self.race_tbl(false) {
+                    let rv = self.race_value(slot) as i32;
+                    if rv > 0 {
+                        return RACE_MATE - rv; // proven win in rv plies (faster = higher)
+                    }
+                    if rv < 0 {
+                        return -(RACE_MATE + rv); // proven loss in -rv plies (slower = higher)
+                    }
+                    // rv==0 with a built table: the retrograde fixpoint resolved
+                    // every forced win/loss, so this live state (ab's terminal
+                    // check guarantees neither pawn is home here) is a PROVEN
+                    // DRAW under optimal play — score 0; the naive ±3000 formula
+                    // on a proven draw is phantom optimism (ZeroFence class).
+                    return 0;
+                }
+            }
+            // no table available (solve budget-gated/skipped): naive heuristic race
             if d_me_i <= d_opp_i {
                 return 3000 + (d_opp_i - d_me_i) * 50 - d_me_i;
             }
@@ -774,11 +988,16 @@ impl AceSearch {
     ) -> Result<i32, TimeUp> {
         self.nodes += 1;
         self.check_time()?;
+        self.sub_min[ply] = MAX_PLY as i32;
         let prev = 1 - self.g.turn;
         if (prev == 0 && self.g.pawn[0] < 9) || (prev == 1 && self.g.pawn[1] >= 72) {
             return Ok(-(MATE - ply as i32));
         }
         if ply >= MAX_PLY - 1 {
+            // truncation-zero is unverified — taint ancestors (ZeroFence)
+            self.sub_min[ply] = -1;
+            self.sub_anc_lo[ply] = 0;
+            self.sub_anc_hi[ply] = 0;
             return Ok(0);
         }
         self.path_lo[ply] = self.g.hash_lo;
@@ -787,6 +1006,13 @@ impl AceSearch {
             // repetition: search line, then game history back to last wall
             for ri in (0..ply).rev() {
                 if self.path_lo[ri] == self.g.hash_lo && self.path_hi[ri] == self.g.hash_hi {
+                    // path-dependent zero: record the external dependency window
+                    self.rep_path_c += 1;
+                    if (ri as i32) < self.sub_min[ply] {
+                        self.sub_min[ply] = ri as i32;
+                        self.sub_anc_lo[ply] = self.g.hash_lo;
+                        self.sub_anc_hi[ply] = self.g.hash_hi;
+                    }
                     return Ok(0);
                 }
             }
@@ -796,6 +1022,8 @@ impl AceSearch {
                 if self.g.hashes_u[gi as usize] == self.g.hash_lo
                     && self.g.hashes_u[gi as usize + 1] == self.g.hash_hi
                 {
+                    // game-history rep: path-independent, no taint
+                    self.rep_game_c += 1;
                     return Ok(0);
                 }
                 gi -= 2;
@@ -828,14 +1056,16 @@ impl AceSearch {
                 } else if es < -(MATE - 2 * MAX_PLY as i32) {
                     es += ply as i32;
                 }
-                if tflag == 0 {
-                    return Ok(es);
-                }
-                if tflag == 1 && es >= beta {
-                    return Ok(es);
-                }
-                if tflag == 2 && es <= alpha {
-                    return Ok(es);
+                if (tflag == 0) || (tflag == 1 && es >= beta) || (tflag == 2 && es <= alpha) {
+                    if self.tt_rep[idx] == 0 {
+                        return Ok(es);
+                    }
+                    // tainted-zero entry: PLAIN ZeroFence ships with the anchor
+                    // rescue disabled (`ghiAnchor=false` — the single min-ply
+                    // anchor slot under-covers multi-dependency certificates),
+                    // so a tainted entry never produces a score cutoff. The
+                    // stored move is still used for ordering.
+                    self.refused_cuts += 1;
                 }
             }
         }
@@ -871,6 +1101,11 @@ impl AceSearch {
                 self.dist0_idx = nd0;
                 self.dist1_idx = nd1;
                 self.cached_stamp = nst;
+                if self.sub_min[ply + 1] < self.sub_min[ply] {
+                    self.sub_min[ply] = self.sub_min[ply + 1];
+                    self.sub_anc_lo[ply] = self.sub_anc_lo[ply + 1];
+                    self.sub_anc_hi[ply] = self.sub_anc_hi[ply + 1];
+                }
                 let ns = -res?;
                 if ns >= beta && ns < MATE - 200 {
                     return Ok(beta);
@@ -990,7 +1225,18 @@ impl AceSearch {
             self.dist0_idx = nd0;
             self.dist1_idx = nd1;
             self.cached_stamp = nst;
+            if self.sub_min[ply + 1] < self.sub_min[ply] {
+                self.sub_min[ply] = self.sub_min[ply + 1];
+                self.sub_anc_lo[ply] = self.sub_anc_lo[ply + 1];
+                self.sub_anc_hi[ply] = self.sub_anc_hi[ply + 1];
+            }
             let score = result?;
+
+            // RaceProof(b): best non-wall root alternative
+            if ply == 0 && m < 100 && score > self.root_pawn_score {
+                self.root_pawn_score = score;
+                self.root_pawn_best = m;
+            }
 
             let prefer_non_repeat = ply == 0
                 && score == best
@@ -1047,10 +1293,40 @@ impl AceSearch {
         } else if ts < -(MATE - 2 * MAX_PLY as i32) {
             ts -= ply as i32;
         }
+        // ZeroFence-A store: claim leans on an external (path-dependent) rep-0
+        let mut sf = flag;
+        let mut rb = 0u8;
+        if self.sub_min[ply] < ply as i32 {
+            if best > 0 {
+                if sf == 0 {
+                    sf = 1;
+                    self.dg_el += 1;
+                } else if sf == 2 {
+                    rb = 1;
+                }
+            } else if best < 0 {
+                if sf == 0 {
+                    sf = 2;
+                    self.dg_eu += 1;
+                } else if sf == 1 {
+                    rb = 1;
+                }
+            } else {
+                rb = 1;
+            }
+            if rb != 0 {
+                self.rb1_stores += 1;
+            }
+        }
         self.tt_key_hi[idx] = self.g.hash_hi;
         self.tt_key_lo[idx] = self.g.hash_lo;
-        self.tt_meta[idx] = best_move as i32 | (flag << 10) | (depth << 12);
+        self.tt_meta[idx] = best_move as i32 | (sf << 10) | (depth << 12);
         self.tt_score[idx] = ts;
+        self.tt_rep[idx] = rb;
+        if rb != 0 {
+            self.tt_anc_lo[idx] = self.sub_anc_lo[ply];
+            self.tt_anc_hi[idx] = self.sub_anc_hi[ply];
+        }
         Ok(best)
     }
 
@@ -1065,7 +1341,12 @@ impl AceSearch {
         self.cached_stamp = nst;
     }
 
-    /// Entry: iterative deepening within `time_ms`. `full` disables the easy-move stop.
+    /// Entry: pathfix/RaceProof(a) — exact race endgame at ROOT. Both hands
+    /// empty ⇒ solve the now-fixed wall graph and play the PROVABLY optimal
+    /// move (fastest win / slowest loss). rv==0 (a built table = PROVEN DRAW)
+    /// or any inconsistency falls through to the normal search: with the
+    /// draw-aware evaluate() the search holds the draw at every depth while
+    /// keeping heuristic ordering among the equally-drawing moves.
     pub fn think(
         &mut self,
         time_ms: u64,
@@ -1074,11 +1355,114 @@ impl AceSearch {
         log: bool,
         engine_label: &str,
     ) -> ThinkResult {
+        if self.race_proof
+            && self.g.wl[0] == 0
+            && self.g.wl[1] == 0
+            && self.g.pawn[0] >= 9
+            && self.g.pawn[1] < 72
+        {
+            let rt0 = Instant::now();
+            // root-level: always allowed to build (force=true; deadline not set yet)
+            let rv = self.race_tbl(true).map_or(0, |s| self.race_value(s)) as i32;
+            if rv != 0 {
+                let slot = self.rc_last as usize;
+                let me = self.g.turn;
+                let mut buf = [0i16; 16];
+                let nm = self.g.gen_pawn_moves(&mut buf, 0);
+                let tbl = self.rc_tbl[slot].as_ref().expect("race slot");
+                let mut best_m: i16 = -1;
+                let mut best_v: i32 = 0;
+                let mut best_key = i32::MIN;
+                for &c in &buf[..nm] {
+                    let cu = c as usize;
+                    let my_v = if (me == 0 && cu < 9) || (me == 1 && cu >= 72) {
+                        1 // reaches own goal row: win in 1 ply
+                    } else {
+                        let v = tbl[if me == 0 {
+                            (cu * 81 + self.g.pawn[1]) * 2 + 1
+                        } else {
+                            (self.g.pawn[0] * 81 + cu) * 2
+                        }] as i32;
+                        if v == 0 {
+                            continue; // unresolved successor: never on a resolved-optimal line
+                        }
+                        // opp wins in v => I lose in v+1; opp loses in -v => I win in -v+1
+                        if v > 0 {
+                            -(v + 1)
+                        } else {
+                            1 - v
+                        }
+                    };
+                    // wins first (faster better), then slower losses
+                    let key = if my_v > 0 {
+                        1_000_000 - my_v
+                    } else {
+                        -1_000_000 - my_v
+                    };
+                    if key > best_key {
+                        best_key = key;
+                        best_m = c;
+                        best_v = my_v;
+                    }
+                }
+                if best_m >= 0 && best_v == rv {
+                    // consistency: chosen move must realize the state value
+                    self.rp_root_solves += 1;
+                    let rk = rv.abs();
+                    self.refresh_dist(0);
+                    return ThinkResult {
+                        mv: best_m,
+                        score: if rv > 0 {
+                            RACE_MATE - rk
+                        } else {
+                            -(RACE_MATE - rk)
+                        },
+                        depth: 99,
+                        nodes: nm as u64,
+                        ms: rt0.elapsed().as_millis() as u64,
+                        white_dist: self.d0[self.dist0_idx][self.g.pawn[0]],
+                        black_dist: self.d1[self.dist1_idx][self.g.pawn[1]],
+                        depth_log: Vec::new(),
+                    };
+                }
+            }
+        }
+        self.think_search(time_ms, max_depth, full, log, engine_label)
+    }
+
+    /// Iterative deepening within `time_ms`. `full` disables the easy-move stop.
+    fn think_search(
+        &mut self,
+        time_ms: u64,
+        max_depth: i32,
+        full: bool,
+        log: bool,
+        engine_label: &str,
+    ) -> ThinkResult {
         let t0 = Instant::now();
-        self.deadline = t0 + Duration::from_millis(time_ms);
+        // pathfix/RaceProof(b): reserve the commitment gate's worst-case cost
+        // out of the search deadline when the gate can fire — it runs after
+        // the search loop and its raceTbl(force=true) call ignores deadline.
+        let mut gate_reserve_ms = 0u64;
+        if self.race_proof && self.g.wl[self.g.turn] == 1 {
+            let cap = (0.3 * time_ms as f64) as u64;
+            gate_reserve_ms = self
+                .rc_build_ms
+                .max(25)
+                .max((time_ms as f64 * 0.15) as u64)
+                .min(cap);
+        }
+        self.deadline = t0 + Duration::from_millis(time_ms.saturating_sub(gate_reserve_ms));
         self.nodes = 0;
         self.root_best = 0;
         self.root_score = 0;
+        // RaceProof per-think solve budgets + caps
+        self.rc_think_solve_ms = 0;
+        self.rc_solve_cap = time_ms as f64 * 0.25;
+        self.rc_blocked = false;
+        self.rc_think_solves = 0;
+        self.rp_root_empty = self.race_proof && self.g.wl[0] == 0 && self.g.wl[1] == 0;
+        self.rp_build_ok = false;
         self.stream_log = log;
         self.stream_label = engine_label.to_string();
         self.stream_t0 = t0;
@@ -1098,6 +1482,9 @@ impl AceSearch {
         let mut last_score = 0;
         let mut last_depth = 0;
         let mut stable = 0;
+        // RaceProof(b); -1 sentinel — pawn-move id 0 (a1) is legal
+        let mut last_pawn_best: i16 = -1;
+        let mut last_pawn_score: i32 = i32::MIN;
         let mut depth_log: Vec<AceDepthLogEntry> = Vec::new();
         let max_depth = if max_depth > 0 { max_depth } else { 30 };
 
@@ -1108,6 +1495,10 @@ impl AceSearch {
             if Instant::now() >= self.deadline {
                 break;
             }
+            // RaceProof: in-tree solves only when cheap to amortize
+            self.rp_build_ok = self.rp_root_empty || d >= 6;
+            self.root_pawn_best = -1;
+            self.root_pawn_score = i32::MIN;
             self.stream_root_score = last_score;
             self.stream_search_depth = d;
             let nodes_at_depth = self.nodes;
@@ -1142,6 +1533,11 @@ impl AceSearch {
                     last_best = self.root_best;
                     last_score = sc;
                     last_depth = d;
+                    if self.root_pawn_best >= 0 {
+                        // RaceProof(b)
+                        last_pawn_best = self.root_pawn_best;
+                        last_pawn_score = self.root_pawn_score;
+                    }
                     let elapsed_ms = t0.elapsed().as_millis() as u64;
                     let pv = if last_best != 0 {
                         super::ace_to_algebraic(last_best)
@@ -1177,6 +1573,43 @@ impl AceSearch {
             }
             if Self::ace_over_time_budget(t0, time_ms, last_score) {
                 break;
+            }
+        }
+
+        // ---------- pathfix/RaceProof(b): last-wall commitment gate (DEMOTE, never forbid) ----------
+        // About to commit our FINAL wall: demote it below the best non-wall
+        // root alternative unless the post-wall position is PROVEN won/
+        // not-lost for us (k=0 oracle verdict <= 0 for the opponent when the
+        // wall empties both hands). Without a certifier (RP_CERT is null in
+        // the browser build this ports) the non-emptying branch is a
+        // documented NO-OP — keep the search's wall, never demote on missing
+        // evidence. Proven-mate walls and positions without a pawn
+        // alternative are kept. Worst-case gate cost was reserved out of the
+        // search deadline up front (gate_reserve_ms).
+        if self.race_proof
+            && last_best >= 100
+            && self.g.wl[self.g.turn] == 1
+            && last_pawn_best >= 0
+            && last_score < MATE - 200
+            && last_pawn_score > -(MATE - 200)
+        {
+            self.g.make_move(last_best);
+            let rp_ok = if self.g.wl[0] == 0 && self.g.wl[1] == 0 {
+                // root-level: always allowed to build
+                match self.race_tbl(true) {
+                    // stm is the OPPONENT: <= 0 = we are not lost
+                    Some(slot) => self.race_value(slot) <= 0,
+                    None => true,
+                }
+            } else {
+                true // no certifier (browser parity): keep the wall
+            };
+            self.g.unmake_move();
+            self.cached_stamp = -1;
+            if !rp_ok {
+                self.rp_demotions += 1;
+                last_best = last_pawn_best;
+                last_score = last_pawn_score;
             }
         }
 

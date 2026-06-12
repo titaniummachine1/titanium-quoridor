@@ -425,8 +425,9 @@ fn ace_engine_flag(args: &[String]) -> Option<&str> {
             return None;
         }
         match w[1].as_str() {
-            "ace" | "ace-v8" | "ace-v10" | "ace-cat" | "ace-ti" | "ace-v8-ti" | "ace-v8-ti-pmc"
-            | "ace-v10-ti" | "ace-v10-ti-pmc" | "ace-pmc" => Some(w[1].as_str()),
+            "ace" | "ace-v8" | "ace-v10" | "ace-v11" | "ace-cat" | "ace-ti" | "ace-v8-ti"
+            | "ace-v8-ti-pmc" | "ace-v10-ti" | "ace-v10-ti-pmc" | "ace-v11-ti"
+            | "ace-v11-ti-pmc" | "ace-pmc" => Some(w[1].as_str()),
             _ => None,
         }
     })
@@ -435,7 +436,8 @@ fn ace_engine_flag(args: &[String]) -> Option<&str> {
 fn ace_engine_mode(flag: &str) -> &'static str {
     match flag {
         "ace-cat" => "ace-cat",
-        "ace-ti" | "ace-v8-ti" | "ace-v8-ti-pmc" | "ace-v10-ti" | "ace-v10-ti-pmc" => "ace-ti",
+        "ace-ti" | "ace-v8-ti" | "ace-v8-ti-pmc" | "ace-v10-ti" | "ace-v10-ti-pmc"
+        | "ace-v11-ti" | "ace-v11-ti-pmc" => "ace-ti",
         _ => "ace",
     }
 }
