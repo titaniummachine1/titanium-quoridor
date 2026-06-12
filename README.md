@@ -6,10 +6,10 @@ Repo: [github.com/titaniummachine1/titanium-quoridor](https://github.com/titaniu
 
 Related repos:
 
-| Repo | Purpose |
-| --- | --- |
-| [Titanium-Quoridor-Website](https://github.com/titaniummachine1/Titanium-Quoridor-Website) | Playable UI, benchmarks, vendored JS engines |
-| [Titanium-Quoridor-Coordinator](https://github.com/titaniummachine1/Titanium-Quoridor-Coordinator) | Cloudflare Worker for distributed SPRT testing |
+| Repo                                                                                               | Purpose                                              |
+| -------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| [Titanium-Quoridor-Website](https://github.com/titaniummachine1/Titanium-Quoridor-Website)         | Playable UI, benchmarks, vendored JS engines         |
+| [Titanium-Quoridor-Coordinator](https://github.com/titaniummachine1/Titanium-Quoridor-Coordinator) | Cloudflare Worker for distributed SPRT testing       |
 | [titanium-quoridor-test-client](https://github.com/titaniummachine1/titanium-quoridor-test-client) | CLI worker that runs matches against the coordinator |
 
 ## Build & test

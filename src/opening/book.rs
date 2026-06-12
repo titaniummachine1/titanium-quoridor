@@ -619,7 +619,8 @@ mod tests {
     }
 
     fn is_anti_gorisanson_ply7(reply: Option<&str>) -> bool {
-        matches!(reply, Some("h3h" | "a3h" | "e3v" | "d3v" | "c3v"))
+        // e3h = mined-ply7 mainline (priority 160, proven fair-10v10)
+        matches!(reply, Some("e3h" | "h3h" | "a3h" | "e3v" | "d3v" | "c3v"))
     }
 
     #[test]
