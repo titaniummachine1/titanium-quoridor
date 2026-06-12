@@ -33,4 +33,6 @@ See `docs/` — start with `docs/STATE.md` for session handoff and `docs/video/R
 
 ## License
 
-MIT OR Apache-2.0 (see `Cargo.toml`).
+**GPL-3.0-or-later** (same copyleft family as [Stockfish](https://github.com/official-stockfish/Stockfish)).
+See `LICENSE`. If you distribute binaries or derivatives, you must provide
+corresponding source under the same license.
