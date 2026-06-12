@@ -5,6 +5,9 @@
 /target_alt
 /pkg
 *.log
+_tmp_stdin.txt
+ace_stderr.txt
+*_test.txt
 
 # Secrets & credentials (never commit)
 .env
