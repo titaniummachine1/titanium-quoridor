@@ -39,10 +39,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(12);
 
-    // Shipped vs research only — full legal perft d4 already covers scalar/bitboard.
     let modes = [
         (PawnGenMode::ShiftCanStep, "shift_can_step (SHIPPED)"),
-        (PawnGenMode::O1Lookup, "o1_lookup (research)"),
+        (PawnGenMode::O1Lookup, "o1_full_lut"),
+        (PawnGenMode::O1LeanLut, "o1_lean_lut (ek=0→shift, ek≠0→table)"),
     ];
 
     let oracle = {

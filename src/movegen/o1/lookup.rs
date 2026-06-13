@@ -1,8 +1,9 @@
 //! Runtime pawn lookup + shift-based wall masks.
 //!
-//! Pawns: offline `PAWN_LEGAL[sq][enemy_key][wall_key]` tables (`PawnGenMode::O1Lookup` only).
+//! Pawns: offline `PAWN_LEGAL[sq][enemy_key][wall_key]` tables — `PawnGenMode::O1Lookup`,
+//! the production default (perft-proven fastest; see `legal.rs`).
 //!
-//! Walls (production — all shift algebra, no runtime tables):
+//! Walls — all shift algebra, no runtime tables:
 //! - L1: empty slot (`!horizontal_walls` / `!vertical_walls`)
 //! - L2: collision (overlap / cross / neighbor) — whole-board shifts
 //! - Topo: `can_wall_block_topology` — two-of-three anchor shifts (flood-skip opt)
@@ -12,8 +13,9 @@ use crate::core::board::{Board, Move, WallOrientation};
 use crate::util::grid::{has_wall, square_index};
 
 use super::tables::{
-    wall_remap_byte, PAWN_CATALOG, PAWN_LAYER_VALID, PAWN_LEGAL, PAWN_WALL_COMBO_COUNT,
-    PAWN_WALL_DESC_COL, PAWN_WALL_DESC_H, PAWN_WALL_DESC_ROW, PAWN_WALL_SLOT_COUNT,
+    wall_remap_byte, PAWN_CATALOG, PAWN_H_PEXT_MASK, PAWN_H_SLOT_COUNT, PAWN_LAYER_VALID,
+    PAWN_LEGAL, PAWN_V_PEXT_MASK, PAWN_WALL_COMBO_COUNT, PAWN_WALL_DESC_COL, PAWN_WALL_DESC_H,
+    PAWN_WALL_DESC_ROW, PAWN_WALL_SLOT_COUNT,
 };
 
 /// Layer 1: 0=opponent absent, 1=up, 2=down, 3=left, 4=right (edge-invalid → 0).
@@ -38,7 +40,29 @@ pub fn encode_enemy_key(board: &Board, side: usize, sq: u8) -> u8 {
 }
 
 /// Pack physical wall combo (up to 12 local slots), remap to 8-bit semantic key.
+///
+/// Fast path: 2× PEXT instructions (BMI2, enabled by `-C target-feature=+bmi2`).
+/// Fallback: scalar loop over per-slot descriptor tables.
 pub fn pack_wall_key(board: &Board, sq: u8, enemy_key: u8) -> u8 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    return unsafe { pack_wall_key_pext(board, sq, enemy_key) };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    pack_wall_key_scalar(board, sq, enemy_key)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[target_feature(enable = "bmi2")]
+unsafe fn pack_wall_key_pext(board: &Board, sq: u8, enemy_key: u8) -> u8 {
+    use std::arch::x86_64::_pext_u64;
+    let si = sq as usize;
+    let ei = enemy_key as usize;
+    let h_bits = _pext_u64(board.horizontal_walls, PAWN_H_PEXT_MASK[si][ei]) as usize;
+    let v_bits = _pext_u64(board.vertical_walls, PAWN_V_PEXT_MASK[si][ei]) as usize;
+    let phys = h_bits | (v_bits << PAWN_H_SLOT_COUNT[si][ei]);
+    wall_remap_byte(sq, enemy_key, phys)
+}
+
+fn pack_wall_key_scalar(board: &Board, sq: u8, enemy_key: u8) -> u8 {
     let nw = PAWN_WALL_SLOT_COUNT[sq as usize][enemy_key as usize] as usize;
     let mut phys = 0usize;
     for i in 0..nw {
@@ -69,6 +93,45 @@ pub fn legal_pawn_move_mask(board: &Board, side: usize, sq: u8) -> u16 {
         return 0;
     }
     PAWN_LEGAL[sq as usize][enemy_key as usize][wall_key as usize]
+}
+
+/// Lean LUT: O1 table only when enemy is adjacent (ek≠0); plain `can_step` otherwise.
+///
+/// Rationale: ek=0 (no adjacent enemy) covers ~95 % of positions and needs only
+/// ≤4 `can_step` calls. Skipping the PEXT + remap + table lookup for that common
+/// case should be faster than the full O1 path.
+pub fn generate_pawn_moves_lean_lut(board: &Board, out: &mut [Move]) -> usize {
+    let side = board.side_to_move as usize;
+    let (fr, fc) = board.pawns[side];
+    let sq = square_index(fr, fc);
+    let enemy_key = encode_enemy_key(board, side, sq);
+    if enemy_key == 0 {
+        crate::movegen::pawn_bits::generate_pawn_moves_shift_slice(board, out)
+    } else {
+        let wall_key = pack_wall_key(board, sq, enemy_key);
+        let max = PAWN_WALL_COMBO_COUNT[sq as usize][enemy_key as usize] as usize;
+        if wall_key as usize >= max {
+            return 0;
+        }
+        let mask = PAWN_LEGAL[sq as usize][enemy_key as usize][wall_key as usize];
+        let catalog = &PAWN_CATALOG[sq as usize];
+        let mut n = 0usize;
+        let mut bits = mask;
+        while bits != 0 {
+            let slot = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let dest = catalog[slot];
+            if dest == 255 {
+                continue;
+            }
+            out[n] = Move::Pawn {
+                row: dest / 9,
+                col: dest % 9,
+            };
+            n += 1;
+        }
+        n
+    }
 }
 
 pub fn generate_pawn_moves_o1(board: &Board, out: &mut [Move]) -> usize {
@@ -443,6 +506,50 @@ mod tests {
                     scalar_topo_v_mask(&b),
                     "hw={hw:#x} vw={vw:#x} v"
                 );
+            }
+        }
+    }
+
+    /// Verify PEXT and scalar fallback agree on every (sq, enemy_key) for two board
+    /// positions. Runs on BMI2 builds only — skips silently on scalar-only builds.
+    #[test]
+    fn pext_pack_wall_key_matches_scalar() {
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        {
+            return;
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        {
+            let boards = [
+                Board::new(),
+                {
+                    let mut b = Board::new();
+                    b.horizontal_walls = 0x00_00_0A_00_14_00;
+                    b.vertical_walls = 0x01_02_04_00;
+                    b
+                },
+                {
+                    let mut b = Board::new();
+                    b.horizontal_walls = 0xFF_FF_FF_00_00_00;
+                    b.vertical_walls = 0x00_00_00_FF_FF_FF;
+                    b
+                },
+            ];
+            for b in &boards {
+                for sq in 0u8..81 {
+                    for ek in 0u8..5 {
+                        if PAWN_LAYER_VALID[sq as usize][ek as usize] == 0 {
+                            continue;
+                        }
+                        let pext = unsafe { pack_wall_key_pext(b, sq, ek) };
+                        let scalar = pack_wall_key_scalar(b, sq, ek);
+                        assert_eq!(
+                            pext, scalar,
+                            "sq={sq} ek={ek} hw={:#x} vw={:#x}",
+                            b.horizontal_walls, b.vertical_walls
+                        );
+                    }
+                }
             }
         }
     }

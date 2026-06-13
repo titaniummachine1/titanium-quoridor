@@ -250,6 +250,155 @@ pub fn both_players_reach_goals_parallel(board: &Board) -> bool {
     both_players_reach_goals_grids(pawn_bit(r1, c1), pawn_bit(r2, c2), &grids)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Kogge-Stone occluded fill (research) — fill whole rays per super-step
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `expand_wave` advances the frontier ONE square per iteration, so the BFS loop
+// runs once per unit of path *length* (~9–40 on a snaking board). The occluded
+// fill instead smears the frontier along an entire open run in O(log w) shifts,
+// so the loop runs once per *turn* in the path (~2–8). Same answer, fewer iters.
+//
+// Why no anti-wrap file masks are needed (the POC's ray-sweep bug does NOT apply):
+// the propagator `p` is `(!blocked >> shift) & FLOOD_PLAYABLE`, so it is ZERO on
+// every buffer-ring bit. The doubling step `p &= p << s` ANDs the propagator with
+// its own shift, so any run that would have to cross a buffer column picks up that
+// zero and stops. An east jump of 2/4/8 from cols 7/8 lands on a buffer bit (or a
+// next-row bit reachable only *through* a buffer bit), where the doubled
+// propagator is 0 — so the leak `expand_wave`'s critics feared cannot occur.
+// `random_walls_match_naive_reference` exercises this against the scalar BFS.
+
+/// Precomputed occluded-fill propagator stages for one `WallGrids`.
+///
+/// Each direction's propagator is `(!blocked >> shift) & FLOOD_PLAYABLE` and is
+/// *constant* across every super-step of a flood — so we build the doubled stages
+/// (`p`, `p & p<<s`, …) once per flood instead of per iteration. We carry shifts
+/// 1,2,4 only: a fully-open 9-cell run then fills in two super-steps instead of
+/// one, which is cheaper on average than paying a 4th (shift-8) round every step.
+struct KsProp {
+    // east (shift +1), stages for shifts 1 and 2; shift-4 reaches the rest.
+    e1: u128,
+    e2: u128,
+    e4: u128,
+    w1: u128,
+    w2: u128,
+    w4: u128,
+    s1: u128,
+    s2: u128,
+    s4: u128,
+    n1: u128,
+    n2: u128,
+    n4: u128,
+}
+
+impl KsProp {
+    #[inline]
+    fn new(grids: &WallGrids) -> Self {
+        const S: u32 = FLOOD_STRIDE;
+        let e1 = (!grids.east << 1) & FLOOD_PLAYABLE;
+        let e2 = e1 & (e1 << 1);
+        let e4 = e2 & (e2 << 2);
+        let w1 = (!grids.west >> 1) & FLOOD_PLAYABLE;
+        let w2 = w1 & (w1 >> 1);
+        let w4 = w2 & (w2 >> 2);
+        let s1 = (!grids.south << S) & FLOOD_PLAYABLE;
+        let s2 = s1 & (s1 << S);
+        let s4 = s2 & (s2 << (2 * S));
+        let n1 = (!grids.north >> S) & FLOOD_PLAYABLE;
+        let n2 = n1 & (n1 >> S);
+        let n4 = n2 & (n2 >> (2 * S));
+        Self { e1, e2, e4, w1, w2, w4, s1, s2, s4, n1, n2, n4 }
+    }
+
+    /// One occluded super-step: horizontal fill then vertical fill on the result,
+    /// so each step grows an L-shaped (single-turn) region instead of one ring.
+    #[inline]
+    fn expand(&self, wave: u128) -> u128 {
+        const S: u32 = FLOOD_STRIDE;
+        let mut g = wave;
+        // east
+        g |= self.e1 & (g << 1);
+        g |= self.e2 & (g << 2);
+        g |= self.e4 & (g << 4);
+        // west
+        g |= self.w1 & (g >> 1);
+        g |= self.w2 & (g >> 2);
+        g |= self.w4 & (g >> 4);
+        // south
+        g |= self.s1 & (g << S);
+        g |= self.s2 & (g << (2 * S));
+        g |= self.s4 & (g << (4 * S));
+        // north
+        g |= self.n1 & (g >> S);
+        g |= self.n2 & (g >> (2 * S));
+        g |= self.n4 & (g >> (4 * S));
+        g
+    }
+}
+
+/// Occluded-fill twin of [`flood_to_goal_grids`].
+#[inline]
+pub fn flood_to_goal_grids_ks(start: u128, grids: &WallGrids, goal: u128) -> (bool, u128) {
+    let mut visited = start & FLOOD_PLAYABLE;
+    if visited & goal != 0 {
+        return (true, visited);
+    }
+    let prop = KsProp::new(grids);
+    loop {
+        let next = prop.expand(visited);
+        if next & goal != 0 {
+            return (true, next);
+        }
+        if next == visited {
+            return (false, visited);
+        }
+        visited = next;
+    }
+}
+
+/// Occluded-fill twin of [`flood_to_goal_with_cache`] (Player 2, bit theft).
+#[inline]
+pub fn flood_to_goal_with_cache_ks(
+    start: u128,
+    cache: u128,
+    grids: &WallGrids,
+    goal: u128,
+) -> bool {
+    let mut visited = start & FLOOD_PLAYABLE;
+    if visited & goal != 0 {
+        return true;
+    }
+    let prop = KsProp::new(grids);
+    let mut pool = cache & !visited;
+    loop {
+        let mut next = prop.expand(visited);
+        if pool != 0 && next & pool != 0 {
+            if pool & goal != 0 {
+                return true;
+            }
+            next |= pool;
+            pool = 0;
+        }
+        if next & goal != 0 {
+            return true;
+        }
+        if next == visited {
+            return false;
+        }
+        visited = next;
+    }
+}
+
+/// Occluded-fill twin of [`both_players_reach_goals_grids`].
+#[inline]
+pub fn both_players_reach_goals_grids_ks(p1_start: u128, p2_start: u128, grids: &WallGrids) -> bool {
+    let (ok1, p1_visited) = flood_to_goal_grids_ks(p1_start, grids, P1_GOAL_BITS);
+    if !ok1 {
+        return false;
+    }
+    flood_to_goal_with_cache_ks(p2_start, p1_visited, grids, P2_GOAL_BITS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,11 +557,27 @@ mod tests {
             assert_eq!(got, expected, "walls h={:#x} v={:#x} p1={:?} p2={:?}",
                 board.horizontal_walls, board.vertical_walls, p1, p2);
 
+            // Kogge-Stone occluded fill must agree with the step-by-step flood.
+            let got_ks =
+                both_players_reach_goals_grids_ks(pawn_bit(p1.0, p1.1), pawn_bit(p2.0, p2.1), &grids);
+            assert_eq!(got_ks, expected, "KS walls h={:#x} v={:#x} p1={:?} p2={:?}",
+                board.horizontal_walls, board.vertical_walls, p1, p2);
+
             // Single-player floods must match the reference too.
-            let (got1, _) = flood_to_goal_grids(pawn_bit(p1.0, p1.1), &grids, P1_GOAL_BITS);
+            let (got1, vis1) = flood_to_goal_grids(pawn_bit(p1.0, p1.1), &grids, P1_GOAL_BITS);
             assert_eq!(got1, reach_goal_naive(&board, p1, Player::One));
             let (got2, _) = flood_to_goal_grids(pawn_bit(p2.0, p2.1), &grids, P2_GOAL_BITS);
             assert_eq!(got2, reach_goal_naive(&board, p2, Player::Two));
+
+            // KS single-player reachability + visited-set parity.
+            let (got1_ks, vis1_ks) = flood_to_goal_grids_ks(pawn_bit(p1.0, p1.1), &grids, P1_GOAL_BITS);
+            assert_eq!(got1_ks, got1, "KS p1 reach mismatch");
+            // When neither reaches the goal the full reachable set must be identical;
+            // on a goal hit either may early-exit with a partial set, so only compare
+            // the reached flag there.
+            if !got1 {
+                assert_eq!(vis1_ks, vis1, "KS p1 visited-set mismatch (no goal)");
+            }
         }
     }
 

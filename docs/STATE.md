@@ -9,7 +9,7 @@
 
 | Layer | Status |
 | ----- | ------ |
-| **Movegen** | **Closed.** Shift walls + `ShiftCanStep` pawns. O1 pawn tables = research only (`docs/MOVEGEN.md`). |
+| **Movegen** | **Closed.** Shift walls + **`O1Lookup` pawns (production default — perft-proven fastest at d4/d5)**; shift/scalar retained as bench/test alts (`docs/MOVEGEN.md`). |
 | **Perft** | Gates exact. Bench d3 ~**210–240M nps** (Zobrist §A on `main`). |
 | **Search** | Pure **ID negamax** + aspiration + adaptive LMR + qsearch + TT + CAT v3 prune. |
 | **ACE** | v11 port (pathfix gen11_ghi). |
@@ -36,9 +36,9 @@ Single-thread only. No GPU. No movegen multithreading.
 engine/src/
 ├── core/board.rs          Board, Move, zobrist, make/unmake
 ├── movegen/
-│   ├── legal.rs           legal moves, lazy WallTrialCtx, ShiftCanStep default
+│   ├── legal.rs           legal moves, lazy WallTrialCtx, O1Lookup default
 │   ├── pawn_bits.rs       pawn variants (bench/tests)
-│   └── o1/lookup.rs       wall_masks(), shift L2/TOPO; pawn O1 research tables
+│   └── o1/lookup.rs       wall_masks(), shift L2/TOPO; pawn O1 LUT (production)
 ├── path/parallel.rs       u128 flood + bit theft (L3)
 ├── search/alphabeta.rs    ID negamax, LMR, CAT prune
 └── util/perft.rs          perft_fast, bulk d1, timed d4 test

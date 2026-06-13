@@ -39,7 +39,8 @@ Production movegen is **single-thread shift algebra** (no wall tables, no movege
 Full reference: [`docs/MOVEGEN.md`](docs/MOVEGEN.md)  
 Handoff for follow-up work: [`docs/MOVEGEN-HANDOFF.md`](docs/MOVEGEN-HANDOFF.md)
 
-Offline pawn O(1) tables (research, not production default):
+Regenerate the offline pawn O(1) tables (`PawnGenMode::O1Lookup` is the
+production default — perft-proven fastest):
 
 ```bash
 cargo run --release --bin movegen-o1-gen

@@ -60,3 +60,11 @@ harness = false
 [[bench]]
 name = "perft_pawn_only"
 harness = false
+
+[[bench]]
+name = "flood_modes"
+harness = false
+
+[[bench]]
+name = "tt_speedup"
+harness = false

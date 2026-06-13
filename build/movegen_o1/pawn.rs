@@ -66,7 +66,10 @@ fn discover_enemy_layer(
         };
     }
 
-    let wall_bits = essential_wall_slots(sr, sc, sq, enemy_key, catalog);
+    // Sort H walls before V walls so PEXT extraction order (H mask then V mask)
+    // matches the bit-index ordering used by the remap table.
+    let mut wall_bits = essential_wall_slots(sr, sc, sq, enemy_key, catalog);
+    wall_bits.sort_by_key(|&(r, c, h)| (!h, r, c));
     let nw = wall_bits.len();
     assert!(
         nw <= MAX_WALL_SLOTS,

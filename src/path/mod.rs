@@ -12,8 +12,9 @@ pub use bfs::{
 };
 pub use masks::DirMasks;
 pub use parallel::{
-    both_players_reach_goals_grids, both_players_reach_goals_parallel, flood_to_goal_grids,
-    flood_to_goal_with_cache, wall_delta, WallGrids,
+    both_players_reach_goals_grids, both_players_reach_goals_grids_ks,
+    both_players_reach_goals_parallel, flood_to_goal_grids, flood_to_goal_grids_ks,
+    flood_to_goal_with_cache, flood_to_goal_with_cache_ks, wall_delta, WallGrids,
 };
 
 #[cfg(test)]

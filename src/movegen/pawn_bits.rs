@@ -104,63 +104,25 @@ fn push_pawn(row: u8, col: u8, out: &mut [Move], n: &mut usize) {
     *n += 1;
 }
 
-#[inline]
-fn shift_playable(bit: u128, shifter: fn(u128) -> u128) -> u128 {
-    let shifted = shifter(bit);
-    if shifted == 0 {
-        return 0;
-    }
-    if flood_sq_from_bit(shifted.trailing_zeros()).is_some() {
-        shifted
-    } else {
-        0
-    }
-}
-
-#[inline]
-fn shift_north_raw(bit: u128) -> u128 {
-    bit >> FLOOD_STRIDE
-}
-
-#[inline]
-fn shift_south_raw(bit: u128) -> u128 {
-    bit << FLOOD_STRIDE
-}
-
-#[inline]
-fn shift_east_raw(bit: u128) -> u128 {
-    bit << 1
-}
-
-#[inline]
-fn shift_west_raw(bit: u128) -> u128 {
-    bit >> 1
-}
-
-/// One axis: blind bit shift, then `can_step` wall validation + jump/lateral logic.
+/// One axis: `can_step` wall + boundary check, then jump/lateral logic.
 fn axis_shift(
     board: &Board,
     fr: u8,
     fc: u8,
     or: u8,
     oc: u8,
-    from: u128,
     dr: i8,
     dc: i8,
-    shifter: fn(u128) -> u128,
     perp_a: (i8, i8),
     perp_b: (i8, i8),
     out: &mut [Move],
     n: &mut usize,
 ) {
-    let neighbor_bit = shift_playable(from, shifter);
-    if neighbor_bit == 0 || !can_step(board, fr, fc, dr, dc) {
+    if !can_step(board, fr, fc, dr, dc) {
         return;
     }
-    let sq = flood_sq_from_bit(neighbor_bit.trailing_zeros()).expect("playable");
-    let (nr, nc) = unpack_square(sq);
-    debug_assert_eq!(nr, (fr as i8 + dr) as u8);
-    debug_assert_eq!(nc, (fc as i8 + dc) as u8);
+    let nr = (fr as i8 + dr) as u8;
+    let nc = (fc as i8 + dc) as u8;
 
     if (nr, nc) != (or, oc) {
         push_pawn(nr, nc, out, n);
@@ -179,26 +141,17 @@ fn axis_shift(
     }
 }
 
-/// Shift pawn bit N/S/E/W; validate edges with `can_step` — no `DirMasks` table.
+/// Validate each direction with `can_step` — no `DirMasks` table, no flood bits.
 pub fn generate_pawn_moves_shift_slice(board: &Board, out: &mut [Move]) -> usize {
     let side = board.side_to_move as usize;
     let (fr, fc) = board.pawns[side];
     let (or, oc) = board.pawns[1 - side];
-    let from = flood_bit_sq(square_index(fr, fc));
     let mut n = 0usize;
 
-    axis_shift(
-        board, fr, fc, or, oc, from, -1, 0, shift_north_raw, (0, -1), (0, 1), out, &mut n,
-    );
-    axis_shift(
-        board, fr, fc, or, oc, from, 1, 0, shift_south_raw, (0, -1), (0, 1), out, &mut n,
-    );
-    axis_shift(
-        board, fr, fc, or, oc, from, 0, 1, shift_east_raw, (-1, 0), (1, 0), out, &mut n,
-    );
-    axis_shift(
-        board, fr, fc, or, oc, from, 0, -1, shift_west_raw, (-1, 0), (1, 0), out, &mut n,
-    );
+    axis_shift(board, fr, fc, or, oc, -1, 0, (0, -1), (0, 1), out, &mut n);
+    axis_shift(board, fr, fc, or, oc, 1, 0, (0, -1), (0, 1), out, &mut n);
+    axis_shift(board, fr, fc, or, oc, 0, 1, (-1, 0), (1, 0), out, &mut n);
+    axis_shift(board, fr, fc, or, oc, 0, -1, (-1, 0), (1, 0), out, &mut n);
 
     n
 }

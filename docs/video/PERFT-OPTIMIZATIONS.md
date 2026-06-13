@@ -106,7 +106,7 @@ Depth 4 matches Ishtar/Canta oracle. Regression: `PERFT4_STARTPOS` test (`cargo 
 
 | Change | Why |
 | ------ | --- |
-| `PawnGenMode::ShiftCanStep` default | No `DirMasks` table per pawn node — blind shift + `can_step` wall check |
+| `PawnGenMode::ShiftCanStep` default *(superseded — `O1Lookup` is now the default, perft-proven faster)* | No `DirMasks` table per pawn node — blind shift + `can_step` wall check |
 | Smart perft test `perft_depth4_matches_oracle` | Depths 1→4 sequential, per-depth timeout, core pinning, `exit(1)` on hang |
 | `core_affinity` dev-dep | Pin worker to P-core (not last logical E-core on hybrid CPUs) |
 

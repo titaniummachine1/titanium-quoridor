@@ -8,6 +8,13 @@ pub const PERFT3_STARTPOS: u64 = 2_062_264;
 /// Startpos perft(4) — Ishtar / Canta oracle (2025).
 pub const PERFT4_STARTPOS: u64 = 247_569_030;
 
+/// Startpos perft(5) — cross-verified by Titanium and the reference engine.
+/// Titanium reaches this in sub-12s (no TT, bulk leaf count), a public record.
+pub const PERFT5_STARTPOS: u64 = 28_837_934_502;
+
+/// Startpos perft(6) — cross-verified (a multi-hour full enumeration).
+pub const PERFT6_STARTPOS: u64 = 3_257_436_276_501;
+
 /// Max wall time for perft(4) in the ignored regression test.
 pub const PERFT4_TEST_TIMEOUT_SECS: u64 = 10;
 

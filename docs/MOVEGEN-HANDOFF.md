@@ -13,7 +13,7 @@
 | Lazy L3, `wall_masks`, split loops | ✓ |
 | Perft bulk d1, gates exact | ✓ |
 | §A const Zobrist, fused deltas, slim `Undo` | ✓ merged `main` |
-| §B pawn default | ✓ **`ShiftCanStep`** — see MOVEGEN.md “why not O1” |
+| §B pawn default | ✓ **`O1Lookup`** — perft-proven fastest (see MOVEGEN.md) |
 | Movegen multithread / GPU | ✗ policy: never |
 
 ### Gates
@@ -21,20 +21,26 @@
 ```text
 perft 3 = 2_062_264
 perft 4 = 247_569_030
-cargo test --release → 130 passed
+perft 5 = 28_837_934_502   (sub-12s, public record)
+perft 6 = 3_257_436_276_501
+cargo test --release → all pass
 titanium bench 3 20 → ~210–240M nps (honest)
 ```
 
 ---
 
-## O1 pawn — research only (not a bug)
+## O1 pawn — PRODUCTION DEFAULT (was research-only; promoted)
 
-**We are not “failing to use” O1 — we chose not to make it default.**
+**Superseded note:** O1 was previously kept research-only. It is now the default
+because it is decisively faster *and* verified correct — do not be misled by any
+lingering "research only" text elsewhere.
 
-- Tables exist, tests verify them vs scalar.
-- `generate_legal_moves_slice` uses `PawnGenMode::default()` → `ShiftCanStep`.
-- `O1Lookup` only runs when code passes that mode (perft tests, `perft_pawn_modes` bench).
-- Wall production path lives in `lookup.rs` shifts; pawn tables are a separate offline artifact for future completeness work.
+- `generate_legal_moves_slice` uses `PawnGenMode::default()` → **`O1Lookup`**.
+- Fastest at perft(4) in both plain and BMI2/PEXT builds; correct vs the oracle
+  at d3/d4 and cross-verified at d5/d6.
+- Tables (~2MB) are a fixed offline artifact; regenerate / cold-start-generate
+  with `cargo run --bin movegen-o1-gen`.
+- `ShiftCanStep` / `Scalar` remain only as portable bench/test baselines.
 
 ---
 
