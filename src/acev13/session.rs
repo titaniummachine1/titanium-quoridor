@@ -21,13 +21,11 @@ fn reply_error(stdout: &mut io::Stdout, message: &str) {
 }
 
 fn build_search(engine_flag: &str, g: AceGame) -> Box<AceSearch> {
+    // gen13 default is the OPTIMIZED engine (Titanium O1 movegen); `ace-v13-pure`
+    // selects the faithful 1:1 native movegen (JS-matching reference).
     let mut search = match engine_flag {
-        "ace-cat" => AceSearch::with_cat(g),
-        "ace-ti" | "ace-v8-ti" | "ace-v8-ti-pmc" | "ace-v10-ti" | "ace-v10-ti-pmc"
-        | "ace-v11-ti" | "ace-v11-ti-pmc" | "ace-v13-ti" | "ace-v13-ti-pmc" => {
-            AceSearch::with_ti_movegen(g)
-        }
-        _ => AceSearch::new(g),
+        "ace-v13-pure" => AceSearch::new(g),
+        _ => AceSearch::with_ti_movegen(g),
     };
     if engine_flag.contains("pmc") {
         search.enable_eme();

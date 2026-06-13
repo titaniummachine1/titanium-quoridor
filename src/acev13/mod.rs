@@ -18,6 +18,12 @@
 //! Only this module's `genmove` entry translates between Titanium algebraic
 //! notation and ACE move encoding.
 //!
+//! CLI engines: **`ace-v13`** is the OPTIMIZED build — it runs the Titanium
+//! **O1 pawn-LUT movegen** (`with_ti_movegen`) and is free to diverge from the
+//! JS (fully-legal movegen, cleaner search tree). **`ace-v13-pure`** is the
+//! faithful 1:1 port (native ACE `wall_legal` movegen) kept as the JS-matching
+//! reference; the certificate / eval / search logic is identical between them.
+//!
 //! Coordinate mapping (ACE row 0 = top, Titanium row 0 = bottom):
 //!   pawn  m = (8 - row) * 9 + col
 //!   wall  m = base + (7 - row) * 8 + col   (base 100 = h, 200 = v)

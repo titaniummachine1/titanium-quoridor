@@ -96,7 +96,7 @@ fn print_usage() {
         "  titanium session [--engine ace-v13-ti] — long-lived REPL (TT persists between plies)"
     );
     println!(
-        "  titanium genmove --engine ace-v13[-ti] [moves...] — gen13 ACE port (ACEV13.html)"
+        "  titanium genmove --engine ace-v13 [moves...] — gen13 ACE port (O1 movegen; ace-v13-pure = faithful 1:1)"
     );
     println!("  titanium ace-perft [depth] [--iters N] — ACE vs Titanium movegen perft compare");
 }
@@ -467,9 +467,8 @@ fn ace_engine_flag(args: &[String]) -> Option<&str> {
         match w[1].as_str() {
             "ace" | "ace-v8" | "ace-v10" | "ace-v11" | "ace-cat" | "ace-ti" | "ace-v8-ti"
             | "ace-v8-ti-pmc" | "ace-v10-ti" | "ace-v10-ti-pmc" | "ace-v11-ti"
-            | "ace-v11-ti-pmc" | "ace-pmc" | "ace-v13" | "ace-v13-ti" | "ace-v13-ti-pmc" => {
-                Some(w[1].as_str())
-            }
+            | "ace-v11-ti-pmc" | "ace-pmc" | "ace-v13" | "ace-v13-ti" | "ace-v13-ti-pmc"
+            | "ace-v13-pure" => Some(w[1].as_str()),
             _ => None,
         }
     })
@@ -478,8 +477,13 @@ fn ace_engine_flag(args: &[String]) -> Option<&str> {
 fn ace_engine_mode(flag: &str) -> &'static str {
     match flag {
         "ace-cat" => "ace-cat",
+        // gen13: the headline `ace-v13` is the OPTIMIZED engine — it uses the
+        // Titanium O1 movegen. `ace-v13-pure` is the faithful 1:1 (native ACE
+        // `wall_legal` movegen) kept as the JS-matching reference.
         "ace-ti" | "ace-v8-ti" | "ace-v8-ti-pmc" | "ace-v10-ti" | "ace-v10-ti-pmc"
-        | "ace-v11-ti" | "ace-v11-ti-pmc" | "ace-v13-ti" | "ace-v13-ti-pmc" => "ace-ti",
+        | "ace-v11-ti" | "ace-v11-ti-pmc" | "ace-v13" | "ace-v13-ti" | "ace-v13-ti-pmc" => {
+            "ace-ti"
+        }
         _ => "ace",
     }
 }
