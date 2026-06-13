@@ -38,8 +38,10 @@ const DEFAULT_TT_BITS: usize = 22;
 //   static, like main:         `TT_BITS=22 cargo run --bin titanium -- perft 5`
 /// Adaptive start (env `TT_START_BITS`): holds the d3 working set in ~1.5 MB.
 const DEFAULT_START_BITS: usize = 14;
-/// Adaptive ceiling (env `TT_MAX_BITS`): 24 = 1.5 GB; growth stops here.
-const DEFAULT_MAX_BITS: usize = 24;
+/// Adaptive ceiling (env `TT_MAX_BITS`): growth stops here. RAM = `2^bits × 96 B`
+/// per cluster: 24 = 1.6 GB, **25 = 3.2 GB (default cap)**, 26 = 6.4 GB (≈ the
+/// "~8 GB" budget), 27 = 12.9 GB. Raise with `TT_MAX_BITS=26` for ~8 GB headroom.
+const DEFAULT_MAX_BITS: usize = 25;
 
 // NOTE: a 16-byte packed layout (`key` + `depth<<56 | nodes`, cluster = one
 // 64-byte cache line) was tried and measured at BOTH perft(4) and perft(5) — no
