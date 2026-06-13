@@ -71,3 +71,7 @@ harness = false
 [[bench]]
 name = "tt_speedup"
 harness = false
+
+[[bench]]
+name = "perft_full_compare"
+harness = false

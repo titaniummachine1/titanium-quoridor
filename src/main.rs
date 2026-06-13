@@ -107,10 +107,12 @@ const DEFAULT_THREAD_BENCH_DEPTH: u32 = 4;
 struct CliArgs {
     positional: Vec<String>,
     threads: usize,
+    no_tt: bool,
 }
 
 fn parse_cli(args: &[String]) -> CliArgs {
     let mut threads = 1usize;
+    let mut no_tt = false;
     let mut positional = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
@@ -123,12 +125,18 @@ fn parse_cli(args: &[String]) -> CliArgs {
             i += 2;
             continue;
         }
+        if args[i] == "--no-tt" {
+            no_tt = true;
+            i += 1;
+            continue;
+        }
         positional.push(args[i].clone());
         i += 1;
     }
     CliArgs {
         positional,
         threads,
+        no_tt,
     }
 }
 
@@ -165,7 +173,12 @@ fn run_perft(args: &[String]) {
     let (board, depth) = load_board(&cli, 2);
     let mut engine = make_engine(cli.threads);
     let start = Instant::now();
-    let nodes = engine.perft(&board, depth);
+    let nodes = if cli.no_tt {
+        let mut board_copy = board.clone();
+        engine.perft_no_tt(&mut board_copy, depth)
+    } else {
+        engine.perft(&board, depth)
+    };
     let elapsed = start.elapsed();
     println!("perft {} {}", depth, nodes);
     println!("threads {}", cli.threads);
