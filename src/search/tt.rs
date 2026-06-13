@@ -3,21 +3,22 @@
 //! Stockfish-style **clustered buckets** (4 slots per index) to cut collisions.
 
 const TT_CLUSTER: usize = 4;
-/// Default index bits → `2^bits` clusters of [`TT_CLUSTER`] slots (~24 MB at 18).
+/// Default index bits → `2^bits` clusters of [`TT_CLUSTER`] slots (~384 MB at 22).
 /// Overridable at construction via the `TT_BITS` env var (10..=27).
 ///
 /// Size is a depth-dependent tradeoff, measured (native, perft, `tt_speedup` bench):
 ///   | bits | RAM | perft(4) TT-on | perft(5) TT-on |
-///   | 18 | 24 MB | **0.30 s** | 20.7 s |
+///   | 18 | 24 MB | 0.30 s | 20.7 s |
 ///   | 20 | 96 MB | 0.33 s | 16.1 s |
 ///   | 22 | 384 MB | 0.41 s | **12.6 s** |
 ///   | 24 | 1.5 GB | 0.76 s | 13.4 s |
-/// A bigger table raises the hit rate (big win once it fills at depth 5+: ~1.6×),
-/// but at shallow depth the tiny working set can't amortise the scattered-probe
-/// page-fault/TLB cost, so it *regresses* perft(4). Default stays small to
-/// protect the common case; deep perft can opt in with `TT_BITS=22`. (Beyond 22
-/// the table's own cache pressure outweighs the marginal hit-rate gain.)
-const DEFAULT_TT_BITS: usize = 18;
+/// **22 is the chosen default — the optimal speed/size tradeoff:** it owns the
+/// deep perft (d5 record 12.6 s, ~1.6× over 18) for 384 MB, while 24 doubles to
+/// 1.5 GB *and* regresses (the table's own cache pressure outweighs the marginal
+/// hit-rate gain). The only cost is shallow perft(4) (0.41 s vs 0.30 s at 18 —
+/// the tiny working set can't amortise the scattered-probe page-fault/TLB cost);
+/// a memory-constrained caller can drop back with `TT_BITS=18`.
+const DEFAULT_TT_BITS: usize = 22;
 
 // NOTE: a 16-byte packed layout (`key` + `depth<<56 | nodes`, cluster = one
 // 64-byte cache line) was tried and measured at BOTH perft(4) and perft(5) — no
