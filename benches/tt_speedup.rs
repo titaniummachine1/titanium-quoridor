@@ -10,6 +10,7 @@ use std::time::Instant;
 use titanium::{perft_fast_mode, perft_no_tt_mode, Board, PawnGenMode};
 
 fn main() {
+    titanium::movegen::prewarm(); // build cold-start tables before timing
     // Depth from env: `$env:TT_DEPTH='5'`. Default 4. No-TT baseline only runs
     // at depth <= 4 (depth 5 no-TT is ~minutes — 28.8B nodes).
     let depth: u32 = env::var("TT_DEPTH")

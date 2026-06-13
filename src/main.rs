@@ -40,6 +40,18 @@ fn main() {
         return;
     }
 
+    // Cold-start pawn tables (~1-2s, once per process). Long-lived server modes
+    // kick the build off in the background AT LAUNCH so it overlaps the GUI
+    // handshake (`isready`/first move blocks on it only if it isn't done yet);
+    // one-shot timed commands build synchronously up front so the build is never
+    // inside a measured region. Never rebuilds mid-session — that's the OnceLock.
+    match args[1].as_str() {
+        "uci" | "session" => {
+            std::thread::spawn(|| titanium::movegen::prewarm());
+        }
+        _ => titanium::movegen::prewarm(),
+    }
+
     match args[1].as_str() {
         "perft" => run_perft(&args),
         "divide" => run_divide(&args),

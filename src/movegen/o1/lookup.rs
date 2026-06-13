@@ -12,11 +12,7 @@
 use crate::core::board::{Board, Move, WallOrientation};
 use crate::util::grid::{has_wall, square_index};
 
-use super::tables::{
-    wall_remap_byte, PAWN_CATALOG, PAWN_H_PEXT_MASK, PAWN_H_SLOT_COUNT, PAWN_LAYER_VALID,
-    PAWN_LEGAL, PAWN_V_PEXT_MASK, PAWN_WALL_COMBO_COUNT, PAWN_WALL_DESC_COL, PAWN_WALL_DESC_H,
-    PAWN_WALL_DESC_ROW, PAWN_WALL_SLOT_COUNT,
-};
+use super::runtime::tables;
 
 /// Layer 1: 0=opponent absent, 1=up, 2=down, 3=left, 4=right (edge-invalid → 0).
 pub fn encode_enemy_key(board: &Board, side: usize, sq: u8) -> u8 {
@@ -32,7 +28,7 @@ pub fn encode_enemy_key(board: &Board, side: usize, sq: u8) -> u8 {
         (0, 1) => 4,
         _ => return 0,
     };
-    if PAWN_LAYER_VALID[sq as usize][ek as usize] == 0 {
+    if tables().layer_valid[sq as usize][ek as usize] == 0 {
         0
     } else {
         ek
@@ -54,21 +50,23 @@ pub fn pack_wall_key(board: &Board, sq: u8, enemy_key: u8) -> u8 {
 #[target_feature(enable = "bmi2")]
 unsafe fn pack_wall_key_pext(board: &Board, sq: u8, enemy_key: u8) -> u8 {
     use std::arch::x86_64::_pext_u64;
+    let t = tables();
     let si = sq as usize;
     let ei = enemy_key as usize;
-    let h_bits = _pext_u64(board.horizontal_walls, PAWN_H_PEXT_MASK[si][ei]) as usize;
-    let v_bits = _pext_u64(board.vertical_walls, PAWN_V_PEXT_MASK[si][ei]) as usize;
-    let phys = h_bits | (v_bits << PAWN_H_SLOT_COUNT[si][ei]);
-    wall_remap_byte(sq, enemy_key, phys)
+    let h_bits = _pext_u64(board.horizontal_walls, t.h_pext_mask[si][ei]) as usize;
+    let v_bits = _pext_u64(board.vertical_walls, t.v_pext_mask[si][ei]) as usize;
+    let phys = h_bits | (v_bits << t.h_slot_count[si][ei]);
+    t.wall_remap_byte(sq, enemy_key, phys)
 }
 
 fn pack_wall_key_scalar(board: &Board, sq: u8, enemy_key: u8) -> u8 {
-    let nw = PAWN_WALL_SLOT_COUNT[sq as usize][enemy_key as usize] as usize;
+    let t = tables();
+    let nw = t.wall_slot_count[sq as usize][enemy_key as usize] as usize;
     let mut phys = 0usize;
     for i in 0..nw {
-        let r = PAWN_WALL_DESC_ROW[sq as usize][enemy_key as usize][i];
-        let c = PAWN_WALL_DESC_COL[sq as usize][enemy_key as usize][i];
-        let h = PAWN_WALL_DESC_H[sq as usize][enemy_key as usize][i] != 0;
+        let r = t.desc_row[sq as usize][enemy_key as usize][i];
+        let c = t.desc_col[sq as usize][enemy_key as usize][i];
+        let h = t.desc_h[sq as usize][enemy_key as usize][i] != 0;
         let orient = if h {
             WallOrientation::Horizontal
         } else {
@@ -78,21 +76,22 @@ fn pack_wall_key_scalar(board: &Board, sq: u8, enemy_key: u8) -> u8 {
             phys |= 1 << i;
         }
     }
-    wall_remap_byte(sq, enemy_key, phys)
+    t.wall_remap_byte(sq, enemy_key, phys)
 }
 
 #[inline]
 pub fn legal_pawn_move_mask(board: &Board, side: usize, sq: u8) -> u16 {
     let enemy_key = encode_enemy_key(board, side, sq);
-    if PAWN_LAYER_VALID[sq as usize][enemy_key as usize] == 0 {
+    let t = tables();
+    if t.layer_valid[sq as usize][enemy_key as usize] == 0 {
         return 0;
     }
     let wall_key = pack_wall_key(board, sq, enemy_key);
-    let max = PAWN_WALL_COMBO_COUNT[sq as usize][enemy_key as usize] as usize;
+    let max = t.wall_combo_count[sq as usize][enemy_key as usize] as usize;
     if wall_key as usize >= max {
         return 0;
     }
-    PAWN_LEGAL[sq as usize][enemy_key as usize][wall_key as usize]
+    t.legal[sq as usize][enemy_key as usize][wall_key as usize]
 }
 
 /// Lean LUT: O1 table only when enemy is adjacent (ek≠0); plain `can_step` otherwise.
@@ -108,13 +107,14 @@ pub fn generate_pawn_moves_lean_lut(board: &Board, out: &mut [Move]) -> usize {
     if enemy_key == 0 {
         crate::movegen::pawn_bits::generate_pawn_moves_shift_slice(board, out)
     } else {
+        let t = tables();
         let wall_key = pack_wall_key(board, sq, enemy_key);
-        let max = PAWN_WALL_COMBO_COUNT[sq as usize][enemy_key as usize] as usize;
+        let max = t.wall_combo_count[sq as usize][enemy_key as usize] as usize;
         if wall_key as usize >= max {
             return 0;
         }
-        let mask = PAWN_LEGAL[sq as usize][enemy_key as usize][wall_key as usize];
-        let catalog = &PAWN_CATALOG[sq as usize];
+        let mask = t.legal[sq as usize][enemy_key as usize][wall_key as usize];
+        let catalog = &t.catalog[sq as usize];
         let mut n = 0usize;
         let mut bits = mask;
         while bits != 0 {
@@ -139,7 +139,7 @@ pub fn generate_pawn_moves_o1(board: &Board, out: &mut [Move]) -> usize {
     let (fr, fc) = board.pawns[side];
     let sq = square_index(fr, fc);
     let mask = legal_pawn_move_mask(board, side, sq);
-    let catalog = &PAWN_CATALOG[sq as usize];
+    let catalog = &tables().catalog[sq as usize];
     let mut n = 0usize;
     let mut bits = mask;
     while bits != 0 {
@@ -293,7 +293,7 @@ mod tests {
     fn scalar_mask(board: &Board, player: Player, sq: u8) -> u16 {
         let mut moves = [Move::Pawn { row: 0, col: 0 }; 8];
         let n = generate_pawn_moves_scalar_for(board, player, &mut moves);
-        let catalog = &PAWN_CATALOG[sq as usize];
+        let catalog = &tables().catalog[sq as usize];
         let mut mask = 0u16;
         for m in &moves[..n] {
             if let Move::Pawn { row, col } = m {
@@ -340,17 +340,18 @@ mod tests {
 
     #[test]
     fn all_wall_slots_fit_8_bits() {
+        let t = tables();
         for sq in 0u8..81 {
             for ek in 0u8..5 {
-                if PAWN_LAYER_VALID[sq as usize][ek as usize] == 0 {
+                if t.layer_valid[sq as usize][ek as usize] == 0 {
                     continue;
                 }
-                let max = PAWN_WALL_COMBO_COUNT[sq as usize][ek as usize];
+                let max = t.wall_combo_count[sq as usize][ek as usize];
                 assert!(
                     max <= 256,
                     "sq {sq} enemy {ek}: {max} combos need >8 wall bits"
                 );
-                let nw = PAWN_WALL_SLOT_COUNT[sq as usize][ek as usize];
+                let nw = t.wall_slot_count[sq as usize][ek as usize];
                 assert!(nw <= 12, "sq {sq} enemy {ek}: {nw} wall slots");
             }
         }
@@ -535,10 +536,11 @@ mod tests {
                     b
                 },
             ];
+            let t = tables();
             for b in &boards {
                 for sq in 0u8..81 {
                     for ek in 0u8..5 {
-                        if PAWN_LAYER_VALID[sq as usize][ek as usize] == 0 {
+                        if t.layer_valid[sq as usize][ek as usize] == 0 {
                             continue;
                         }
                         let pext = unsafe { pack_wall_key_pext(b, sq, ek) };

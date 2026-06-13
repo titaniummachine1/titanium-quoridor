@@ -68,6 +68,7 @@ fn build_corpus() -> Vec<Case> {
 }
 
 fn main() {
+    titanium::movegen::prewarm(); // build cold-start tables before timing
     let corpus = build_corpus();
 
     // 1) Correctness: the two floods must agree on every position.

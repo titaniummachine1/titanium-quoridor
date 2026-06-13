@@ -548,6 +548,7 @@ mod tests {
     #[test]
     #[ignore = "slow; release: cargo test --release perft_depth4 -- --ignored --nocapture"]
     fn perft_depth4_matches_oracle() {
+        crate::movegen::prewarm(); // cold-start tables before the timed depths
         let mut completed: Vec<(u32, u64, Duration, Duration)> = Vec::with_capacity(4);
         let mut prev_elapsed = Duration::from_millis(PERFT_DEPTH_TIMEOUT_FLOOR_MS);
 

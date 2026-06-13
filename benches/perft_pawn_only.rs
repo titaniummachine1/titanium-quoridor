@@ -33,6 +33,7 @@ fn maybe_pin_core() {}
 
 fn main() {
     maybe_pin_core();
+    titanium::movegen::prewarm(); // build cold-start tables before timing
 
     let depth: u32 = env::var("PAWN_ONLY_DEPTH")
         .ok()

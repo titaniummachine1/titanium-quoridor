@@ -5,10 +5,12 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use super::pawn::{
-    discover_all_pawn_tables, ENEMY_LAYERS, MAX_WALL_SLOTS, PHYS_WALL_COMBOS, WALL_KEYS,
+// Single source of truth: the table-computation logic lives in the engine lib
+// (`titanium::movegen::o1::gen`), shared with the runtime cold-start builder.
+use titanium::movegen::o1::gen::{
+    discover_all_pawn_tables, EnemyLayerMeta, PawnSquareMeta, ENEMY_LAYERS, MAX_WALL_SLOTS,
+    PHYS_WALL_COMBOS, WALL_KEYS,
 };
-use super::progress::phase_bar;
 
 pub fn generate(out_path: &Path) {
     let t0 = Instant::now();
@@ -16,8 +18,8 @@ pub fn generate(out_path: &Path) {
         std::fs::create_dir_all(parent).expect("create output dir");
     }
 
-    let bar = phase_bar();
-    let pawn = discover_all_pawn_tables(&bar);
+    eprintln!("movegen-o1-gen: discovering pawn tables…");
+    let pawn = discover_all_pawn_tables();
 
     let file = File::create(out_path).expect("create tables file");
     let mut w = BufWriter::new(file);
@@ -145,8 +147,7 @@ pub fn generate(out_path: &Path) {
         "pub const PAWN_LEGAL: [[[u16; {WALL_KEYS}]; {ENEMY_LAYERS}]; 81] = ["
     )
     .unwrap();
-    bar.begin(81, "emit tables.rs");
-    for (sq, p) in pawn.iter().enumerate() {
+    for p in pawn.iter() {
         writeln!(w, "    [").unwrap();
         for layer in &p.layers {
             write!(w, "        [").unwrap();
@@ -162,9 +163,7 @@ pub fn generate(out_path: &Path) {
             writeln!(w, "\n        ],").unwrap();
         }
         writeln!(w, "    ],").unwrap();
-        bar.tick(&format!("write square {sq}/80"));
     }
-    bar.finish("tables written");
     writeln!(w, "];").unwrap();
     writeln!(w).unwrap();
 
@@ -176,13 +175,9 @@ pub fn generate(out_path: &Path) {
     );
 }
 
-fn write_wall_desc<F>(
-    w: &mut BufWriter<File>,
-    name: &str,
-    pawn: &[super::pawn::PawnSquareMeta],
-    f: F,
-) where
-    F: Fn(&super::pawn::EnemyLayerMeta, usize) -> u8,
+fn write_wall_desc<F>(w: &mut BufWriter<File>, name: &str, pawn: &[PawnSquareMeta], f: F)
+where
+    F: Fn(&EnemyLayerMeta, usize) -> u8,
 {
     writeln!(w, "pub const {name}: [[[u8; {MAX_WALL_SLOTS}]; 5]; 81] = [").unwrap();
     for p in pawn {

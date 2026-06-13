@@ -30,18 +30,18 @@ pub struct EnemyLayerMeta {
     pub wall_remap: Vec<u8>,
 }
 
-pub fn discover_all_pawn_tables(bar: &super::progress::PhaseBar) -> Vec<PawnSquareMeta> {
-    bar.begin(81, "pawn discover [81 squares × 5 enemy × walls]");
+/// Discover all pawn lookup tables in memory (silent — no progress bar).
+/// Single source of truth for both the offline emitter (`movegen-o1-gen`) and
+/// the runtime cold-start builder (`super::runtime`).
+pub fn discover_all_pawn_tables() -> Vec<PawnSquareMeta> {
     let mut result = Vec::with_capacity(81);
     for sq in 0..81u8 {
         result.push(discover_pawn_square(sq));
-        bar.tick(&format!("square {sq}/80"));
     }
-    bar.finish("pawn discover done");
     result
 }
 
-fn discover_pawn_square(sq: u8) -> PawnSquareMeta {
+pub fn discover_pawn_square(sq: u8) -> PawnSquareMeta {
     let (sr, sc) = (sq / 9, sq % 9);
     let catalog = pseudo_catalog(sr, sc);
     let layers = std::array::from_fn(|k| discover_enemy_layer(sr, sc, sq, k as u8, &catalog));

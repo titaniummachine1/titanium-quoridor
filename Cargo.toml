@@ -27,13 +27,16 @@ path = "src/bin/movegen_o1_gen.rs"
 default = ["parallel"]
 # Multi-threaded perft / Lazy SMP (rayon). Disable for wasm.
 parallel = ["dep:rayon"]
+# Bake the precomputed pawn O1 tables (~1.85MB) into the binary instead of
+# building them at cold start. Use for prewarmed / latency-sensitive targets
+# (e.g. the website); the default build computes them on first use / `prewarm()`.
+embed-tables = []
 # wasm-bindgen bindings for the website (build with:
 #   wasm-pack build --no-default-features --features wasm
 # or cargo build --lib --target wasm32-unknown-unknown --no-default-features --features wasm)
 wasm = ["dep:wasm-bindgen"]
 
 [dependencies]
-indicatif = "0.17"
 rand = "0.8"
 rayon = { version = "1.10", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }

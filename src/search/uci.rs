@@ -137,6 +137,9 @@ pub fn run_uci_stdio() {
         match parts[0] {
             "uci" => handle_uci(&mut stdout),
             "isready" => {
+                // Cold-start: build the pawn lookup tables now so they're ready
+                // before any search/perft — `readyok` means truly ready.
+                crate::movegen::prewarm();
                 let _ = writeln!(stdout, "readyok");
                 flush(&mut stdout);
             }
