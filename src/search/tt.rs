@@ -3,56 +3,54 @@
 //! Stockfish-style **clustered buckets** (4 slots per index) to cut collisions.
 
 const TT_CLUSTER: usize = 4;
-/// Default index bits → `2^bits` clusters of [`TT_CLUSTER`] slots (~384 MB at 22).
-/// Overridable at construction via the `TT_BITS` env var (10..=27).
+/// Default index bits → `2^bits` clusters of [`TT_CLUSTER`] slots.
+/// Overridable at construction via the `TT_BITS` env var (8..=27).
 ///
 /// Size is a depth-dependent tradeoff, measured (native, perft, `tt_speedup` bench):
-///   | bits | RAM | perft(4) TT-on | perft(5) TT-on |
-///   | 18 | 24 MB | 0.30 s | 20.7 s |
-///   | 20 | 96 MB | 0.33 s | 16.1 s |
-///   | 22 | 384 MB | 0.41 s | **12.6 s** |
-///   | 23 | 768 MB | — | 11.0 s (≈ 22) |
-///   | 24 | 1.5 GB | 0.76 s | 13.4 s |
-/// **22 is the chosen default — the optimal speed/size tradeoff:** it owns the
-/// deep perft (d5 ~1.6× over 18) for 384 MB, while 24 doubles to 1.5 GB *and*
-/// regresses (the table's own cache pressure outweighs the marginal hit-rate
-/// gain). **Why not 23?** measured d5 (best of 3, this machine): 22 = 11.04 s,
-/// 23 = 11.00 s, 24 = 11.76 s — 23 is a noise-level tie with 22 but costs **2×
-/// the RAM (768 MB vs 384)** for nothing, so 22 is the better point. The only
-/// cost of 22 is shallow perft(4) (0.41 s vs 0.30 s at 18 — the tiny working set
-/// can't amortise the scattered-probe page-fault/TLB cost); a memory-constrained
-/// caller can drop back with `TT_BITS=18`.
+///   | bits | RAM    | perft(3) | perft(4) | perft(5) |
+///   |   8  |  24 KB |  111 ms  |  1.12 s  |    —     |
+///   |  11  | 192 KB |  103 ms  |  0.83 s  |    —     |  ← d3 sweet spot (L2/core)
+///   |  14  | 1.5 MB |  104 ms  |  0.53 s  |    —     |
+///   |  16  |   6 MB |  111 ms  |  0.44 s  |    —     |
+///   |  18  |  24 MB |  119 ms  |  0.37 s  | **20.7 s** |  ← d4 sweet spot
+///   |  20  |  96 MB |  110 ms  |  0.42 s  |  16.1 s  |
+///   |  22  | 384 MB |  119 ms  |  0.63 s  | **12.6 s** |  ← d5 sweet spot (default)
+///   |  24  | 1.5 GB |    —     |  0.76 s  |  13.4 s  |
 ///
-/// Flag guidance: `TT_BITS=23` (768 MB) is a good choice for deeper-than-d5
-/// searches (ties 22 at d5, more headroom beyond), and `24` (1.5 GB) for even
-/// deeper still. Default stays 22. (An adaptive table that starts small — sized
-/// to the d3/d4 working set — and grows a bit at a time while preserving stored
-/// entries is prototyped on the `adaptive-tt` branch for A/B testing vs this.)
-const DEFAULT_TT_BITS: usize = 22;
+/// Working set scales ~7 bits per depth (Quoridor branches ~100× per ply):
+///   d3 knee ≈ 11, d4 knee ≈ 18, d5 knee ≈ 22.
+/// Larger tables regress at shallow depths (page-fault / TLB pressure outweighs
+/// the marginal hit-rate gain once the working set is already resident).
+///
+/// **Adaptive mode (default)**: starts at `DEFAULT_START_BITS` (11, L2-sized),
+/// grows one bit at a time when the load factor hits 50%, rehashing live entries
+/// so nothing computed is thrown away. RAM tracks actual depth reached instead of
+/// pre-allocating 384 MB. Pin a static size with `TT_BITS=N` (disables growth) to
+/// match a specific depth or memory budget; use `TT_START_BITS` / `TT_MAX_BITS`
+/// to tune the adaptive range without disabling it.
+///
+/// Pin a static size for benchmarking with `TT_BITS=22` (d5 optimal) or
+/// `TT_BITS=18` (d4 optimal, 24 MB). Adaptive is the default.
+/// Adaptive start — holds the d3 working set in ~192 KB (L2 per core).
+const DEFAULT_START_BITS: usize = 11;
+/// Adaptive ceiling — growth stops here. `2^25 × 96 B ≈ 3.2 GB`.
+const DEFAULT_MAX_BITS: usize = 25;
 
-// NOTE: a 16-byte packed layout (`key` + `depth<<56 | nodes`, cluster = one
-// 64-byte cache line) was tried and measured at BOTH perft(4) and perft(5) — no
-// speedup at either (d4 ~0.32s, d5 ~22s, indistinguishable from 24-byte). Even
-// at depth 5, where the TT thrashes, halving the cluster cache footprint did
-// nothing: the engine is compute-bound on TT-miss nodes, not TT-memory-bound.
-// Kept the clear 24-byte struct. See `benches/tt_speedup.rs`.
+// NOTE: a 16-byte packed layout was tried and measured at BOTH perft(4) and
+// perft(5) — no speedup at either. Even at depth 5, halving cluster footprint
+// did nothing: the engine is compute-bound on TT-miss nodes, not
+// TT-memory-bound. Kept the clear 24-byte struct. See `benches/tt_speedup.rs`.
 //
-// COLLISION SAFETY: the 64-bit `key` alone can't prove two boards are identical
-// (distinct positions can share a Zobrist key → a wrong stored `nodes` would be
-// served as if correct). `verify` is a SECOND, independent 32-bit hash of the
-// board (`Board::tt_verify`); a false hit now needs BOTH `key` (64) and `verify`
-// (32) to collide (~2^-96/pair — negligible even at game-solve scale). It is
-// FREE: { key:8, nodes:8, verify:4, depth:1 } = 21 bytes, padded to the same
-// 24-byte align-8 entry, so the cluster stays 96 B (no cache cost).
+// COLLISION SAFETY: the 64-bit `key` alone can't prove two boards are identical.
+// `verify` is a SECOND, independent 32-bit hash (`Board::tt_verify`); a false
+// hit needs BOTH `key` (64) and `verify` (32) to collide (~2^-96/pair —
+// negligible even at game-solve scale). FREE: { key:8, nodes:8, verify:4,
+// depth:1 } = 21 bytes, padded to the same 24-byte align-8 entry (no cache cost).
 //
 // EVICTION is depth-only (evict the shallowest entry in a full cluster). A
-// `walls_total`-primary policy ("drop entries from unreachable game phases
-// first") was MEASURED and REJECTED for perft: it regressed d5 by ~10% (15.1s →
-// 16.7s). In perft's DFS, positions with more walls remaining are SHALLOWER in
-// the game tree and carry the MOST plies below them — the most expensive
-// subtrees to recompute — so evicting them first tanked the hit rate. The idea
-// is sound for FORWARD-only game search (walls never un-placed), but that path
-// uses a different table (`search_tt::SearchTt`), so it belongs there if wanted.
+// `walls_total`-primary policy was MEASURED and REJECTED for perft: it regressed
+// d5 by ~10% (positions with more walls remaining are shallower in the tree but
+// carry the most plies below — evicting them first tanks the hit rate).
 #[derive(Clone, Copy, Default)]
 struct Entry {
     key: u64,
@@ -77,6 +75,12 @@ impl Default for Cluster {
 pub struct TranspositionTable {
     clusters: Vec<Cluster>,
     mask: usize,
+    bits: usize,
+    /// Non-empty slots currently held (grow trigger).
+    filled: usize,
+    max_bits: usize,
+    /// False when `TT_BITS` was pinned (A/B baseline, matches static behaviour).
+    adaptive: bool,
 }
 
 impl Default for TranspositionTable {
@@ -85,22 +89,49 @@ impl Default for TranspositionTable {
     }
 }
 
+fn env_bits(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&b| (8..=27).contains(&b))
+}
+
 impl TranspositionTable {
     pub fn new() -> Self {
-        let bits = std::env::var("TT_BITS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&b| (10..=27).contains(&b))
-            .unwrap_or(DEFAULT_TT_BITS);
+        // `TT_BITS` pins a static size (disables adaptive growth).
+        if let Some(bits) = env_bits("TT_BITS") {
+            return Self::with_size(bits, bits, false);
+        }
+        let start = env_bits("TT_START_BITS").unwrap_or(DEFAULT_START_BITS);
+        let max = env_bits("TT_MAX_BITS")
+            .unwrap_or(DEFAULT_MAX_BITS)
+            .max(start);
+        Self::with_size(start, max, true)
+    }
+
+    fn with_size(bits: usize, max_bits: usize, adaptive: bool) -> Self {
         let size = 1usize << bits;
         Self {
             clusters: vec![Cluster::default(); size],
             mask: size - 1,
+            bits,
+            filled: 0,
+            max_bits,
+            adaptive,
         }
     }
 
     pub fn clear(&mut self) {
         self.clusters.fill(Cluster::default());
+        self.filled = 0;
+    }
+
+    /// Grow at load factor ≥ 50% (half of all slots filled).
+    #[inline]
+    fn should_grow(&self) -> bool {
+        self.adaptive
+            && self.bits < self.max_bits
+            && self.filled * 2 >= self.clusters.len() * TT_CLUSTER
     }
 
     #[inline]
@@ -109,8 +140,6 @@ impl TranspositionTable {
         for entry in &cluster.entries {
             // Both the 64-bit key AND the independent 32-bit verify must match —
             // guards against a Zobrist collision serving the wrong node count.
-            // (Measured: 0 such collisions at perft d4/d5; this is insurance that
-            // only bites at far deeper / game-solve scale.)
             if entry.key == key && entry.verify == verify && entry.depth == depth {
                 return Some(entry.nodes);
             }
@@ -120,7 +149,27 @@ impl TranspositionTable {
 
     #[inline]
     pub fn store(&mut self, key: u64, verify: u32, depth: u8, nodes: u64) {
-        let cluster = &mut self.clusters[(key as usize) & self.mask];
+        if Self::insert_into(&mut self.clusters, self.mask, key, verify, depth, nodes) {
+            self.filled += 1;
+            if self.should_grow() {
+                self.grow();
+            }
+        }
+    }
+
+    /// Insert into a (clusters, mask) table. Returns `true` iff a previously
+    /// EMPTY slot was consumed (caller tracks occupancy for adaptive growth).
+    /// Matching-key updates and depth-evictions return `false`.
+    #[inline]
+    fn insert_into(
+        clusters: &mut [Cluster],
+        mask: usize,
+        key: u64,
+        verify: u32,
+        depth: u8,
+        nodes: u64,
+    ) -> bool {
+        let cluster = &mut clusters[(key as usize) & mask];
         let mut replace = 0usize;
         let mut shallowest = u8::MAX;
 
@@ -129,11 +178,11 @@ impl TranspositionTable {
                 if entry.depth <= depth {
                     cluster.entries[i] = Entry { key, nodes, verify, depth };
                 }
-                return;
+                return false;
             }
             if entry.key == 0 {
                 cluster.entries[i] = Entry { key, nodes, verify, depth };
-                return;
+                return true;
             }
             if entry.depth < shallowest {
                 shallowest = entry.depth;
@@ -142,5 +191,38 @@ impl TranspositionTable {
         }
 
         cluster.entries[replace] = Entry { key, nodes, verify, depth };
+        false
+    }
+
+    /// How many bits to add on the next grow.
+    /// Large jumps when small (cheap rehash, need to reach working set fast),
+    /// single-bit steps when large (avoid overshooting and wasting RAM).
+    ///   bits <  14 → +3  (11 → 14 → ... saves 4 rehashes vs +1 to reach d4=18)
+    ///   bits < 18  → +2  (14 → 16 → 18, d4 sweet spot in 3 total grows)
+    ///   bits ≥ 18  → +1  (careful steps for d5 and beyond)
+    #[inline]
+    fn grow_step(&self) -> usize {
+        if self.bits < 14 { 3 } else if self.bits < 18 { 2 } else { 1 }
+    }
+
+    /// Grow the table by `grow_step()` bits, rehashing all live entries into the
+    /// new allocation so no computed results are lost. O(old slots); the
+    /// aggressive early steps mean total rehash work to reach d4=18 is ~3× less
+    /// than single-bit steps (84K clusters vs 260K).
+    fn grow(&mut self) {
+        let new_bits = (self.bits + self.grow_step()).min(self.max_bits);
+        let new_size = 1usize << new_bits;
+        let new_mask = new_size - 1;
+        let mut next = vec![Cluster::default(); new_size];
+        for cluster in &self.clusters {
+            for e in &cluster.entries {
+                if e.key != 0 {
+                    Self::insert_into(&mut next, new_mask, e.key, e.verify, e.depth, e.nodes);
+                }
+            }
+        }
+        self.clusters = next;
+        self.mask = new_mask;
+        self.bits = new_bits;
     }
 }
