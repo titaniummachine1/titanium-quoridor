@@ -43,6 +43,7 @@ pub struct Undo {
     pub mv: Move,
     pub pawn_from: (Row, Column),
     pub hash: u64,
+    pub verify: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -54,6 +55,9 @@ pub struct Board {
     pub side_to_move: Player,
     pub move_number: u32,
     pub hash: u64,
+    /// Cached `compute_verify()` result — updated by `make_move`, restored by
+    /// `unmake_move`. Makes `tt_verify()` a free register read on the probe hot path.
+    pub verify: u32,
 }
 
 impl Default for Board {
@@ -65,20 +69,24 @@ impl Default for Board {
 impl Board {
     /// Independent 32-bit board signature for TT collision verification.
     ///
-    /// The Zobrist `hash` alone can't prove two boards are identical (distinct
-    /// positions can share a 64-bit key). `tt_verify` is a SECOND hash with
-    /// different mixing over the full position state (both wall bitboards, both
-    /// pawns, side to move), so a false TT hit needs both `hash` and this to
-    /// collide (~2^-96/pair). Cheap: a handful of mul/xor over fields already in
-    /// registers — no per-move accumulation. Mirrors the Zobrist's state coverage
-    /// (walls + pawns + turn; move number is irrelevant to perft/search value).
+    /// Returns the cached `self.verify` field — a free register read on the TT
+    /// probe hot path. The value is computed once by `compute_verify()` and kept
+    /// current by `make_move` / `unmake_move`.
     #[inline]
     pub fn tt_verify(&self) -> u32 {
-        // Pawns + side-to-move packed into one word (no collisions: 4×4 bits +
-        // a turn bit), then XOR-mixed with the two wall bitboards under distinct
-        // odd multipliers and folded to 32 bits. 2 mul + a few xor/shift — much
-        // cheaper than a full avalanche finalizer, still effectively independent
-        // of the Zobrist key (different inputs+mixing).
+        self.verify
+    }
+
+    /// Full computation of the 32-bit verify hash — called only in `Board::new()`
+    /// and `make_move`. Never call this on the TT probe hot path; use `tt_verify()`.
+    ///
+    /// Pawns + side-to-move packed into one word, XOR-mixed with both wall
+    /// bitboards under distinct odd multipliers, folded to 32 bits. Effectively
+    /// independent of the Zobrist key (different inputs + mixing constants), so
+    /// a false TT hit needs both `hash` (64-bit) and `verify` (32-bit) to collide
+    /// (~2^-96/pair — negligible even at game-solve scale).
+    #[inline]
+    fn compute_verify(&self) -> u32 {
         let p = ((self.pawns[0].0 as u64) << 21)
             | ((self.pawns[0].1 as u64) << 14)
             | ((self.pawns[1].0 as u64) << 7)
@@ -99,8 +107,10 @@ impl Board {
             side_to_move: Player::One,
             move_number: 1,
             hash: 0,
+            verify: 0,
         };
         board.hash = crate::core::zobrist::hash_board(&board);
+        board.verify = board.compute_verify();
         board
     }
 
@@ -160,6 +170,7 @@ impl Board {
             mv,
             pawn_from: self.pawns[side],
             hash: self.hash,
+            verify: self.verify,
         };
 
         match mv {
@@ -189,6 +200,7 @@ impl Board {
             self.move_number += 1;
         }
 
+        self.verify = self.compute_verify();
         undo
     }
 
@@ -214,6 +226,7 @@ impl Board {
         }
 
         self.hash = undo.hash;
+        self.verify = undo.verify;
     }
 
     /// Convenience API — allocates nothing but cannot unmake.

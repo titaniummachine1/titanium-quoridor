@@ -41,25 +41,24 @@ const DEFAULT_TT_BITS: usize = 22;
 // (distinct positions can share a Zobrist key → a wrong stored `nodes` would be
 // served as if correct). `verify` is a SECOND, independent 32-bit hash of the
 // board (`Board::tt_verify`); a false hit now needs BOTH `key` (64) and `verify`
-// (32) to collide (~2^-96/pair — negligible even at game-solve scale).
+// (32) to collide (~2^-96/pair — negligible even at game-solve scale). It is
+// FREE: { key:8, nodes:8, verify:4, depth:1 } = 21 bytes, padded to the same
+// 24-byte align-8 entry, so the cluster stays 96 B (no cache cost).
 //
-// EVICTION: `walls_total` = walls_remaining[0] + walls_remaining[1] (0–20).
-// Walls are monotonically placed — a position with MORE walls remaining than the
-// current search position can never be reached as a descendant, so it is dead
-// weight. On cluster-full eviction we prefer these unreachable-phase entries
-// (primary), then shallowest depth as the tiebreaker (secondary).
-//
-// Layout: { key:8, nodes:8, verify:4, depth:1, walls_total:1 } = 22 bytes,
-// padded to 24 (align 8) — cluster stays 96 B, zero RAM cost vs before.
+// EVICTION is depth-only (evict the shallowest entry in a full cluster). A
+// `walls_total`-primary policy ("drop entries from unreachable game phases
+// first") was MEASURED and REJECTED for perft: it regressed d5 by ~10% (15.1s →
+// 16.7s). In perft's DFS, positions with more walls remaining are SHALLOWER in
+// the game tree and carry the MOST plies below them — the most expensive
+// subtrees to recompute — so evicting them first tanked the hit rate. The idea
+// is sound for FORWARD-only game search (walls never un-placed), but that path
+// uses a different table (`search_tt::SearchTt`), so it belongs there if wanted.
 #[derive(Clone, Copy, Default)]
 struct Entry {
     key: u64,
     nodes: u64,
     verify: u32,
     depth: u8,
-    /// `walls_remaining[0] + walls_remaining[1]` at store time. Used only for
-    /// eviction priority; never checked during probe (key+verify guard that).
-    walls_total: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -120,35 +119,28 @@ impl TranspositionTable {
     }
 
     #[inline]
-    pub fn store(&mut self, key: u64, verify: u32, depth: u8, nodes: u64, walls_total: u8) {
+    pub fn store(&mut self, key: u64, verify: u32, depth: u8, nodes: u64) {
         let cluster = &mut self.clusters[(key as usize) & self.mask];
         let mut replace = 0usize;
-        let mut best_evict = i32::MIN;
+        let mut shallowest = u8::MAX;
 
         for (i, entry) in cluster.entries.iter().enumerate() {
             if entry.key == key && entry.verify == verify {
                 if entry.depth <= depth {
-                    cluster.entries[i] = Entry { key, nodes, verify, depth, walls_total };
+                    cluster.entries[i] = Entry { key, nodes, verify, depth };
                 }
                 return;
             }
             if entry.key == 0 {
-                cluster.entries[i] = Entry { key, nodes, verify, depth, walls_total };
+                cluster.entries[i] = Entry { key, nodes, verify, depth };
                 return;
             }
-            // Eviction score — higher wins:
-            //   Primary: entries from unreachable game phases (walls_total > current)
-            //     score hundreds of points above any depth difference (max depth ≈ 20
-            //     for perft, max walls_excess = 20 → 2000 vs −255).
-            //   Secondary: shallowest depth (least recomputation cost) as tiebreaker.
-            let walls_excess = (entry.walls_total as i32) - (walls_total as i32);
-            let score = walls_excess * 100 - (entry.depth as i32);
-            if score > best_evict {
-                best_evict = score;
+            if entry.depth < shallowest {
+                shallowest = entry.depth;
                 replace = i;
             }
         }
 
-        cluster.entries[replace] = Entry { key, nodes, verify, depth, walls_total };
+        cluster.entries[replace] = Entry { key, nodes, verify, depth };
     }
 }

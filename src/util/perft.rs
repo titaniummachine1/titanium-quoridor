@@ -79,8 +79,7 @@ pub fn perft_fast_mode_ctx(
     };
 
     if let Some(shared) = shared {
-        let walls_total = board.walls_remaining[0] + board.walls_remaining[1];
-        shared.tt.store(board.hash, verify, depth as u8, nodes, walls_total);
+        shared.tt.store(board.hash, verify, depth as u8, nodes);
     }
     nodes
 }
