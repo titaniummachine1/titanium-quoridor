@@ -101,6 +101,30 @@ fn detect_cache_bytes() -> Option<(usize, usize, usize)> {
     None
 }
 
+/// Cache-tier index bits for ANY transposition table whose logical entry is
+/// `entry_bytes` wide. Returns `(l1_start, l2, l3)` index bits — the largest
+/// power-of-two entry count that fits each tier. Used by other TTs (e.g. the
+/// acev13 search TT, whose 7 parallel arrays total ~25 B/entry) to get the same
+/// overflow-driven cache-tier growth as the perft TT. Falls back to 9/11/16 when
+/// CPUID cache detection is unavailable.
+pub fn cache_tier_bits(entry_bytes: usize) -> (usize, usize, usize) {
+    let to_bits = |cache: usize| -> usize {
+        let n = cache / entry_bytes.max(1);
+        if n < 2 {
+            return 8;
+        }
+        ((usize::BITS - n.leading_zeros() - 1) as usize).clamp(8, 27)
+    };
+    if let Some((l1d, l2, l3)) = detect_cache_bytes() {
+        let s = to_bits(l1d);
+        let l2b = to_bits(l2).max(s + 1);
+        let l3b = to_bits(l3).max(l2b + 1);
+        (s, l2b, l3b)
+    } else {
+        (FALLBACK_START_BITS, FALLBACK_L2_BITS, FALLBACK_L3_BITS)
+    }
+}
+
 /// Compute (start_bits, l2_bits, l3_bits) from detected or fallback cache sizes.
 /// `start_bits` targets L1 data/core, `l2_bits` targets L2/core, `l3_bits` targets L3.
 fn tier_bits() -> (usize, usize, usize) {

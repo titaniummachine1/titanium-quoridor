@@ -204,6 +204,23 @@ pub struct AceSearch {
     tt_rep: Vec<u8>,
     tt_anc_lo: Vec<u32>,
     tt_anc_hi: Vec<u32>,
+    /// Index mask for the TT vecs (`size - 1`). Runtime so the TT can be resized
+    /// (Titanium-style larger table) without recompiling — `1<<TT_BITS` default.
+    tt_mask: u32,
+    /// Current TT index bits (`tt_mask == (1<<tt_bits)-1`).
+    tt_bits: usize,
+    /// Occupied slots (meta != 0). Drives overflow-triggered growth.
+    tt_filled: usize,
+    /// Overflow-driven cache-tier growth targets (Titanium strategy): start in L1,
+    /// jump L1→L2→L3→d4(18)→d5(22) on overflow, then +1 per overflow past d5. Each
+    /// jump lands on a calibrated size that won't immediately re-overflow. Inactive
+    /// unless [`enable_adaptive_tt`](AceSearch::enable_adaptive_tt) is called.
+    tt_l2: usize,
+    tt_l3: usize,
+    tt_d4: usize,
+    tt_d5: usize,
+    tt_max: usize,
+    tt_adaptive: bool,
     // per-ply open-subtree dependency window: min external path-rep target ply
     sub_min: [i32; MAX_PLY],
     sub_anc_lo: [u32; MAX_PLY],
@@ -232,6 +249,11 @@ pub struct AceSearch {
     ti_movegen: bool,
     /// CAT-filter walls at inner nodes (requires `bridge`).
     cat_walls: bool,
+    /// Grafted-engine flag: in the hands-empty endgame, use Titanium's cheap
+    /// path-aware tempo classifier ([`cert_bridge::hands_empty_race`]) instead of
+    /// the full recursive `certify`. Same result, a fraction of the nodes — frees
+    /// NPS for the rest of the search. Off = faithful gen13 (always `certify`).
+    cheap_cert: bool,
     /// Early Move Extensions on the first ordered wall moves (mirror of graduated LMR).
     eme: bool,
     pub nodes: u64,
@@ -313,6 +335,16 @@ impl AceSearch {
             tt_rep: vec![0; TT_SIZE],
             tt_anc_lo: vec![0; TT_SIZE],
             tt_anc_hi: vec![0; TT_SIZE],
+            tt_mask: TT_MASK,
+            tt_bits: TT_BITS,
+            tt_filled: 0,
+            // Defaults overwritten by enable_adaptive_tt(); harmless when inactive.
+            tt_l2: TT_BITS,
+            tt_l3: TT_BITS,
+            tt_d4: 18,
+            tt_d5: 22,
+            tt_max: 25,
+            tt_adaptive: false,
             sub_min: [MAX_PLY as i32; MAX_PLY],
             sub_anc_lo: [0; MAX_PLY],
             sub_anc_hi: [0; MAX_PLY],
@@ -336,6 +368,7 @@ impl AceSearch {
             bridge: None,
             ti_movegen: false,
             cat_walls: false,
+            cheap_cert: false,
             eme: false,
             nodes: 0,
             deadline: Instant::now(),
@@ -416,6 +449,133 @@ impl AceSearch {
         let mut search = Self::with_ti_movegen(g);
         search.cat_walls = true;
         search
+    }
+
+    /// **Grafted engine** — gen13 net search + Titanium's *measured-positive*
+    /// extras: O1 movegen, the cheap hands-empty cert (+31 Elo vs plain ace-v13),
+    /// and the adaptive cache-tier TT (strength-neutral but safe/scalable).
+    ///
+    /// NOTE: CAT wall-pruning is deliberately **excluded** — measured −25 Elo on
+    /// the net engine (it compensates for a weak eval; the net doesn't need it and
+    /// loses good wall candidates). `tt_bits = Some(n)` pins a fixed TT instead of
+    /// the adaptive one (for benchmarking).
+    pub fn grafted(g: AceGame, tt_bits: Option<usize>) -> Box<Self> {
+        let mut search = Self::with_ti_movegen(g);
+        search.cheap_cert = true;
+        match tt_bits {
+            Some(bits) => search.resize_tt(bits),
+            None => search.enable_adaptive_tt(),
+        }
+        search
+    }
+
+    /// gen13 net search + O1 movegen + cheap hands-empty cert, but **no CAT**.
+    /// Isolates the certificate contribution from CAT wall-pruning.
+    pub fn with_ti_movegen_cheap_cert(g: AceGame, tt_bits: Option<usize>) -> Box<Self> {
+        let mut search = Self::with_ti_movegen(g);
+        search.cheap_cert = true;
+        if let Some(bits) = tt_bits {
+            search.resize_tt(bits);
+        }
+        search
+    }
+
+    /// gen13 net search + O1 movegen + adaptive cache-tier TT (no CAT, no cert).
+    /// Isolates the TT-growth contribution.
+    pub fn with_ti_movegen_adaptive_tt(g: AceGame) -> Box<Self> {
+        let mut search = Self::with_ti_movegen(g);
+        search.enable_adaptive_tt();
+        search
+    }
+
+    /// Reallocate the transposition table to `1 << bits` entries. Clears all TT
+    /// state — call before search starts, not mid-think.
+    pub fn resize_tt(&mut self, bits: usize) {
+        let size = 1usize << bits;
+        self.tt_key_hi = vec![0; size];
+        self.tt_key_lo = vec![0; size];
+        self.tt_meta = vec![0; size];
+        self.tt_score = vec![0; size];
+        self.tt_rep = vec![0; size];
+        self.tt_anc_lo = vec![0; size];
+        self.tt_anc_hi = vec![0; size];
+        self.tt_mask = (size - 1) as u32;
+        self.tt_bits = bits;
+        self.tt_filled = 0;
+    }
+
+    /// Enable overflow-driven cache-tier TT growth (Titanium strategy). Starts the
+    /// table small enough to live in L1, then jumps L1→L2→L3→18→22 as it fills, so
+    /// at low node counts the whole TT stays hot in cache (the big win at short TC)
+    /// and only grows when it genuinely overflows. `entry_bytes` = 25 (the 7 SoA
+    /// arrays: 3×u32 key/anc + 2×i32 meta/score + 1×u8 rep ≈ 25 B/logical entry).
+    pub fn enable_adaptive_tt(&mut self) {
+        const ENTRY_BYTES: usize = 25;
+        let (start, l2, l3) = crate::search::tt::cache_tier_bits(ENTRY_BYTES);
+        self.tt_l2 = l2.max(start + 1);
+        self.tt_l3 = l3.max(self.tt_l2 + 1);
+        self.tt_d4 = 18.max(self.tt_l3);
+        self.tt_d5 = 22.max(self.tt_d4);
+        self.tt_max = 25.max(self.tt_d5);
+        self.tt_adaptive = true;
+        self.resize_tt(start); // start small — grows on overflow
+    }
+
+    /// Grow the TT to the next calibrated cache tier and rehash live entries.
+    /// Always-replace on collision (matches the live store policy). Called from the
+    /// store path when occupancy crosses 50%.
+    fn tt_grow(&mut self) {
+        let nb = if self.tt_bits < self.tt_l2 {
+            self.tt_l2
+        } else if self.tt_bits < self.tt_l3 {
+            self.tt_l3
+        } else if self.tt_bits < self.tt_d4 {
+            self.tt_d4
+        } else if self.tt_bits < self.tt_d5 {
+            self.tt_d5
+        } else {
+            self.tt_bits + 1
+        }
+        .min(self.tt_max);
+        if nb <= self.tt_bits {
+            return;
+        }
+        let new_size = 1usize << nb;
+        let new_mask = (new_size - 1) as u32;
+        let mut k_hi = vec![0u32; new_size];
+        let mut k_lo = vec![0u32; new_size];
+        let mut meta = vec![0i32; new_size];
+        let mut score = vec![0i32; new_size];
+        let mut rep = vec![0u8; new_size];
+        let mut a_lo = vec![0u32; new_size];
+        let mut a_hi = vec![0u32; new_size];
+        let mut filled = 0usize;
+        for i in 0..self.tt_meta.len() {
+            if self.tt_meta[i] == 0 {
+                continue;
+            }
+            let ni = (self.tt_key_lo[i] & new_mask) as usize;
+            if meta[ni] == 0 {
+                filled += 1;
+            }
+            k_hi[ni] = self.tt_key_hi[i];
+            k_lo[ni] = self.tt_key_lo[i];
+            meta[ni] = self.tt_meta[i];
+            score[ni] = self.tt_score[i];
+            rep[ni] = self.tt_rep[i];
+            a_lo[ni] = self.tt_anc_lo[i];
+            a_hi[ni] = self.tt_anc_hi[i];
+        }
+        self.tt_key_hi = k_hi;
+        self.tt_key_lo = k_lo;
+        self.tt_meta = meta;
+        self.tt_score = score;
+        self.tt_rep = rep;
+        self.tt_anc_lo = a_lo;
+        self.tt_anc_hi = a_hi;
+        self.tt_mask = new_mask;
+        self.tt_bits = nb;
+        self.tt_filled = filled;
     }
 
     /// Advance the live game one ply, keeping TT/killers/history warm.
@@ -657,6 +817,21 @@ impl AceSearch {
     /// for weaker-or-equal retries (`bud <= work`); a richer call (bigger
     /// budget / fresh deadline) re-runs instead of inheriting a starved failure.
     fn cert_win(&mut self, s: usize, budget: u64, deadline_ms: u64) -> bool {
+        // Grafted fast path: hands-empty is a pure pawn race — Titanium's tempo
+        // classifier resolves it exactly (deterministic in the common case, a tiny
+        // forward race-minimax only when paths overlap within 1 tempo). Sound: with
+        // no walls the win-certificate reduces to the race outcome, so this returns
+        // the same verdict as `certify` at a fraction of the node cost.
+        if self.cheap_cert && self.g.wl[0] == 0 && self.g.wl[1] == 0 {
+            use crate::acev13::cert_bridge::{hands_empty_race, race_minimax, RaceVerdict};
+            let stm_wins = match hands_empty_race(&self.g) {
+                RaceVerdict::Win => true,
+                RaceVerdict::Loss => false,
+                RaceVerdict::NeedsProof => race_minimax(&mut self.g) > 0,
+            };
+            // Classifier is from the side-to-move's view; `s` may be either side.
+            return if s == self.g.turn { stm_wins } else { !stm_wins };
+        }
         let key = (self.g.hash_lo, self.g.hash_hi, s, self.g.wl[0], self.g.wl[1]);
         let bud: i64 = if budget == 0 { 2500 } else { budget as i64 };
         let prior = self.cw_cache.get(&key).copied();
@@ -1135,7 +1310,7 @@ impl AceSearch {
         }
 
         // TT probe (typed, always-replace)
-        let idx = (self.g.hash_lo & TT_MASK) as usize;
+        let idx = (self.g.hash_lo & self.tt_mask) as usize;
         let mut tt_move: i16 = 0;
         let meta = self.tt_meta[idx];
         if meta != 0
@@ -1414,6 +1589,7 @@ impl AceSearch {
                 self.rb1_stores += 1;
             }
         }
+        let was_empty = self.tt_meta[idx] == 0;
         self.tt_key_hi[idx] = self.g.hash_hi;
         self.tt_key_lo[idx] = self.g.hash_lo;
         self.tt_meta[idx] = best_move as i32 | (sf << 10) | (depth << 12);
@@ -1422,6 +1598,16 @@ impl AceSearch {
         if rb != 0 {
             self.tt_anc_lo[idx] = self.sub_anc_lo[ply];
             self.tt_anc_hi[idx] = self.sub_anc_hi[ply];
+        }
+        // Overflow-driven cache-tier growth (idx is dead after this — safe to grow).
+        if was_empty {
+            self.tt_filled += 1;
+            if self.tt_adaptive
+                && self.tt_bits < self.tt_max
+                && self.tt_filled.saturating_mul(2) >= (1usize << self.tt_bits)
+            {
+                self.tt_grow();
+            }
         }
         Ok(best)
     }

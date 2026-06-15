@@ -655,15 +655,21 @@ fn run_match(args: &[String]) {
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
+    let mut engine_a = MatchEngine::TitaniumCert;
+    let mut engine_b = MatchEngine::TitaniumPlain;
+    let mut tt_bits: Option<usize> = None;
     let mut i = 2usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--games" => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { games = v; i += 2; continue; } }
-            "--time"  => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { time_sec = v; i += 2; continue; } }
-            "--seed"  => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { seed = v; i += 2; continue; } }
-            "--open"  => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { open_plies = v; i += 2; continue; } }
-            "--maxply"=> { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { max_ply = v; i += 2; continue; } }
-            "--threads"=>{ if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { threads = v; i += 2; continue; } }
+            "--games"  => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { games = v; i += 2; continue; } }
+            "--time"   => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { time_sec = v; i += 2; continue; } }
+            "--seed"   => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { seed = v; i += 2; continue; } }
+            "--open"   => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { open_plies = v; i += 2; continue; } }
+            "--maxply" => { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { max_ply = v; i += 2; continue; } }
+            "--threads"=> { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { threads = v; i += 2; continue; } }
+            "--tt-bits"=> { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { tt_bits = Some(v); i += 2; continue; } }
+            "--a"      => { if let Some(e) = args.get(i+1).and_then(|s| MatchEngine::parse(s)) { engine_a = e; i += 2; continue; } }
+            "--b" | "--vs" => { if let Some(e) = args.get(i+1).and_then(|s| MatchEngine::parse(s)) { engine_b = e; i += 2; continue; } }
             _ => {}
         }
         i += 1;
@@ -678,8 +684,8 @@ fn run_match(args: &[String]) {
         .build_global()
         .ok();
 
-    let cert_w  = AtomicU32::new(0);
-    let plain_w = AtomicU32::new(0);
+    let a_w = AtomicU32::new(0);
+    let b_w = AtomicU32::new(0);
     let draws   = AtomicU32::new(0);
     let cert_touched = AtomicU64::new(0);
     let games_done   = AtomicU32::new(0);
@@ -692,11 +698,12 @@ fn run_match(args: &[String]) {
     let pairs = raw_pairs.div_ceil(pair_threads) * pair_threads;
     let games = pairs * 2;
 
+    let tt_note = tt_bits.map(|b| format!(", tt-bits={b}")).unwrap_or_default();
     eprintln!(
         "match: {games} games @ {time_sec}s/move, open={open_plies} plies, \
-         maxply={max_ply}, threads={pair_threads}"
+         maxply={max_ply}, threads={pair_threads}{tt_note}"
     );
-    eprintln!("  A = Titanium+endgame-cert   B = plain Titanium");
+    eprintln!("  A = {}   B = {}", engine_a.label(), engine_b.label());
 
     (0..pairs).into_par_iter().for_each(|pair| {
         let opening = match_random_opening(seed.wrapping_add(pair as u64), open_plies);
@@ -704,35 +711,38 @@ fn run_match(args: &[String]) {
         for flip in 0..2u32 {
             let game_idx = pair * 2 + flip as usize;
             if game_idx >= games { break; }
-            let cert_is_one = flip == 0;
+            // Swap colors per game in the pair so the opening is played from both
+            // sides — `a_is_one` true means engine A holds Player::One this game.
+            let a_is_one = flip == 0;
 
             let proofs_before = CERT_PROOFS.load(Ordering::Relaxed);
-            let outcome = play_one_game(&opening, cert_is_one, time_ms, max_ply);
+            let outcome =
+                play_one_game(&opening, a_is_one, time_ms, max_ply, engine_a, engine_b, tt_bits);
             if CERT_PROOFS.load(Ordering::Relaxed) > proofs_before {
                 cert_touched.fetch_add(1, Ordering::Relaxed);
             }
 
             match outcome {
                 Some(titanium::Player::One) => {
-                    if cert_is_one { cert_w.fetch_add(1, Ordering::Relaxed); }
-                    else           { plain_w.fetch_add(1, Ordering::Relaxed); }
+                    if a_is_one { a_w.fetch_add(1, Ordering::Relaxed); }
+                    else        { b_w.fetch_add(1, Ordering::Relaxed); }
                 }
                 Some(titanium::Player::Two) => {
-                    if cert_is_one { plain_w.fetch_add(1, Ordering::Relaxed); }
-                    else           { cert_w.fetch_add(1, Ordering::Relaxed); }
+                    if a_is_one { b_w.fetch_add(1, Ordering::Relaxed); }
+                    else        { a_w.fetch_add(1, Ordering::Relaxed); }
                 }
                 None => { draws.fetch_add(1, Ordering::Relaxed); }
             }
 
             let played = games_done.fetch_add(1, Ordering::Relaxed) + 1;
-            let cw = cert_w.load(Ordering::Relaxed);
-            let pw = plain_w.load(Ordering::Relaxed);
+            let aw = a_w.load(Ordering::Relaxed);
+            let bw = b_w.load(Ordering::Relaxed);
             let dr = draws.load(Ordering::Relaxed);
             let ct = cert_touched.load(Ordering::Relaxed);
-            let score = cw as f64 + 0.5 * dr as f64;
+            let score = aw as f64 + 0.5 * dr as f64;
             let _g = print_mu.lock().unwrap();
             eprintln!(
-                "  [{played}/{games}] A {cw} - {pw} B  ({dr} draws)  \
+                "  [{played}/{games}] A {aw} - {bw} B  ({dr} draws)  \
                  A-score {score:.1}/{played}  cert-touched {ct} games  \
                  {:.0}s elapsed",
                 started.elapsed().as_secs_f64()
@@ -740,12 +750,12 @@ fn run_match(args: &[String]) {
         }
     });
 
-    let cw = cert_w.load(Ordering::Relaxed);
-    let pw = plain_w.load(Ordering::Relaxed);
+    let aw = a_w.load(Ordering::Relaxed);
+    let bw = b_w.load(Ordering::Relaxed);
     let dr = draws.load(Ordering::Relaxed);
     let ct = cert_touched.load(Ordering::Relaxed);
     let n = games as f64;
-    let score = cw as f64 + 0.5 * dr as f64;
+    let score = aw as f64 + 0.5 * dr as f64;
     let p = score / n;
     let se = (p * (1.0 - p) / n).sqrt();
     let elo = if p > 0.0 && p < 1.0 {
@@ -754,14 +764,14 @@ fn run_match(args: &[String]) {
         f64::INFINITY * (p - 0.5).signum()
     };
     println!("=== STRENGTH MATCH RESULT ===");
-    println!("A = Titanium+endgame-cert,  B = plain Titanium");
+    println!("A = {},  B = {}{tt_note}", engine_a.label(), engine_b.label());
     println!("games {games} @ {time_sec}s/move");
-    println!("A wins {cw}  |  B wins {pw}  |  draws {dr}");
+    println!("A wins {aw}  |  B wins {bw}  |  draws {dr}");
     println!(
         "A score {score:.1}/{games} = {:.1}% (±{:.1}%)  →  ~{elo:+.0} Elo",
         p * 100.0, se * 196.0
     );
-    println!("endgame certificate fired in {ct}/{games} games");
+    println!("Titanium-cert fired in {ct}/{games} games");
 }
 
 /// Build a seeded random legal opening of `plies` moves from startpos.
@@ -793,64 +803,182 @@ fn match_random_opening(seed: u64, plies: u32) -> Vec<String> {
     out
 }
 
-/// Play one full game from `opening`. `cert_is_one` decides which config holds
+/// A selectable engine for either side of a match.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatchEngine {
+    /// Titanium αβ + endgame certificate (distance eval).
+    TitaniumCert,
+    /// Titanium αβ, certificate disabled.
+    TitaniumPlain,
+    /// gen13 net search, O1 movegen only (the strong baseline).
+    AceV13,
+    /// gen13 net search + cheap hands-empty cert ONLY (no CAT). Isolates the
+    /// certificate contribution from CAT pruning.
+    AceV13Cert,
+    /// gen13 net search + adaptive cache-tier TT ONLY. Isolates TT growth.
+    AceV13AdaptiveTt,
+    /// Production graft: gen13 net + cheap hands-empty cert + adaptive cache-tier
+    /// TT (NO CAT — measured −25 Elo on the net engine).
+    AceV13Grafted,
+}
+
+impl MatchEngine {
+    fn parse(s: &str) -> Option<MatchEngine> {
+        match s {
+            "titanium" | "titanium-cert" => Some(MatchEngine::TitaniumCert),
+            "titanium-plain" => Some(MatchEngine::TitaniumPlain),
+            "ace-v13" => Some(MatchEngine::AceV13),
+            "ace-v13-cert" => Some(MatchEngine::AceV13Cert),
+            "ace-v13-att" | "ace-v13-adaptive-tt" => Some(MatchEngine::AceV13AdaptiveTt),
+            "ace-v13-grafted" | "grafted" => Some(MatchEngine::AceV13Grafted),
+            _ => None,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            MatchEngine::TitaniumCert => "Titanium+cert",
+            MatchEngine::TitaniumPlain => "plain Titanium",
+            MatchEngine::AceV13 => "ace-v13 (O1 movegen)",
+            MatchEngine::AceV13Cert => "ace-v13 + cheap-cert (no CAT)",
+            MatchEngine::AceV13AdaptiveTt => "ace-v13 + adaptive cache-tier TT",
+            MatchEngine::AceV13Grafted => "ace-v13 grafted (cheap-cert + adaptive-TT)",
+        }
+    }
+}
+
+/// One side's warm engine state (TT/killers/history persist across the game).
+enum Seat {
+    Titanium {
+        session: titanium::GameSearchSession,
+        cert: bool,
+    },
+    Ace {
+        search: Box<titanium::acev13::AceSearch>,
+    },
+}
+
+impl Seat {
+    fn new(engine: MatchEngine, opening: &[String], tt_bits: Option<usize>) -> Seat {
+        use titanium::acev13::{algebraic_to_ace, AceGame, AceSearch};
+        match engine {
+            MatchEngine::TitaniumCert => Seat::Titanium {
+                session: titanium::GameSearchSession::new(),
+                cert: true,
+            },
+            MatchEngine::TitaniumPlain => Seat::Titanium {
+                session: titanium::GameSearchSession::new(),
+                cert: false,
+            },
+            MatchEngine::AceV13
+            | MatchEngine::AceV13Cert
+            | MatchEngine::AceV13AdaptiveTt
+            | MatchEngine::AceV13Grafted => {
+                let mut g = AceGame::new();
+                for m in opening {
+                    g.make_move(algebraic_to_ace(m));
+                }
+                let search = match engine {
+                    MatchEngine::AceV13Grafted => AceSearch::grafted(g, tt_bits),
+                    MatchEngine::AceV13Cert => AceSearch::with_ti_movegen_cheap_cert(g, tt_bits),
+                    MatchEngine::AceV13AdaptiveTt => AceSearch::with_ti_movegen_adaptive_tt(g),
+                    _ => {
+                        // Plain ace-v13 — but still honor --tt-bits so a pure TT-size
+                        // experiment (ace-v13 @ N bits vs ace-v13 default) is possible.
+                        let mut s = AceSearch::with_ti_movegen(g);
+                        if let Some(bits) = tt_bits {
+                            s.resize_tt(bits);
+                        }
+                        s
+                    }
+                };
+                Seat::Ace { search }
+            }
+        }
+    }
+
+    /// Pick a move for the current position (`moves` = full move list so far).
+    fn pick(&mut self, moves: &[String], time_ms: u64) -> Option<String> {
+        use titanium::{SearchConfig, DEFAULT_MAX_NODES};
+        match self {
+            Seat::Titanium { session, cert } => {
+                session.set_position(moves).ok()?;
+                let config = SearchConfig {
+                    time_ms,
+                    max_nodes: DEFAULT_MAX_NODES,
+                    log: false,
+                    book_hint: None,
+                    cert_enabled: Some(*cert),
+                    ..SearchConfig::default()
+                };
+                let report = run_search(session, config)?;
+                Some(format_move(report.best_move))
+            }
+            Seat::Ace { search } => {
+                let r = search.think(time_ms, 30, false, false, "match");
+                if r.mv == titanium::acev13::ACE_NO_MOVE {
+                    return None;
+                }
+                Some(titanium::acev13::ace_to_algebraic(r.mv))
+            }
+        }
+    }
+
+    /// Advance incremental state by one applied move (Ace keeps its TT warm; the
+    /// Titanium seat re-syncs from the move list each `pick`, so it's a no-op).
+    fn observe(&mut self, alg: &str) {
+        if let Seat::Ace { search } = self {
+            search.apply_move(titanium::acev13::algebraic_to_ace(alg));
+        }
+    }
+}
+
+/// Play one full game from `opening`. `a_is_one` decides which engine holds
 /// Player::One. Returns the winner, or `None` for an adjudicated draw at the
 /// ply cap (closer pawn wins; equal distance = draw).
 fn play_one_game(
     opening: &[String],
-    cert_is_one: bool,
+    a_is_one: bool,
     time_ms: u64,
     max_ply: u32,
+    engine_a: MatchEngine,
+    engine_b: MatchEngine,
+    tt_bits: Option<usize>,
 ) -> Option<titanium::Player> {
-    use titanium::{Board, GameSearchSession, Player, SearchConfig, DEFAULT_MAX_NODES};
+    use titanium::{Board, Player};
 
     let mut moves: Vec<String> = opening.to_vec();
     let mut board = Board::new();
     for m in &moves {
         board.apply_algebraic(m);
     }
-    let mut session = GameSearchSession::new();
+
+    // `--tt-bits` configures the A-side candidate only; B always uses the engine
+    // default, so a run like `--a ace-v13 --b ace-v13 --tt-bits 22` isolates TT size.
+    let mut seat_a = Seat::new(engine_a, opening, tt_bits);
+    let mut seat_b = Seat::new(engine_b, opening, None);
 
     for _ in 0..max_ply {
         if let Some(w) = board.is_terminal() {
             return Some(w);
         }
-        // Whose config moves now?
-        let one_to_move = board.side() == Player::One;
-        let cert_on = one_to_move == cert_is_one;
-
-        if session.set_position(&moves).is_err() {
-            return None;
-        }
-        let config = SearchConfig {
-            time_ms,
-            max_nodes: DEFAULT_MAX_NODES,
-            log: false,
-            book_hint: None,
-            cert_enabled: Some(cert_on),
-            ..SearchConfig::default()
+        let a_to_move = (board.side() == Player::One) == a_is_one;
+        let alg = {
+            let seat = if a_to_move { &mut seat_a } else { &mut seat_b };
+            seat.pick(&moves, time_ms)?
         };
-        let report = match run_search(&mut session, config) {
-            Some(r) => r,
-            None => return None,
-        };
-        let mv = report.best_move;
-        let alg = format_move(mv);
-        board.apply_move(mv);
+        board.apply_algebraic(&alg);
+        seat_a.observe(&alg);
+        seat_b.observe(&alg);
         moves.push(alg);
     }
 
-    // Ply cap reached — adjudicate by shortest path (closer pawn wins).
+    // Ply cap — adjudicate by shortest path.
     let mut bfs = titanium::BfsScratch::new();
-    let d_one = bfs
-        .shortest_distance(&board, titanium::Player::One)
-        .unwrap_or(255);
-    let d_two = bfs
-        .shortest_distance(&board, titanium::Player::Two)
-        .unwrap_or(255);
+    let d_one = bfs.shortest_distance(&board, Player::One).unwrap_or(255);
+    let d_two = bfs.shortest_distance(&board, Player::Two).unwrap_or(255);
     match d_one.cmp(&d_two) {
-        std::cmp::Ordering::Less => Some(titanium::Player::One),
-        std::cmp::Ordering::Greater => Some(titanium::Player::Two),
+        std::cmp::Ordering::Less => Some(Player::One),
+        std::cmp::Ordering::Greater => Some(Player::Two),
         std::cmp::Ordering::Equal => None,
     }
 }
