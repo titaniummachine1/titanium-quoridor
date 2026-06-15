@@ -14,8 +14,15 @@ fn corridor_heat(delta: u16) -> u16 {
     if delta > MAX_RELEVANT_CORRIDOR_DELTA {
         return 0;
     }
-    let denom = 1.0 + f32::from(delta) * f32::from(delta + 2).log2();
-    (f32::from(CAT_CORRIDOR_CM) / denom).round().max(1.0) as u16
+    // Exact rounded values of `CAT_CORRIDOR_CM / (1 + delta·log2(delta+2))` for
+    // delta 0/1/2 — kept as a LUT so the per-square hot loop never evaluates a
+    // float `log2`. Bit-identical to the old formula:
+    //   delta 0 → 200/1.0       = 200
+    //   delta 1 → 200/(1+log2 3) = 77
+    //   delta 2 → 200/(1+2·log2 4) = 40
+    const HEAT_LUT: [u16; (MAX_RELEVANT_CORRIDOR_DELTA + 1) as usize] = [200, 77, 40];
+    debug_assert_eq!(CAT_CORRIDOR_CM, 200, "HEAT_LUT computed for CAT_CORRIDOR_CM=200");
+    HEAT_LUT[delta as usize]
 }
 
 /// Centi-percent (45–100): gentle linear fade along the race — near-pawn squares
@@ -68,12 +75,14 @@ fn corridor_delta(
     Some((u16::from(from) + u16::from(to)).saturating_sub(u16::from(shortest_to_goal)))
 }
 
+/// `delta_arr[sq]` is the precomputed corridor delta (`u16::MAX` = off-path/None),
+/// so the per-neighbor near-shortest test is an array read, not a recompute.
 fn reasonable_forward_continuations(
     sq: u8,
     masks: DirMasks,
     dist_from_pawn: &[u8; 81],
     dist_to_goal: &[u8; 81],
-    shortest_to_goal: u8,
+    delta_arr: &[u16; 81],
 ) -> u8 {
     let from = dist_from_pawn[sq as usize];
     let to = dist_to_goal[sq as usize];
@@ -86,10 +95,10 @@ fn reasonable_forward_continuations(
     for &next in &neighbors[..n] {
         let next_from = dist_from_pawn[next as usize];
         let next_to = dist_to_goal[next as usize];
+        // `u16::MAX` sentinel (None) is > MAX_RELEVANT, so it fails the bound naturally.
         if next_from == from.saturating_add(1)
             && next_to < to
-            && corridor_delta(next, dist_from_pawn, dist_to_goal, shortest_to_goal)
-                .is_some_and(|d| d <= MAX_RELEVANT_CORRIDOR_DELTA)
+            && delta_arr[next as usize] <= MAX_RELEVANT_CORRIDOR_DELTA
         {
             count = count.saturating_add(1);
         }
@@ -113,16 +122,23 @@ fn add_player_corridor_attention(
 
     let shortest_to_goal = dist_to_goal[start as usize];
 
+    // Compute each square's corridor delta once (u16::MAX = off-path); the main
+    // loop and the per-neighbor flex test both read it instead of recomputing.
+    let mut delta_arr = [u16::MAX; 81];
+    for sq in 0usize..81 {
+        if let Some(d) = corridor_delta(sq as u8, dist_from_pawn, dist_to_goal, shortest_to_goal) {
+            delta_arr[sq] = d;
+        }
+    }
+
     for sq in 0u8..81 {
-        let Some(delta) = corridor_delta(sq, dist_from_pawn, dist_to_goal, shortest_to_goal) else {
-            continue;
-        };
+        let idx = sq as usize;
+        let delta = delta_arr[idx];
         let base = corridor_heat(delta);
         if base == 0 {
             continue;
         }
 
-        let idx = sq as usize;
         let from = dist_from_pawn[idx];
         let weight = pawn_path_weight(from, shortest_to_goal);
         let heat = (u32::from(base) * u32::from(weight) / 100) as u16;
@@ -130,13 +146,8 @@ fn add_player_corridor_attention(
             continue;
         }
 
-        let flex = reasonable_forward_continuations(
-            sq,
-            masks,
-            dist_from_pawn,
-            dist_to_goal,
-            shortest_to_goal,
-        );
+        let flex =
+            reasonable_forward_continuations(sq, masks, dist_from_pawn, dist_to_goal, &delta_arr);
         out.square_heat[idx] = out.square_heat[idx].saturating_add(heat);
         out.route_flex[idx] = out.route_flex[idx].saturating_add(flex);
         if delta <= BOTTLENECK_CORRIDOR_DELTA && flex <= 1 && dist_to_goal[idx] > 0 {
@@ -212,16 +223,20 @@ pub fn corridor_bottleneck_count(scratch: &mut BfsScratch, board: &Board, player
         return 8;
     }
 
+    let mut delta_arr = [u16::MAX; 81];
+    for sq in 0usize..81 {
+        if let Some(d) = corridor_delta(sq as u8, dist_from, dist_to, shortest_to_goal) {
+            delta_arr[sq] = d;
+        }
+    }
+
     let mut bottlenecks = 0u8;
     for sq in 0u8..81 {
-        let Some(delta) = corridor_delta(sq, dist_from, dist_to, shortest_to_goal) else {
-            continue;
-        };
+        let delta = delta_arr[sq as usize];
         if delta > BOTTLENECK_CORRIDOR_DELTA || dist_to[sq as usize] == 0 {
             continue;
         }
-        let flex =
-            reasonable_forward_continuations(sq, masks, dist_from, dist_to, shortest_to_goal);
+        let flex = reasonable_forward_continuations(sq, masks, dist_from, dist_to, &delta_arr);
         if flex <= 1 {
             bottlenecks = bottlenecks.saturating_add(1);
         }

@@ -65,6 +65,7 @@ fn main() {
         "ace-bench" => run_ace_bench(&args),
         "ace-perft" => run_ace_perft(&args),
         "cat" => run_cat(&args),
+        "eval" => run_eval(&args),
         "lmr" => run_lmr(&args),
         "rollout" => run_rollout(&args),
         "match" => run_match(&args),
@@ -420,6 +421,26 @@ fn run_cat(args: &[String]) {
     println!("{}", cat_snapshot_json(&mut board));
 }
 
+/// Dump the acev13 (grafted) net evaluation for a position — used to verify the
+/// Python NNUE trainer's forward pass matches the engine bit-for-bit. On mid-game
+/// positions (both sides hold walls, not near mate) this is the pure net output.
+fn run_eval(args: &[String]) {
+    use titanium::acev13::{algebraic_to_ace, AceGame, AceSearch};
+    let mut g = AceGame::new();
+    for a in args.iter().skip(2) {
+        if a.starts_with("--") {
+            break;
+        }
+        g.make_move(algebraic_to_ace(a));
+    }
+    let mut s = AceSearch::grafted(g, None);
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", s.eval_dump_json());
+    } else {
+        println!("eval {}", s.eval_position());
+    }
+}
+
 fn looks_like_algebraic_move(arg: &str) -> bool {
     let b = arg.as_bytes();
     b.len() >= 2 && b[0].is_ascii_lowercase() && b[1].is_ascii_digit()
@@ -659,6 +680,7 @@ fn run_match(args: &[String]) {
     let mut engine_b = MatchEngine::TitaniumPlain;
     let mut tt_bits: Option<usize> = None;
     let mut early_stop = true;
+    let mut book_openings = false;
     let mut i = 2usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -672,6 +694,7 @@ fn run_match(args: &[String]) {
             "--a"      => { if let Some(e) = args.get(i+1).and_then(|s| MatchEngine::parse(s)) { engine_a = e; i += 2; continue; } }
             "--b" | "--vs" => { if let Some(e) = args.get(i+1).and_then(|s| MatchEngine::parse(s)) { engine_b = e; i += 2; continue; } }
             "--no-early-stop" => { early_stop = false; i += 1; continue; }
+            "--openings" => { if let Some(v) = args.get(i+1) { book_openings = v == "book"; i += 2; continue; } }
             _ => {}
         }
         i += 1;
@@ -704,14 +727,23 @@ fn run_match(args: &[String]) {
     let games = pairs * 2;
 
     let tt_note = tt_bits.map(|b| format!(", tt-bits={b}")).unwrap_or_default();
+    let open_note = if book_openings {
+        "book lines".to_string()
+    } else {
+        format!("{open_plies} random plies")
+    };
     eprintln!(
-        "match: {games} games @ {time_sec}s/move, open={open_plies} plies, \
+        "match: {games} games @ {time_sec}s/move, open={open_note}, \
          maxply={max_ply}, threads={pair_threads}{tt_note}"
     );
     eprintln!("  A = {}   B = {}", engine_a.label(), engine_b.label());
 
     (0..pairs).into_par_iter().for_each(|pair| {
-        let opening = match_random_opening(seed.wrapping_add(pair as u64), open_plies);
+        let opening = if book_openings {
+            match_book_opening(seed.wrapping_add(pair as u64), open_plies)
+        } else {
+            match_random_opening(seed.wrapping_add(pair as u64), open_plies)
+        };
 
         for flip in 0..2u32 {
             let game_idx = pair * 2 + flip as usize;
@@ -835,6 +867,86 @@ fn match_random_opening(seed: u64, plies: u32) -> Vec<String> {
     out
 }
 
+/// Curated strong opening lines (Ka `FORCE_OPENING_LIST` + win-rate-ranked
+/// comparison data), with selection weights so the distribution peaks on the
+/// main line and tapers to the rarer P2 refutations — a "bell curve around the
+/// top lines". Realistic strong-play openings make A/B matches lower-variance
+/// than uniform-random junk openings. `--openings book` ignores `--open`: the
+/// whole line is played (its length is the intended opening depth).
+const BOOK_OPENINGS: &[(&[&str], u32)] = &[
+    (&["e2", "e8", "e3", "e7", "e4", "e6", "a3h"], 40),
+    (&["e2", "e8", "e3", "e7", "e4", "e6", "d3h", "c6h", "e6v"], 10),
+    (&["e2", "e8", "e3", "e7", "e4", "e6", "d3h", "c6h", "d5v"], 10),
+    (&["e2", "e8", "e3", "e7", "e4", "d4v"], 8),
+    (&["e2", "e8", "e3", "e7", "e4", "e6", "a3h", "d4v", "c5h"], 6),
+    (&["e2", "e8", "e3", "e7", "e4", "e6", "a3h", "h6h", "c3h"], 5),
+];
+
+/// Pick a weighted book line, play it, then append `diverge` seed-random PAWN
+/// plies for variety. Without divergence, deterministic engines replay identical
+/// games whenever two pairs pick the same line — collapsing the sample. Pawn-only
+/// divergence keeps the position realistic (no junk-wall drops) while giving each
+/// pair a distinct midgame. Each move is validated legal (truncates on any
+/// notation mismatch rather than crashing). Color-swap balances first-player edge.
+fn match_book_opening(seed: u64, diverge: u32) -> Vec<String> {
+    use titanium::{generate_legal_moves, Board};
+    let total: u32 = BOOK_OPENINGS.iter().map(|(_, w)| *w).sum();
+    let mut r = ((seed.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as u32) % total;
+    let mut chosen: &[&str] = BOOK_OPENINGS[0].0;
+    for (line, w) in BOOK_OPENINGS {
+        if r < *w {
+            chosen = line;
+            break;
+        }
+        r -= *w;
+    }
+    let mut board = Board::new();
+    let mut out = Vec::new();
+    for mv_str in chosen {
+        if board.is_terminal().is_some() {
+            break;
+        }
+        let legal = generate_legal_moves(&board);
+        match legal.iter().find(|m| format_move(**m) == *mv_str) {
+            Some(&m) => {
+                out.push((*mv_str).to_string());
+                board.apply_move(m);
+            }
+            None => break, // notation mismatch — stop here, keep the valid prefix
+        }
+    }
+    // Pawn-only divergence so identical-line pairs still play distinct games.
+    let mut state = seed | 1;
+    let mut next = || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    for _ in 0..diverge.max(2) {
+        if board.is_terminal().is_some() {
+            break;
+        }
+        let moves = generate_legal_moves(&board);
+        let pawns: Vec<_> = moves
+            .iter()
+            .copied()
+            .filter(|m| {
+                let s = format_move(*m);
+                !s.ends_with('h') && !s.ends_with('v')
+            })
+            .collect();
+        let pool = if pawns.is_empty() { &moves[..] } else { &pawns[..] };
+        if pool.is_empty() {
+            break;
+        }
+        let mv = pool[(next() as usize) % pool.len()];
+        out.push(format_move(mv));
+        board.apply_move(mv);
+    }
+    out
+}
+
 /// A selectable engine for either side of a match.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MatchEngine {
@@ -854,6 +966,9 @@ enum MatchEngine {
     /// Production graft: gen13 net + cheap hands-empty cert + adaptive cache-tier
     /// TT (NO CAT — measured −25 Elo on the net engine).
     AceV13Grafted,
+    /// Grafted + Lague partial-iteration (keep best move from a time-aborted
+    /// deepest iteration). A/B target vs plain grafted to measure the trick.
+    AceV13GraftedPartial,
 }
 
 impl MatchEngine {
@@ -866,6 +981,9 @@ impl MatchEngine {
             "ace-v13-att" | "ace-v13-adaptive-tt" => Some(MatchEngine::AceV13AdaptiveTt),
             "ace-v13-dz" | "ace-v13-deadzone" => Some(MatchEngine::AceV13DeadZone),
             "ace-v13-grafted" | "grafted" => Some(MatchEngine::AceV13Grafted),
+            "ace-v13-grafted-partial" | "grafted-partial" => {
+                Some(MatchEngine::AceV13GraftedPartial)
+            }
             _ => None,
         }
     }
@@ -878,6 +996,7 @@ impl MatchEngine {
             MatchEngine::AceV13AdaptiveTt => "ace-v13 + adaptive cache-tier TT",
             MatchEngine::AceV13DeadZone => "ace-v13 + dead-zone wall prune",
             MatchEngine::AceV13Grafted => "ace-v13 grafted (cheap-cert + adaptive-TT)",
+            MatchEngine::AceV13GraftedPartial => "ace-v13 grafted + Lague partial-iteration",
         }
     }
 }
@@ -909,13 +1028,19 @@ impl Seat {
             | MatchEngine::AceV13Cert
             | MatchEngine::AceV13AdaptiveTt
             | MatchEngine::AceV13DeadZone
-            | MatchEngine::AceV13Grafted => {
+            | MatchEngine::AceV13Grafted
+            | MatchEngine::AceV13GraftedPartial => {
                 let mut g = AceGame::new();
                 for m in opening {
                     g.make_move(algebraic_to_ace(m));
                 }
                 let search = match engine {
                     MatchEngine::AceV13Grafted => AceSearch::grafted(g, tt_bits),
+                    MatchEngine::AceV13GraftedPartial => {
+                        let mut s = AceSearch::grafted(g, tt_bits);
+                        s.set_partial_iter(true);
+                        s
+                    }
                     MatchEngine::AceV13Cert => AceSearch::with_ti_movegen_cheap_cert(g, tt_bits),
                     MatchEngine::AceV13AdaptiveTt => AceSearch::with_ti_movegen_adaptive_tt(g),
                     MatchEngine::AceV13DeadZone => AceSearch::with_ti_movegen_deadzone(g),

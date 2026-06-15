@@ -267,6 +267,9 @@ pub struct AceSearch {
     deadline: Instant,
     root_best: i16,
     root_score: i32,
+    /// Lague partial-iteration: on time-abort, adopt the best FULLY-searched
+    /// root move from the unfinished deepest iteration instead of discarding it.
+    use_partial_iter: bool,
     // ---------- pathfix feature flags (gen11 shipping config) ----------
     /// Exact k=0 race endgame + last-wall gate (JS `raceProof`, ships true).
     race_proof: bool,
@@ -382,6 +385,7 @@ impl AceSearch {
             deadline: Instant::now(),
             root_best: super::ACE_NO_MOVE,
             root_score: 0,
+            use_partial_iter: false,
             race_proof: true,
             refused_cuts: 0,
             rb1_stores: 0,
@@ -614,6 +618,57 @@ impl AceSearch {
     pub fn set_position(&mut self, g: AceGame) {
         self.g = g;
         self.position_changed();
+    }
+
+    /// Static evaluation of the current position (no search) — primes the distance
+    /// cache and forces an accumulator rebuild, then runs `evaluate()`. On mid-game
+    /// positions this returns the pure HalfPW net output; used by the NNUE trainer
+    /// parity harness to confirm the Python forward pass matches the engine.
+    pub fn eval_position(&mut self) -> i32 {
+        self.position_changed();
+        self.refresh_dist(0);
+        self.evaluate()
+    }
+
+    /// Enable Lague partial-iteration (keep the best fully-searched move from a
+    /// time-aborted deepest iteration). Off by default; A/B-measured before adoption.
+    pub fn set_partial_iter(&mut self, on: bool) {
+        self.use_partial_iter = on;
+    }
+
+    /// Dump the raw net inputs + the resulting eval as JSON. Lets the Python NNUE
+    /// trainer verify its forward pass against the engine on the *inputs alone*,
+    /// without reimplementing Quoridor rules/BFS in Python — and is the record
+    /// format for training-data generation. `d0`/`d1` are shortest-path distances.
+    pub fn eval_dump_json(&mut self) -> String {
+        self.position_changed();
+        self.refresh_dist(0);
+        let eval = self.evaluate();
+        let d0 = self.d0[self.dist0_idx][self.g.pawn[0]];
+        let d1 = self.d1[self.dist1_idx][self.g.pawn[1]];
+        let bits = |arr: &[u8; 64]| {
+            let mut s = String::new();
+            for (i, b) in arr.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push(if *b != 0 { '1' } else { '0' });
+            }
+            s
+        };
+        format!(
+            "{{\"turn\":{},\"pawn0\":{},\"pawn1\":{},\"wl0\":{},\"wl1\":{},\"d0\":{},\"d1\":{},\"hw\":[{}],\"vw\":[{}],\"eval\":{}}}",
+            self.g.turn,
+            self.g.pawn[0],
+            self.g.pawn[1],
+            self.g.wl[0],
+            self.g.wl[1],
+            d0,
+            d1,
+            bits(&self.g.hw),
+            bits(&self.g.vw),
+            eval
+        )
     }
 
     fn position_changed(&mut self) {
@@ -1905,7 +1960,26 @@ impl AceSearch {
                         break;
                     }
                 }
-                Err(TimeUp) => break, // state already restored by unwinding unmakes
+                Err(TimeUp) => {
+                    // Lague partial-iteration: the aborted depth-`d` iteration
+                    // still searched its best-ordered root moves to full depth.
+                    // `root_best` only updates after a root move's search FULLY
+                    // completes (the `?` on an aborted child returns first), so it
+                    // holds the best completed move — adopt it instead of falling
+                    // back to depth d-1. On a pure fail-low (no alpha-raise this
+                    // iteration) root_best/root_score still equal the prior depth's
+                    // values, so this is a no-op exactly in the unsafe case.
+                    if self.use_partial_iter && self.root_best >= 0 {
+                        last_best = self.root_best;
+                        last_score = self.root_score;
+                        last_depth = d;
+                        if self.root_pawn_best >= 0 {
+                            last_pawn_best = self.root_pawn_best;
+                            last_pawn_score = self.root_pawn_score;
+                        }
+                    }
+                    break; // state already restored by unwinding unmakes
+                }
             }
             if Self::ace_over_time_budget(t0, time_ms, last_score) {
                 break;

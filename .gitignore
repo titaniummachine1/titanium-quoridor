@@ -26,3 +26,6 @@ credentials.json
 id_rsa
 id_rsa.*
 *.kdbx
+
+# Local strength baseline reference (archived binary + weights)
+baseline/

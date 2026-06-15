@@ -75,3 +75,7 @@ harness = false
 [[bench]]
 name = "perft_full_compare"
 harness = false
+
+[[bench]]
+name = "cat_build"
+harness = false
