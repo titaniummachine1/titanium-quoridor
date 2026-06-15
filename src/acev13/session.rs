@@ -22,9 +22,11 @@ fn reply_error(stdout: &mut io::Stdout, message: &str) {
 
 fn build_search(engine_flag: &str, g: AceGame) -> Box<AceSearch> {
     // gen13 default is the OPTIMIZED engine (Titanium O1 movegen); `ace-v13-pure`
-    // selects the faithful 1:1 native movegen (JS-matching reference).
+    // selects the faithful 1:1 native movegen (JS-matching reference);
+    // `ace-v13-grafted` is the production graft (cheap-cert + adaptive cache-tier TT).
     let mut search = match engine_flag {
         "ace-v13-pure" => AceSearch::new(g),
+        "ace-v13-grafted" => AceSearch::grafted(g, None),
         _ => AceSearch::with_ti_movegen(g),
     };
     if engine_flag.contains("pmc") {

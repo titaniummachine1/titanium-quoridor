@@ -643,7 +643,7 @@ fn run_rollout(args: &[String]) {
 ///         [--maxply N]`
 fn run_match(args: &[String]) {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::Mutex;
     use titanium::search::alphabeta::CERT_PROOFS;
 
@@ -658,6 +658,7 @@ fn run_match(args: &[String]) {
     let mut engine_a = MatchEngine::TitaniumCert;
     let mut engine_b = MatchEngine::TitaniumPlain;
     let mut tt_bits: Option<usize> = None;
+    let mut early_stop = true;
     let mut i = 2usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -670,6 +671,7 @@ fn run_match(args: &[String]) {
             "--tt-bits"=> { if let Some(v) = args.get(i+1).and_then(|s| s.parse().ok()) { tt_bits = Some(v); i += 2; continue; } }
             "--a"      => { if let Some(e) = args.get(i+1).and_then(|s| MatchEngine::parse(s)) { engine_a = e; i += 2; continue; } }
             "--b" | "--vs" => { if let Some(e) = args.get(i+1).and_then(|s| MatchEngine::parse(s)) { engine_b = e; i += 2; continue; } }
+            "--no-early-stop" => { early_stop = false; i += 1; continue; }
             _ => {}
         }
         i += 1;
@@ -689,6 +691,9 @@ fn run_match(args: &[String]) {
     let draws   = AtomicU32::new(0);
     let cert_touched = AtomicU64::new(0);
     let games_done   = AtomicU32::new(0);
+    // Disaster guard: set when we're statistically confident A is ≥100 Elo worse.
+    // In-flight games still finish, but no new ones launch — saves a doomed run.
+    let aborted = AtomicBool::new(false);
     let started = Instant::now();
     let print_mu: Mutex<()> = Mutex::new(());
 
@@ -711,6 +716,7 @@ fn run_match(args: &[String]) {
         for flip in 0..2u32 {
             let game_idx = pair * 2 + flip as usize;
             if game_idx >= games { break; }
+            if aborted.load(Ordering::Relaxed) { break; } // disaster guard tripped
             // Swap colors per game in the pair so the opening is played from both
             // sides — `a_is_one` true means engine A holds Player::One this game.
             let a_is_one = flip == 0;
@@ -747,6 +753,25 @@ fn run_match(args: &[String]) {
                  {:.0}s elapsed",
                 started.elapsed().as_secs_f64()
             );
+
+            // Disaster guard: once we have a small sample, abort if we're 97.5%
+            // confident A scores below 36% (≈ −100 Elo). p̂ + 1.96·SE < 0.36.
+            // -100 Elo ⇒ expected score 1/(1+10^(100/400)) ≈ 0.360.
+            if early_stop && !aborted.load(Ordering::Relaxed) && played >= 16 {
+                let n = played as f64;
+                let p = score / n;
+                let se = (p * (1.0 - p) / n).sqrt();
+                if p + 1.96 * se < 0.36 {
+                    aborted.store(true, Ordering::Relaxed);
+                    eprintln!(
+                        "  !! EARLY STOP: A-score {:.1}% (95% CI upper {:.1}%) < 36% \
+                         after {played} games — A is ≥100 Elo worse. Aborting \
+                         (use --no-early-stop to force a full run).",
+                        p * 100.0,
+                        (p + 1.96 * se) * 100.0
+                    );
+                }
+            }
         }
     });
 
@@ -754,7 +779,10 @@ fn run_match(args: &[String]) {
     let bw = b_w.load(Ordering::Relaxed);
     let dr = draws.load(Ordering::Relaxed);
     let ct = cert_touched.load(Ordering::Relaxed);
-    let n = games as f64;
+    let was_aborted = aborted.load(Ordering::Relaxed);
+    // Use games actually played (abort may have cut the run short).
+    let played = games_done.load(Ordering::Relaxed) as usize;
+    let n = (played.max(1)) as f64;
     let score = aw as f64 + 0.5 * dr as f64;
     let p = score / n;
     let se = (p * (1.0 - p) / n).sqrt();
@@ -765,13 +793,17 @@ fn run_match(args: &[String]) {
     };
     println!("=== STRENGTH MATCH RESULT ===");
     println!("A = {},  B = {}{tt_note}", engine_a.label(), engine_b.label());
-    println!("games {games} @ {time_sec}s/move");
+    if was_aborted {
+        println!("EARLY-STOPPED after {played}/{games} games (A ≥100 Elo worse)");
+    } else {
+        println!("games {played} @ {time_sec}s/move");
+    }
     println!("A wins {aw}  |  B wins {bw}  |  draws {dr}");
     println!(
-        "A score {score:.1}/{games} = {:.1}% (±{:.1}%)  →  ~{elo:+.0} Elo",
+        "A score {score:.1}/{played} = {:.1}% (±{:.1}%)  →  ~{elo:+.0} Elo",
         p * 100.0, se * 196.0
     );
-    println!("Titanium-cert fired in {ct}/{games} games");
+    println!("Titanium-cert fired in {ct}/{played} games");
 }
 
 /// Build a seeded random legal opening of `plies` moves from startpos.
@@ -817,6 +849,8 @@ enum MatchEngine {
     AceV13Cert,
     /// gen13 net search + adaptive cache-tier TT ONLY. Isolates TT growth.
     AceV13AdaptiveTt,
+    /// gen13 net search + SOUND dead-zone wall prune ONLY. Isolates that pruner.
+    AceV13DeadZone,
     /// Production graft: gen13 net + cheap hands-empty cert + adaptive cache-tier
     /// TT (NO CAT — measured −25 Elo on the net engine).
     AceV13Grafted,
@@ -830,6 +864,7 @@ impl MatchEngine {
             "ace-v13" => Some(MatchEngine::AceV13),
             "ace-v13-cert" => Some(MatchEngine::AceV13Cert),
             "ace-v13-att" | "ace-v13-adaptive-tt" => Some(MatchEngine::AceV13AdaptiveTt),
+            "ace-v13-dz" | "ace-v13-deadzone" => Some(MatchEngine::AceV13DeadZone),
             "ace-v13-grafted" | "grafted" => Some(MatchEngine::AceV13Grafted),
             _ => None,
         }
@@ -841,6 +876,7 @@ impl MatchEngine {
             MatchEngine::AceV13 => "ace-v13 (O1 movegen)",
             MatchEngine::AceV13Cert => "ace-v13 + cheap-cert (no CAT)",
             MatchEngine::AceV13AdaptiveTt => "ace-v13 + adaptive cache-tier TT",
+            MatchEngine::AceV13DeadZone => "ace-v13 + dead-zone wall prune",
             MatchEngine::AceV13Grafted => "ace-v13 grafted (cheap-cert + adaptive-TT)",
         }
     }
@@ -872,6 +908,7 @@ impl Seat {
             MatchEngine::AceV13
             | MatchEngine::AceV13Cert
             | MatchEngine::AceV13AdaptiveTt
+            | MatchEngine::AceV13DeadZone
             | MatchEngine::AceV13Grafted => {
                 let mut g = AceGame::new();
                 for m in opening {
@@ -881,6 +918,7 @@ impl Seat {
                     MatchEngine::AceV13Grafted => AceSearch::grafted(g, tt_bits),
                     MatchEngine::AceV13Cert => AceSearch::with_ti_movegen_cheap_cert(g, tt_bits),
                     MatchEngine::AceV13AdaptiveTt => AceSearch::with_ti_movegen_adaptive_tt(g),
+                    MatchEngine::AceV13DeadZone => AceSearch::with_ti_movegen_deadzone(g),
                     _ => {
                         // Plain ace-v13 — but still honor --tt-bits so a pure TT-size
                         // experiment (ace-v13 @ N bits vs ace-v13 default) is possible.
@@ -1011,7 +1049,7 @@ fn ace_engine_flag(args: &[String]) -> Option<&str> {
             "ace" | "ace-v8" | "ace-v10" | "ace-v11" | "ace-cat" | "ace-ti" | "ace-v8-ti"
             | "ace-v8-ti-pmc" | "ace-v10-ti" | "ace-v10-ti-pmc" | "ace-v11-ti"
             | "ace-v11-ti-pmc" | "ace-pmc" | "ace-v13" | "ace-v13-ti" | "ace-v13-ti-pmc"
-            | "ace-v13-pure" => Some(w[1].as_str()),
+            | "ace-v13-pure" | "ace-v13-grafted" => Some(w[1].as_str()),
             _ => None,
         }
     })

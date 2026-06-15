@@ -389,7 +389,16 @@ fn wall_touches_gap_zone(mv: Move, gap_zone: u128) -> bool {
     false
 }
 
-fn wall_in_dead_zone(mv: Move, reachable: u128) -> bool {
+/// SOUND "useless wall" test: true iff EVERY square the wall touches is
+/// unreachable (outside both pawns' reachable region). Such a wall can never be
+/// adjacent to any pawn, so it can block no path — placing it only wastes
+/// inventory, which is never an advantage → it can never be the best move, so
+/// pruning it is NPS-only and cannot cost Elo.
+///
+/// Exclusion is built in: a wall touching even ONE reachable square — including a
+/// half-in-void / half-in-playable wall — returns `false` (kept), preserving the
+/// tactical half-wall placement.
+pub fn wall_in_dead_zone(mv: Move, reachable: u128) -> bool {
     let Move::Wall {
         row,
         col,

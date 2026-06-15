@@ -26,7 +26,9 @@ use crate::acev13::certify::{certify, CertifyOpts};
 use crate::acev13::game::{AceGame, ZOBRIST};
 use crate::acev13::net::{net, Net, NET_BKT, NET_H, NET_MIRC, NET_MIRS};
 use crate::acev13::race::{solve_race_config, RaceScratch, RACE_MATE, RACE_STATES};
-use crate::cat::prune::{gap_play_zone_mask, get_shortest_path, wall_should_search};
+use crate::cat::prune::{
+    gap_play_zone_mask, get_shortest_path, wall_in_dead_zone, wall_should_search,
+};
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move as BoardMove, Player, Undo, WallOrientation};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
@@ -249,6 +251,11 @@ pub struct AceSearch {
     ti_movegen: bool,
     /// CAT-filter walls at inner nodes (requires `bridge`).
     cat_walls: bool,
+    /// SOUND dead-zone wall prune at inner nodes (requires `bridge`): drop only
+    /// walls in an unreachable void / sealed interior — provably irrelevant (they
+    /// change no path and only burn inventory, never the best move). NPS-only;
+    /// cannot cost Elo. Distinct from `cat_walls` (heat filter, which can).
+    dead_zone_prune: bool,
     /// Grafted-engine flag: in the hands-empty endgame, use Titanium's cheap
     /// path-aware tempo classifier ([`cert_bridge::hands_empty_race`]) instead of
     /// the full recursive `certify`. Same result, a fraction of the nodes — frees
@@ -368,6 +375,7 @@ impl AceSearch {
             bridge: None,
             ti_movegen: false,
             cat_walls: false,
+            dead_zone_prune: false,
             cheap_cert: false,
             eme: false,
             nodes: 0,
@@ -451,14 +459,22 @@ impl AceSearch {
         search
     }
 
-    /// **Grafted engine** — gen13 net search + Titanium's *measured-positive*
-    /// extras: O1 movegen, the cheap hands-empty cert (+31 Elo vs plain ace-v13),
-    /// and the adaptive cache-tier TT (strength-neutral but safe/scalable).
+    /// **Grafted engine** — gen13 net search + Titanium's *logically-safe* extras:
+    ///   - cheap hands-empty cert: replaces the recursive `certify` with the exact
+    ///     race classifier when no walls remain — IDENTICAL verdict, fewer nodes.
+    ///     A strict non-regression (can't produce a worse move; frees NPS).
+    ///   - adaptive cache-tier TT: identical TT semantics, better cache locality
+    ///     and safe growth. Also can't hurt.
     ///
-    /// NOTE: CAT wall-pruning is deliberately **excluded** — measured −25 Elo on
-    /// the net engine (it compensates for a weak eval; the net doesn't need it and
-    /// loses good wall candidates). `tt_bits = Some(n)` pins a fixed TT instead of
-    /// the adaptive one (for benchmarking).
+    /// EXCLUDED:
+    ///   - CAT heat-prune: removes wall candidates the net wants (drops Elo).
+    ///   - dead-zone prune: unsound (block-a-blocker) AND its apparent gain was
+    ///     measurement noise — a single-seed +76 became −25 on another seed.
+    ///
+    /// NOTE on measurement: 112-game runs carry a ±~64 Elo 95% CI, so per-run Elo
+    /// deltas are not individually trustworthy. These two extras are kept because
+    /// they are *provably* non-harmful, not because a single match "won".
+    /// `tt_bits = Some(n)` pins a fixed TT instead of the adaptive one.
     pub fn grafted(g: AceGame, tt_bits: Option<usize>) -> Box<Self> {
         let mut search = Self::with_ti_movegen(g);
         search.cheap_cert = true;
@@ -485,6 +501,14 @@ impl AceSearch {
     pub fn with_ti_movegen_adaptive_tt(g: AceGame) -> Box<Self> {
         let mut search = Self::with_ti_movegen(g);
         search.enable_adaptive_tt();
+        search
+    }
+
+    /// gen13 net search + O1 movegen + SOUND dead-zone wall prune (no CAT heat).
+    /// Isolates the dead-zone pruner's contribution (NPS-only, can't cost Elo).
+    pub fn with_ti_movegen_deadzone(g: AceGame) -> Box<Self> {
+        let mut search = Self::with_ti_movegen(g);
+        search.dead_zone_prune = true;
         search
     }
 
@@ -1081,7 +1105,7 @@ impl AceSearch {
         // Fully legal walls — no lazy seal checks needed downstream, and inner
         // nodes can never search (or suggest via TT) a Titanium-illegal move.
         // The CAT hybrid keeps its own filtered path at inner nodes.
-        if self.ti_movegen && (check_legal || !self.cat_walls) {
+        if self.ti_movegen && (check_legal || (!self.cat_walls && !self.dead_zone_prune)) {
             return self
                 .bridge
                 .as_mut()
@@ -1094,6 +1118,9 @@ impl AceSearch {
         }
         if self.cat_walls && !check_legal {
             return self.gen_walls_cat_filtered(depth, tt_move, out, n);
+        }
+        if self.dead_zone_prune && !check_legal {
+            return self.gen_walls_deadzone_filtered(out, n);
         }
         for slot in 0..64 {
             if check_legal {
@@ -1180,6 +1207,30 @@ impl AceSearch {
                     out[n] = m;
                     n += 1;
                 }
+            }
+        }
+        n
+    }
+
+    /// Wall generation with the SOUND dead-zone skip ONLY: emit every geometrically
+    /// legal wall EXCEPT those whose every touched square is unreachable (a wall in
+    /// a pure void). Those touch no pawn-reachable cell, block no path, and only
+    /// burn inventory — never the best move, so pruning is NPS-only and can't cost
+    /// Elo. A wall touching even one reachable square (incl. half-in-void) is kept.
+    fn gen_walls_deadzone_filtered(&mut self, out: &mut [i16; 160], mut n: usize) -> usize {
+        let bridge = self.bridge.as_mut().expect("dead-zone bridge");
+        let reachable = bridge.bfs.both_reachable_mask(&bridge.board);
+        for slot in 0..64 {
+            for (wall_type, base) in [(0usize, 100i16), (1usize, 200i16)] {
+                if !self.g.wall_fits(wall_type, slot) {
+                    continue;
+                }
+                let m = base + slot as i16;
+                if wall_in_dead_zone(ace_move_to_board(m), reachable) {
+                    continue;
+                }
+                out[n] = m;
+                n += 1;
             }
         }
         n
@@ -1415,7 +1466,10 @@ impl AceSearch {
             }
             // Seal check only needed for ACE's lazy pseudo-legal walls; with
             // MoveGen+ (Titanium legal gen at every node) all walls are legal.
-            let lazy_walls = !(self.ti_movegen && !self.cat_walls);
+            // The CAT and dead-zone paths both emit geometry-only (pseudo-legal)
+            // walls, so they STILL need the seal check — only the pure ti_movegen
+            // path (full legal gen) can skip it.
+            let lazy_walls = !(self.ti_movegen && !self.cat_walls && !self.dead_zone_prune);
             if m >= 100 && ply > 0 && lazy_walls {
                 let wt = if m < 200 { 0 } else { 1 };
                 let slot = (m % 100) as usize;
