@@ -1017,11 +1017,13 @@ impl MatchEngine {
         match s {
             "titanium" | "titanium-cert" => Some(MatchEngine::TitaniumCert),
             "titanium-plain" => Some(MatchEngine::TitaniumPlain),
+            // Titanium v14 = ACE v13 + O1 movegen + cheap-cert + adaptive-TT + partial-iter
+            // This is our current strongest engine; bump the version number when we add more.
+            "titanium-v14" | "ace-v13-grafted" | "grafted" => Some(MatchEngine::AceV13Grafted),
             "ace-v13" => Some(MatchEngine::AceV13),
             "ace-v13-cert" => Some(MatchEngine::AceV13Cert),
             "ace-v13-att" | "ace-v13-adaptive-tt" => Some(MatchEngine::AceV13AdaptiveTt),
             "ace-v13-dz" | "ace-v13-deadzone" => Some(MatchEngine::AceV13DeadZone),
-            "ace-v13-grafted" | "grafted" => Some(MatchEngine::AceV13Grafted),
             "ace-v13-grafted-partial" | "grafted-partial" => {
                 Some(MatchEngine::AceV13GraftedPartial)
             }
@@ -1036,7 +1038,7 @@ impl MatchEngine {
             MatchEngine::AceV13Cert => "ace-v13 + cheap-cert (no CAT)",
             MatchEngine::AceV13AdaptiveTt => "ace-v13 + adaptive cache-tier TT",
             MatchEngine::AceV13DeadZone => "ace-v13 + dead-zone wall prune",
-            MatchEngine::AceV13Grafted => "ace-v13 grafted (cheap-cert + adaptive-TT)",
+            MatchEngine::AceV13Grafted => "Titanium v14 (ACE v13 + cert + adaptive-TT + partial-iter)",
             MatchEngine::AceV13GraftedPartial => "ace-v13 grafted + Lague partial-iteration",
         }
     }
@@ -1219,7 +1221,7 @@ fn ace_engine_flag(args: &[String]) -> Option<&str> {
             "ace" | "ace-v8" | "ace-v10" | "ace-v11" | "ace-cat" | "ace-ti" | "ace-v8-ti"
             | "ace-v8-ti-pmc" | "ace-v10-ti" | "ace-v10-ti-pmc" | "ace-v11-ti"
             | "ace-v11-ti-pmc" | "ace-pmc" | "ace-v13" | "ace-v13-ti" | "ace-v13-ti-pmc"
-            | "ace-v13-pure" | "ace-v13-grafted" => Some(w[1].as_str()),
+            | "ace-v13-pure" | "ace-v13-grafted" | "titanium-v14" => Some(w[1].as_str()),
             _ => None,
         }
     })
@@ -1241,7 +1243,7 @@ fn ace_engine_mode(flag: &str) -> &'static str {
 
 /// gen13 engine (`ACEV13.html` port in `crate::acev13`) vs the v11 `crate::ace`.
 fn is_acev13(flag: &str) -> bool {
-    flag.starts_with("ace-v13")
+    flag.starts_with("ace-v13") || flag == "titanium-v14"
 }
 
 fn is_ace_engine(args: &[String]) -> bool {
