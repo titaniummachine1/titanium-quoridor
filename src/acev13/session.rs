@@ -1,10 +1,11 @@
-//! Long-lived ACE session REPL — one process per web UI engine seat.
+//! ACE v13 reference-engine session REPL (ace-v13-*, ace-v13-ti-pure, …).
 //!
-//! Same wire protocol as `search::session_stdio` (`reset` / `position` /
-//! `makemove` / `go TIME_SEC [MAX_NODES]` / `quit`), but holds a single
-//! `AceSearch` for the whole game so the TT, killers, history, and
-//! countermove tables stay warm between plies — each think starts from
-//! the previous search's analysis instead of cold.
+//! Wire protocol: `reset` / `position [MOVES]` / `makemove MOVE` /
+//! `go TIME_SEC` / `quit`.  Holds one warm `AceSearch` per process so the
+//! TT, killers, history, and countermove tables persist between plies.
+//!
+//! **Titanium v15 uses `session_v15` instead** — this file handles only the
+//! ACE reference engines used as comparison baselines.
 
 use std::io::{self, BufRead, Write};
 
@@ -21,14 +22,12 @@ fn reply_error(stdout: &mut io::Stdout, message: &str) {
 }
 
 fn build_search(engine_flag: &str, g: AceGame) -> Box<AceSearch> {
-    // `titanium-v15` is the current production engine (gen13 + O1 movegen + cert + adaptive-TT + partial-iter).
-    // `ace-v13-ti-pure` is the JS v13 baseline (+ O1 movegen only) — fair yardstick for Elo measurement.
-    // `titanium-v14` / `ace-v13-grafted` are legacy aliases for the same v15 build.
+    // Reference engines only — titanium-v15 is routed to session_v15::run_v15_session_stdio.
+    // ace-v13-ti-pure = O1 movegen + pure_mode (faithful JS baseline, Elo measurement yardstick).
     let mut search = match engine_flag {
         "ace-v13-pure"    => AceSearch::new(g),
         "ace-v13-ti-pure" => AceSearch::with_ti_movegen_pure(g),
-        "ace-v13-grafted" | "titanium-v14" | "titanium-v15" => AceSearch::grafted(g, None),
-        _ => AceSearch::with_ti_movegen(g),
+        _                 => AceSearch::with_ti_movegen(g),
     };
     if engine_flag.contains("pmc") {
         search.enable_eme();

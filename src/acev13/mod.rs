@@ -1,30 +1,26 @@
-//! ACE v13 (gen13) port — `ACEV13.html` "pathfix gen11_ghi +
-//! RaceProof/ThreatPrice/WallSense" search, plus optional Titanium movegen.
+//! **Titanium v15** — the production Titanium engine — and the ACE v13
+//! reference family live in this module.
 //!
-//! Baseline copied from the proven v11 port (`crate::ace`): the game rules,
-//! movegen, and HalfPW net are byte-identical (verified `net_weights.bin`
-//! Wskip == ACEV13 `NET_DATA.Wskip`), and the RaceProof race tables match.
+//! ## Titanium v15
+//! The flagship engine: grafts the Titanium O1 pawn-LUT movegen, adaptive TT,
+//! win-certificate solver (`certify.rs`), and incremental HalfPW accumulator
+//! onto the gen13 search core.  It is NOT just an ACE port — it is the
+//! Titanium engine, using ACE v13 as its search algorithm foundation.
+//! Session: `run_v15_session_stdio` (two-thread daemon, infinite search).
 //!
-//! gen13 over v11: `certify_win.js` is INLINED in the JS, so `RP_CERT` always
-//! exists (browser AND node). The v11 port mirrored the *browser* build where
-//! `RP_CERT === null` and omitted the certificate solver; gen13 adds the
-//! static win-certificate solver (`certify`, this module's `certify.rs`) and
-//! runs it in the certified-win eval floor and the last-wall commitment gate
-//! (refutation semantics: demote only on a certificate the opponent wins).
-//! ThreatPrice and WallSense still ship FALSE in gen13 (falsifier/SPRT-killed)
-//! and are intentionally not ported — the flags no-op cleanly when false.
+//! ## ACE v13 reference engines
+//! Faithful Rust ports of `ACEV13.html` ("pathfix gen11_ghi +
+//! RaceProof/ThreatPrice/WallSense").  Rules, movegen, and HalfPW net are
+//! byte-identical to the JS (verified `net_weights.bin` Wskip match).
+//! gen13 addition: `certify_win.js` is inlined so `RP_CERT` always exists;
+//! the static win-certificate solver and last-wall commitment gate are ported.
+//! ThreatPrice / WallSense ship false in gen13 and are not ported.
 //!
-//! Self-contained: own board representation, search, and HalfPW net eval.
-//! Only this module's `genmove` entry translates between Titanium algebraic
-//! notation and ACE move encoding.
+//! - **`ace-v13-ti`** — optimized: Titanium O1 movegen, fully-legal tree.
+//! - **`ace-v13-pure`** — faithful 1:1 port: native ACE movegen, JS-matching.
+//! - **`ace-v13-ti-pure`** — O1 movegen + pure_mode=true (JS baseline for Elo).
 //!
-//! CLI engines: **`ace-v13`** is the OPTIMIZED build — it runs the Titanium
-//! **O1 pawn-LUT movegen** (`with_ti_movegen`) and is free to diverge from the
-//! JS (fully-legal movegen, cleaner search tree). **`ace-v13-pure`** is the
-//! faithful 1:1 port (native ACE `wall_legal` movegen) kept as the JS-matching
-//! reference; the certificate / eval / search logic is identical between them.
-//!
-//! Coordinate mapping (ACE row 0 = top, Titanium row 0 = bottom):
+//! ## Coordinate mapping (ACE row 0 = top, Titanium row 0 = bottom)
 //!   pawn  m = (8 - row) * 9 + col
 //!   wall  m = base + (7 - row) * 8 + col   (base 100 = h, 200 = v)
 

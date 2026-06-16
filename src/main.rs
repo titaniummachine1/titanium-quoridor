@@ -73,7 +73,7 @@ fn main() {
         "uci" => titanium::run_uci_stdio(),
         "session" => match ace_engine_flag(&args) {
             Some(flag) if flag == "titanium-v15" => titanium::acev13::run_v15_session_stdio(flag),
-            Some(flag) if is_acev13(flag) => titanium::acev13::run_ace_session_stdio(flag),
+            Some(flag) if uses_acev13_module(flag) => titanium::acev13::run_ace_session_stdio(flag),
             Some(flag) => titanium::ace::run_ace_session_stdio(flag),
             None => run_session_stdio(),
         },
@@ -1215,18 +1215,23 @@ fn run_genmove(args: &[String]) {
 
 // ── ACE v7 port (pure) ───────────────────────────────────────────────────────
 
+/// Returns the engine flag if it routes through the acev13 module (or earlier ace module).
+/// This covers both the ACE reference family and the Titanium v14/v15 production engines.
 fn ace_engine_flag(args: &[String]) -> Option<&str> {
     args.windows(2).find_map(|w| {
         if w[0] != "--engine" {
             return None;
         }
         match w[1].as_str() {
+            // ACE reference engines (older versions)
             "ace" | "ace-v8" | "ace-v10" | "ace-v11" | "ace-cat" | "ace-ti" | "ace-v8-ti"
             | "ace-v8-ti-pmc" | "ace-v10-ti" | "ace-v10-ti-pmc" | "ace-v11-ti"
-            | "ace-v11-ti-pmc" | "ace-pmc" | "ace-v13" | "ace-v13-ti" | "ace-v13-ti-pmc"
-            | "ace-v13-pure" | "ace-v13-grafted" | "titanium-v14" | "titanium-v15" => {
-                Some(w[1].as_str())
-            }
+            | "ace-v11-ti-pmc" | "ace-pmc"
+            // ACE v13 reference engines (JS-equivalent baselines)
+            | "ace-v13" | "ace-v13-ti" | "ace-v13-ti-pmc"
+            | "ace-v13-pure" | "ace-v13-grafted" | "ace-v13-ti-pure"
+            // Titanium production engines (use acev13 search core)
+            | "titanium-v14" | "titanium-v15" => Some(w[1].as_str()),
             _ => None,
         }
     })
@@ -1246,8 +1251,9 @@ fn ace_engine_mode(flag: &str) -> &'static str {
     }
 }
 
-/// gen13 engine (`ACEV13.html` port in `crate::acev13`) vs the v11 `crate::ace`.
-fn is_acev13(flag: &str) -> bool {
+/// True for any engine that lives in the `crate::acev13` module — both the
+/// ACE v13 reference engines and the Titanium v14/v15 production engines.
+fn uses_acev13_module(flag: &str) -> bool {
     flag.starts_with("ace-v13") || flag == "titanium-v14" || flag == "titanium-v15"
 }
 
@@ -1356,7 +1362,7 @@ fn run_genmove_ace(args: &[String]) {
         }};
     }
 
-    if is_acev13(label) {
+    if uses_acev13_module(label) {
         emit_genmove!(titanium::acev13);
     } else {
         emit_genmove!(titanium::ace);

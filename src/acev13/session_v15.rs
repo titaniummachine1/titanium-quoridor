@@ -1,20 +1,25 @@
-//! titanium-v15 session — two-thread design: I/O on main thread, search daemon.
+//! **Titanium v15 engine session** — two-thread design: I/O on main thread,
+//! search daemon thread.
 //!
-//! Extends the standard ACE session protocol with infinite-search commands:
+//! Titanium v15 is the production engine: grafts Titanium O1 movegen,
+//! adaptive TT, win-certificate solver, and incremental HalfPW accumulator
+//! onto the gen13 search core.  This session adds continuous-search support
+//! on top of the standard game-server protocol.
 //!
-//!   go infinite [PONDER_MOVE]   — start pondering (apply PONDER_MOVE first if given)
-//!   stop                        — stop pondering; replies "bestmove MOVE"
-//!   ponderhit TIME_MS           — ponder move was correct; think for TIME_MS; replies "bestmove MOVE"
-//!   movemiss MOVE TIME_MS       — opponent played MOVE (not the ponder move);
-//!                                 migrate root and think for TIME_MS; replies "bestmove MOVE"
+//! ## Protocol
 //!
-//! Legacy commands from the standard session still work:
-//!
+//! ### Standard commands (compatible with self_match.js and run_overnight.bat)
 //!   reset / position [MOVES] / makemove MOVE / go TIME_SEC / quit
 //!
-//! For `go TIME_SEC` the daemon does a single blocking think() and replies
-//! "bestmove MOVE" — identical to the standard session, so self_match.js
-//! (which uses the standard protocol) works with titanium-v15 unchanged.
+//! ### Titanium v15 infinite-search extensions
+//!   go infinite [PONDER_MOVE]   — start pondering; applies PONDER_MOVE first if given
+//!   stop                        — stop pondering; replies "bestmove MOVE"
+//!   ponderhit TIME_MS           — ponder move was correct; think for TIME_MS; replies "bestmove MOVE"
+//!   movemiss MOVE TIME_MS       — opponent played MOVE (unexpected);
+//!                                 migrate root and think for TIME_MS; replies "bestmove MOVE"
+//!
+//! For `go TIME_SEC` the daemon does a single blocking think and replies
+//! "bestmove MOVE" — the standard path used by self_match.js.
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
