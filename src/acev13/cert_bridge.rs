@@ -436,6 +436,8 @@ mod tests {
         let mut volatile = 0usize;
 
         for p0 in 0..81 {
+            // Skip already-terminal roots; those are handled by the normal
+            // immediate winner path, not by race classification.
             if p0 < 9 {
                 continue;
             }

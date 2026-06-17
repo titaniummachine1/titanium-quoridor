@@ -28,7 +28,7 @@ use crate::util::clock::{Duration, Instant};
 
 use crate::acev13::certify::{certify, CertifyOpts};
 use crate::acev13::game::{AceGame, ZOBRIST};
-use crate::acev13::net::{net, Net, NET_BKT, NET_H, NET_MIRC, NET_MIRS};
+use crate::acev13::net::{net, net_frozen, Net, NET_BKT, NET_H, NET_MIRC, NET_MIRS};
 use crate::acev13::race::{solve_race_config, RaceScratch, RACE_MATE, RACE_STATES};
 use crate::cat::prune::{
     gap_play_zone_mask, get_shortest_path, wall_in_dead_zone, wall_should_search,
@@ -161,6 +161,45 @@ pub struct ThinkResult {
     pub depth_log: Vec<AceDepthLogEntry>,
 }
 
+pub fn score_label(score: i32) -> String {
+    let abs = score.abs();
+    if abs >= MATE - 1_000 {
+        let plies = MATE - abs;
+        if score > 0 {
+            format!("mate in {}", plies.max(0))
+        } else {
+            format!("mated in {}", plies.max(0))
+        }
+    } else if abs >= RACE_MATE - 1_000 && abs <= RACE_MATE {
+        let plies = RACE_MATE - abs;
+        if score > 0 {
+            format!("race win in {}", plies.max(0))
+        } else {
+            format!("race loss in {}", plies.max(0))
+        }
+    } else {
+        format!("cp {score}")
+    }
+}
+
+#[cfg(test)]
+mod score_label_tests {
+    use super::*;
+
+    #[test]
+    fn labels_race_scores_as_forced_races() {
+        assert_eq!(score_label(RACE_MATE - 30), "race win in 30");
+        assert_eq!(score_label(-(RACE_MATE - 17)), "race loss in 17");
+    }
+
+    #[test]
+    fn labels_true_mate_scores_separately_from_races() {
+        assert_eq!(score_label(MATE - 5), "mate in 5");
+        assert_eq!(score_label(-(MATE - 9)), "mated in 9");
+        assert_eq!(score_label(42), "cp 42");
+    }
+}
+
 fn emit_ace_progress(
     engine_label: &str,
     depth_log: &[AceDepthLogEntry],
@@ -177,18 +216,21 @@ fn emit_ace_progress(
             depth_json.push(',');
         }
         let pv = e.pv.replace('\\', "\\\\").replace('"', "\\\"");
+        let score_text = score_label(e.score);
         depth_json.push_str(&format!(
-            "{{\"depth\":{},\"score\":{},\"nodes\":{},\"elapsedMs\":{},\"marginalNodes\":{},\"pv\":\"{}\"}}",
-            e.depth, e.score, e.nodes, e.elapsed_ms, e.marginal_nodes, pv
+            "{{\"depth\":{},\"score\":{},\"scoreText\":\"{}\",\"nodes\":{},\"elapsedMs\":{},\"marginalNodes\":{},\"pv\":\"{}\"}}",
+            e.depth, e.score, score_text, e.nodes, e.elapsed_ms, e.marginal_nodes, pv
         ));
     }
+    let root_score_text = score_label(root_score);
     eprintln!(
-        "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"depthLog\":[{}]}}",
+        "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"rootScoreText\":\"{}\",\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"depthLog\":[{}]}}",
         engine_label,
         engine_label,
         search_depth,
         nodes,
         root_score,
+        root_score_text,
         white_dist,
         black_dist,
         elapsed_ms,
@@ -270,6 +312,10 @@ pub struct AceSearch {
     /// the full recursive `certify`. Same result, a fraction of the nodes — frees
     /// NPS for the rest of the search. Off = faithful gen13 (always `certify`).
     cheap_cert: bool,
+    /// When true, recursive certify + k=0 race oracle run only at quiescence
+    /// leaves with both hands empty. Inner nodes use the HalfPW net (search
+    /// + EME resolve tempo ambiguity). Set in [`Self::grafted_with_weights`].
+    cert_eval_leaves_only: bool,
     /// Early Move Extensions on the first ordered wall moves (mirror of graduated LMR).
     eme: bool,
     pub nodes: u64,
@@ -399,6 +445,7 @@ impl AceSearch {
             cat_walls: false,
             dead_zone_prune: false,
             cheap_cert: false,
+            cert_eval_leaves_only: false,
             eme: false,
             nodes: 0,
             deadline: Instant::now(),
@@ -469,12 +516,11 @@ impl AceSearch {
         search
     }
 
-    /// Pure JS-port baseline + O1 movegen only. All Rust-side state-retention extras
-    /// (gen TT, history aging, dynamic ID startup, accumulator retention) are disabled
-    /// so this is a faithful 1:1 JS v13 reference, just with the faster movegen.
-    /// Use as the fair B-engine when measuring how far Titanium v15 is beyond JS v13.
+    /// Pure JS-port baseline + O1 movegen only. Uses **frozen** v13 HalfPW weights
+    /// (`net_weights_frozen.bin`) — never picks up live training/deploy updates.
     pub fn with_ti_movegen_pure(g: AceGame) -> Box<Self> {
         let mut search = Self::new(g);
+        search.net = net_frozen();
         search.bridge = Some(TiBridge::from_game(&search.g));
         search.ti_movegen = true;
         search.pure_mode = true;
@@ -513,8 +559,31 @@ impl AceSearch {
     /// they are *provably* non-harmful, not because a single match "won".
     /// `tt_bits = Some(n)` pins a fixed TT instead of the adaptive one.
     pub fn grafted(g: AceGame, tt_bits: Option<usize>) -> Box<Self> {
+        Self::grafted_with_weights(g, tt_bits, net())
+    }
+
+    /// Same as [`grafted`] but uses the frozen v13 HalfPW blob (training A/B control).
+    pub fn grafted_frozen(g: AceGame, tt_bits: Option<usize>) -> Box<Self> {
+        Self::grafted_with_weights(g, tt_bits, net_frozen())
+    }
+
+    /// Production graft minus RaceProof/cert gates. Experimental only: useful for
+    /// measuring whether search can replace the proof layer before removing it.
+    pub fn grafted_no_raceproof(g: AceGame, tt_bits: Option<usize>) -> Box<Self> {
+        let mut search = Self::grafted(g, tt_bits);
+        search.race_proof = false;
+        search
+    }
+
+    pub fn grafted_with_weights(
+        g: AceGame,
+        tt_bits: Option<usize>,
+        weights: &'static Net,
+    ) -> Box<Self> {
         let mut search = Self::with_ti_movegen(g);
+        search.net = weights;
         search.cheap_cert = true;
+        search.cert_eval_leaves_only = true;
         match tt_bits {
             Some(bits) => search.resize_tt(bits),
             None => search.enable_adaptive_tt(),
@@ -694,7 +763,7 @@ impl AceSearch {
     pub fn eval_position(&mut self) -> i32 {
         self.position_changed();
         self.refresh_dist(0);
-        self.evaluate()
+        self.evaluate(0)
     }
 
     /// Enable Lague partial-iteration (keep the best fully-searched move from a
@@ -736,7 +805,7 @@ impl AceSearch {
     pub fn eval_dump_json(&mut self) -> String {
         self.position_changed();
         self.refresh_dist(0);
-        let eval = self.evaluate();
+        let eval = self.evaluate(0);
         let d0_scalar = self.d0[self.dist0_idx][self.g.pawn[0]];
         let d1_scalar = self.d1[self.dist1_idx][self.g.pawn[1]];
         let bits = |arr: &[u8; 64]| {
@@ -1221,7 +1290,8 @@ impl AceSearch {
         res
     }
 
-    fn evaluate(&mut self) -> i32 {
+    /// Static/quiescence eval. `depth <= 0` = leaf (cert oracle eligible when gated).
+    fn evaluate(&mut self, depth: i32) -> i32 {
         let me = self.g.turn;
         let opp = 1 - me;
         let d_me_u = if me == 0 {
@@ -1238,7 +1308,22 @@ impl AceSearch {
         let w_opp_i = self.g.wl[opp];
         let d_me_i = d_me_u as i32;
         let d_opp_i = d_opp_u as i32;
-        if w_me_i == 0 && w_opp_i == 0 {
+        if w_me_i == 0 && w_opp_i == 0 && (!self.cert_eval_leaves_only || depth <= 0) {
+            if self.cheap_cert {
+                // No walls left: Quoridor is a forced pawn race, never a draw.
+                // Most races are settled by tempo/path math; only close
+                // overlapping paths pay the tiny forward minimax proof.
+                use crate::acev13::cert_bridge::{hands_empty_race, race_minimax, RaceVerdict};
+                let stm_wins = match hands_empty_race(&self.g) {
+                    RaceVerdict::Win => true,
+                    RaceVerdict::Loss => false,
+                    RaceVerdict::NeedsProof => race_minimax(&mut self.g) > 0,
+                };
+                if stm_wins {
+                    return RACE_MATE - d_me_i.max(1);
+                }
+                return -(RACE_MATE - d_opp_i.max(1));
+            }
             if self.race_proof {
                 // pathfix/RaceProof(a): exact k=0 verdict; cached tables always usable
                 if let Some(slot) = self.race_tbl(false) {
@@ -1408,14 +1493,20 @@ impl AceSearch {
             let a2 = hid[j].clamp(0.0, 1.0);
             out += nw.w2[j] * a2 * 200.0;
         }
+        // Integer centipawns (JS `out | 0` / halfpw `int(out)`).
         let mut ret = out as i32;
         // pathfix/RaceProof(c): certified-win floor (sound; lazy; memoized;
         // capped per think; plausibility filter dMe <= dOpp+1 — certificates
         // prove race-lead survival). gen13: RP_CERT always exists (certify_win.js
         // inlined), so unlike the v11 browser-parity port this floor is LIVE.
-        // (ThreatPrice block omitted — it ships false in gen13.)
+        // Grafted: leaf + both hands empty only (skip 1–2 wall cert in eval).
+        let cert_ok = if self.cert_eval_leaves_only {
+            depth <= 0 && w_me_i == 0 && w_opp_i == 0
+        } else {
+            w_me_i <= 2
+        };
         if self.race_proof
-            && w_me_i <= 2
+            && cert_ok
             && ret < 2500
             && out > -700.0
             && out < 700.0
@@ -1695,7 +1786,7 @@ impl AceSearch {
         let nd1 = self.dist1_idx;
         let nst = self.cached_stamp;
         if depth <= 0 {
-            return Ok(self.evaluate());
+            return Ok(self.evaluate(depth));
         }
 
         // TT probe (typed, always-replace)
@@ -1732,7 +1823,7 @@ impl AceSearch {
 
         // reverse futility: hopeless to fall below beta at shallow depth
         if depth <= 4 && beta > -2000 && beta < 2000 {
-            let sev = self.evaluate();
+            let sev = self.evaluate(depth);
             if sev - 90 * depth >= beta {
                 return Ok(sev);
             }
@@ -1740,7 +1831,7 @@ impl AceSearch {
 
         // null move
         if allow_null && depth >= 3 && ply > 0 {
-            let ev = self.evaluate();
+            let ev = self.evaluate(depth);
             if ev >= beta {
                 let z = &ZOBRIST;
                 self.g.turn ^= 1;
@@ -1776,7 +1867,7 @@ impl AceSearch {
         let mut moves = [0i16; 160];
         let n = self.gen_moves(ply, depth, tt_move, &mut moves);
         if n == 0 {
-            return Ok(self.evaluate());
+            return Ok(self.evaluate(depth));
         }
         let cm_move = if prev_move > 0 {
             self.cm[prev_move as usize]
@@ -1948,7 +2039,7 @@ impl AceSearch {
         }
 
         if best == i32::MIN {
-            return Ok(self.evaluate()); // all pseudo-legal moves were sealing walls
+            return Ok(self.evaluate(depth)); // all pseudo-legal moves were sealing walls
         }
         let mut ts = best; // store mate scores node-relative
         if ts > MATE - 2 * MAX_PLY as i32 {
@@ -1982,8 +2073,8 @@ impl AceSearch {
             }
         }
         // Depth-preferred replacement (gen-aware when pure_mode=false).
-        //   pure_mode: only deeper entries overwrite (faithful JS TT semantics).
-        //   normal:    stale-gen entries always evictable; same-gen: depth-preferred.
+        // Recompute idx: a child may have grown the TT (adaptive path) after our probe.
+        let idx = (self.g.hash_lo & self.tt_mask) as usize;
         let was_empty = self.tt_meta[idx] == 0;
         let stale_gen = !self.pure_mode && !was_empty && self.tt_entry_gen[idx] != self.tt_gen;
         let deeper = !was_empty && !stale_gen && depth >= (self.tt_meta[idx] >> 12);
@@ -2076,6 +2167,8 @@ impl AceSearch {
                 };
                 self.g.unmake_move();
 
+                // Prefer any forced win over any forced loss; among wins, take
+                // the fastest race. Among losses, delay as long as possible.
                 let key = if my_v > 0 {
                     1_000_000 - my_v
                 } else {
@@ -2092,13 +2185,26 @@ impl AceSearch {
                 self.rp_root_solves += 1;
                 self.refresh_dist(0);
                 let rk = best_v.abs();
+                let score = if best_v > 0 {
+                    RACE_MATE - rk
+                } else {
+                    -(RACE_MATE - rk)
+                };
+                if log {
+                    emit_ace_progress(
+                        engine_label,
+                        &[],
+                        99,
+                        nm as u64,
+                        score,
+                        self.d0[self.dist0_idx][self.g.pawn[0]],
+                        self.d1[self.dist1_idx][self.g.pawn[1]],
+                        rt0.elapsed().as_millis() as u64,
+                    );
+                }
                 return ThinkResult {
                     mv: best_m,
-                    score: if best_v > 0 {
-                        RACE_MATE - rk
-                    } else {
-                        -(RACE_MATE - rk)
-                    },
+                    score,
                     depth: 99,
                     nodes: nm as u64,
                     ms: rt0.elapsed().as_millis() as u64,
@@ -2421,6 +2527,9 @@ impl AceSearch {
                     RaceVerdict::NeedsProof => race_minimax(&mut self.g) > 0,
                 };
                 !opp_wins
+            } else if self.cert_eval_leaves_only {
+                // Walls remain: search + EME cover tempo; skip recursive certify here.
+                true
             } else {
                 // gen13 refutation: demote only if the opponent's win is certified.
                 let deadline_ms = 25u64.max(time_ms * 15 / 100);
