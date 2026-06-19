@@ -38,6 +38,7 @@ wasm = ["dep:wasm-bindgen", "dep:js-sys"]
 
 [dependencies]
 rand = "0.8"
+sha2 = "0.10"
 rayon = { version = "1.10", optional = true }
 wasm-bindgen = { version = "=0.2.100", optional = true }
 js-sys = { version = "0.3", optional = true }

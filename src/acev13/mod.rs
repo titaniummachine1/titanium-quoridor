@@ -35,6 +35,7 @@ pub mod net;
 pub mod oracle;
 pub mod perft;
 pub mod race;
+pub mod reduction_sidecar;
 pub mod search;
 pub mod session;
 pub mod session_v15;
@@ -44,7 +45,9 @@ pub use perft::{
     default_timeout, oracle_nodes, perft_ace_ti_timed, perft_ace_timed, perft_engine_timed,
     perft_titanium_timed, TimedPerftResult, ACE_PERFT4_STARTPOS,
 };
-pub use search::{board_move_to_ace, AceSearch, ThinkResult};
+pub use search::{
+    board_move_to_ace, AceSearch, ReductionProbeEvent, ReductionShadowStats, ThinkResult,
+};
 pub use session::run_ace_session_stdio;
 pub use session_v15::run_v15_session_stdio;
 
@@ -181,6 +184,48 @@ pub fn ace_genmove(
     Some((ace_to_algebraic(result.mv), result))
 }
 
+/// Offline-only deterministic LMR probe. Each invocation starts from a fresh,
+/// fixed-size TT and zeroed history/killer/countermove state, so A and B cannot
+/// contaminate one another. `target_ordinal` adds one provisional reduction to
+/// exactly that recorded LMR event; native verification remains unchanged.
+pub fn reduction_counterfactual_probe(
+    moves: &[String],
+    depth: i32,
+    target_ordinal: Option<u64>,
+    event_limit: usize,
+) -> Option<(ThinkResult, Vec<ReductionProbeEvent>)> {
+    let mut g = AceGame::new();
+    for text in moves {
+        g.make_move(algebraic_to_ace(text));
+    }
+    if g.winner() >= 0 {
+        return None;
+    }
+    let mut search = AceSearch::grafted(g, Some(18));
+    search.enable_reduction_probe(target_ordinal, event_limit);
+    let result = search.think(3_600_000, depth, true, false, "reduction-probe");
+    Some((result, search.reduction_probe_events().to_vec()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn reduction_shadow_probe(
+    moves: &[String],
+    depth: i32,
+    sidecar_path: &std::path::Path,
+) -> Result<(ThinkResult, ReductionShadowStats), String> {
+    let mut g = AceGame::new();
+    for text in moves {
+        g.make_move(algebraic_to_ace(text));
+    }
+    if g.winner() >= 0 {
+        return Err("terminal position".into());
+    }
+    let mut search = AceSearch::grafted(g, Some(18));
+    search.enable_reduction_shadow(sidecar_path)?;
+    let result = search.think(3_600_000, depth, true, false, "reduction-shadow");
+    Ok((result, search.reduction_shadow_stats()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +354,70 @@ mod tests {
             ti_legal.iter().any(|m| m == "a6h"),
             "Titanium oracle must accept a6h on h3v line"
         );
+    }
+
+    #[test]
+    fn reduction_probe_replays_from_clean_deterministic_state() {
+        let moves = "e2 e8 e3 e7 e4 e6 c3h"
+            .split_whitespace()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let (a, ae) = reduction_counterfactual_probe(&moves, 4, None, 8).unwrap();
+        let (b, be) = reduction_counterfactual_probe(&moves, 4, None, 8).unwrap();
+        assert_eq!((a.mv, a.score, a.nodes), (b.mv, b.score, b.nodes));
+        assert_eq!(ae.len(), be.len());
+        for (left, right) in ae.iter().zip(&be) {
+            assert_eq!(left.ordinal, right.ordinal);
+            assert_eq!(left.parent_hash_lo, right.parent_hash_lo);
+            assert_eq!(left.parent_hash_hi, right.parent_hash_hi);
+            assert_eq!(left.mv, right.mv);
+            assert_eq!(left.score, right.score);
+            assert_eq!(left.nodes, right.nodes);
+        }
+    }
+
+    #[test]
+    fn reduction_probe_targets_only_requested_pipeline() {
+        let moves = "e2 e8 e3 e7 e4 e6 c3h"
+            .split_whitespace()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let (_, baseline) = reduction_counterfactual_probe(&moves, 4, None, 4).unwrap();
+        let target = baseline[3].ordinal;
+        let (_, changed) = reduction_counterfactual_probe(&moves, 4, Some(target), 1).unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].ordinal, target);
+        assert!(changed[0].applied_extra_reduction);
+        assert_eq!(changed[0].parent_hash_lo, baseline[3].parent_hash_lo);
+        assert_eq!(changed[0].parent_hash_hi, baseline[3].parent_hash_hi);
+        assert_eq!(changed[0].mv, baseline[3].mv);
+    }
+
+    #[test]
+    fn neutral_shadow_is_fixed_depth_tree_identical() {
+        let moves = "e2 e8 e3 e7 e4 e6 c3h"
+            .split_whitespace()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let mut g = AceGame::new();
+        for mv in &moves {
+            g.make_move(algebraic_to_ace(mv));
+        }
+        let mut baseline = AceSearch::grafted(g, Some(18));
+        let expected = baseline.think(3_600_000, 4, true, false, "baseline");
+
+        let path = std::env::temp_dir().join(format!(
+            "titanium-neutral-sidecar-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, crate::acev13::reduction_sidecar::neutral_test_blob()).unwrap();
+        let (actual, stats) = reduction_shadow_probe(&moves, 4, &path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            (expected.mv, expected.score, expected.depth, expected.nodes),
+            (actual.mv, actual.score, actual.depth, actual.nodes)
+        );
+        assert!(stats.evaluations > 0);
+        assert_eq!(stats.hypothetical_activations, 0);
     }
 }

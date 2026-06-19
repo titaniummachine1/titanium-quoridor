@@ -31,6 +31,7 @@ use crate::acev13::certify::{certify, CertifyOpts};
 use crate::acev13::game::{AceGame, ZOBRIST};
 use crate::acev13::net::{net, net_frozen, Net, NET_BKT, NET_H, NET_MIRC, NET_MIRS};
 use crate::acev13::race::{solve_race_config, RaceScratch, RACE_MATE, RACE_STATES};
+use crate::acev13::reduction_sidecar::ReductionSidecar;
 use crate::cat::prune::{
     gap_play_zone_mask, get_shortest_path, wall_in_dead_zone, wall_should_search,
 };
@@ -176,6 +177,36 @@ pub struct ThinkResult {
     pub white_dist: u8,
     pub black_dist: u8,
     pub depth_log: Vec<AceDepthLogEntry>,
+}
+
+/// One complete late-move pipeline observation. These records are emitted only
+/// by the offline counterfactual collector; production search leaves probing off.
+#[derive(Debug, Clone)]
+pub struct ReductionProbeEvent {
+    pub ordinal: u64,
+    pub parent_hash_lo: u32,
+    pub parent_hash_hi: u32,
+    pub child_hash_lo: u32,
+    pub child_hash_hi: u32,
+    pub mv: i16,
+    pub depth: i32,
+    pub ply: usize,
+    pub alpha: i32,
+    pub beta: i32,
+    pub move_index: usize,
+    pub base_reduction: i32,
+    pub applied_extra_reduction: bool,
+    pub verification_triggered: bool,
+    pub score: i32,
+    pub nodes: u64,
+    pub hidden: [f64; NET_H],
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReductionShadowStats {
+    pub evaluations: u64,
+    pub hypothetical_activations: u64,
+    pub inference_nanos: u64,
 }
 
 pub fn score_label(score: i32) -> String {
@@ -344,6 +375,15 @@ pub struct AceSearch {
     history_tbl: [i32; 512],
     cm: [i16; 512], // countermove table
     killers: [[i16; 2]; MAX_PLY],
+    // Offline-only LMR counterfactual probe. A target ordinal receives exactly
+    // one provisional extra reduction; verification always uses native depth.
+    reduction_probe_enabled: bool,
+    reduction_probe_target: Option<u64>,
+    reduction_probe_next: u64,
+    reduction_probe_limit: usize,
+    reduction_probe_events: Vec<ReductionProbeEvent>,
+    reduction_sidecar: Option<ReductionSidecar>,
+    reduction_shadow_stats: ReductionShadowStats,
     path_lo: [u32; MAX_PLY],
     path_hi: [u32; MAX_PLY],
     d0: [[u8; 81]; MAX_PLY],
@@ -494,6 +534,13 @@ impl AceSearch {
             history_tbl: [0; 512],
             cm: [0; 512],
             killers: [[0; 2]; MAX_PLY],
+            reduction_probe_enabled: false,
+            reduction_probe_target: None,
+            reduction_probe_next: 0,
+            reduction_probe_limit: 0,
+            reduction_probe_events: Vec::new(),
+            reduction_sidecar: None,
+            reduction_shadow_stats: ReductionShadowStats::default(),
             path_lo: [0; MAX_PLY],
             path_hi: [0; MAX_PLY],
             d0: [[0; 81]; MAX_PLY],
@@ -584,6 +631,31 @@ impl AceSearch {
     /// Enable Early Move Extensions — same gates/tuning as graduated LMR, early indices.
     pub fn enable_eme(&mut self) {
         self.eme = true;
+    }
+
+    /// Enable offline observation of complete native LMR move pipelines.
+    /// `target=None` records baseline events; `Some(n)` applies +1 only to event n.
+    pub fn enable_reduction_probe(&mut self, target: Option<u64>, limit: usize) {
+        self.reduction_probe_enabled = true;
+        self.reduction_probe_target = target;
+        self.reduction_probe_next = 0;
+        self.reduction_probe_limit = limit;
+        self.reduction_probe_events.clear();
+    }
+
+    pub fn reduction_probe_events(&self) -> &[ReductionProbeEvent] {
+        &self.reduction_probe_events
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn enable_reduction_shadow(&mut self, path: &std::path::Path) -> Result<(), String> {
+        self.reduction_sidecar = Some(ReductionSidecar::load(path)?);
+        self.reduction_shadow_stats = ReductionShadowStats::default();
+        Ok(())
+    }
+
+    pub fn reduction_shadow_stats(&self) -> ReductionShadowStats {
+        self.reduction_shadow_stats
     }
 
     /// Titanium movegen on a mirrored board — same legal set, much faster than `wall_legal`.
@@ -1397,6 +1469,81 @@ impl AceSearch {
         res
     }
 
+    /// Materialize the existing HalfPW child representation without computing
+    /// route fields, legal-wall count, or the value projection. Probe/shadow only.
+    fn current_hidden_features(&mut self) -> [f64; NET_H] {
+        let nw = self.net;
+        let b0 = NET_BKT[self.g.pawn[0]] as i32;
+        let b1 = NET_BKT[NET_MIRC[self.g.pawn[1]]] as i32;
+        if b0 != self.np_b0 || b1 != self.np_b1v {
+            self.np_acc0.fill(0.0);
+            self.np_acc1.fill(0.0);
+            for s in 0..64 {
+                if self.g.hw[s] != 0 {
+                    let o0 = (b0 as usize * 128 + s) * NET_H;
+                    let o1 = (b1 as usize * 128 + NET_MIRS[s]) * NET_H;
+                    for j in 0..NET_H {
+                        self.np_acc0[j] += nw.w1c[o0 + j];
+                        self.np_acc1[j] += nw.w1c[o1 + j];
+                    }
+                }
+                if self.g.vw[s] != 0 {
+                    let o0 = (b0 as usize * 128 + 64 + s) * NET_H;
+                    let o1 = (b1 as usize * 128 + 64 + NET_MIRS[s]) * NET_H;
+                    for j in 0..NET_H {
+                        self.np_acc0[j] += nw.w1c[o0 + j];
+                        self.np_acc1[j] += nw.w1c[o1 + j];
+                    }
+                }
+                self.np_hw[s] = self.g.hw[s];
+                self.np_vw[s] = self.g.vw[s];
+            }
+            self.np_b0 = b0;
+            self.np_b1v = b1;
+        } else {
+            for s in 0..64 {
+                if self.g.hw[s] != self.np_hw[s] {
+                    let sign = if self.g.hw[s] != 0 { 1.0 } else { -1.0 };
+                    let o0 = (b0 as usize * 128 + s) * NET_H;
+                    let o1 = (b1 as usize * 128 + NET_MIRS[s]) * NET_H;
+                    for j in 0..NET_H {
+                        self.np_acc0[j] += sign * nw.w1c[o0 + j];
+                        self.np_acc1[j] += sign * nw.w1c[o1 + j];
+                    }
+                    self.np_hw[s] = self.g.hw[s];
+                }
+                if self.g.vw[s] != self.np_vw[s] {
+                    let sign = if self.g.vw[s] != 0 { 1.0 } else { -1.0 };
+                    let o0 = (b0 as usize * 128 + 64 + s) * NET_H;
+                    let o1 = (b1 as usize * 128 + 64 + NET_MIRS[s]) * NET_H;
+                    for j in 0..NET_H {
+                        self.np_acc0[j] += sign * nw.w1c[o0 + j];
+                        self.np_acc1[j] += sign * nw.w1c[o1 + j];
+                    }
+                    self.np_vw[s] = self.g.vw[s];
+                }
+            }
+        }
+
+        let mut hidden = [0.0; NET_H];
+        if self.g.turn == 0 {
+            let po = self.g.pawn[0] * NET_H;
+            let px = self.g.pawn[1] * NET_H;
+            for j in 0..NET_H {
+                hidden[j] =
+                    (nw.b1[j] + self.np_acc0[j] + nw.po[po + j] + nw.px[px + j]).clamp(0.0, 1.0);
+            }
+        } else {
+            let po = NET_MIRC[self.g.pawn[1]] * NET_H;
+            let px = NET_MIRC[self.g.pawn[0]] * NET_H;
+            for j in 0..NET_H {
+                hidden[j] =
+                    (nw.b1[j] + self.np_acc1[j] + nw.po[po + j] + nw.px[px + j]).clamp(0.0, 1.0);
+            }
+        }
+        hidden
+    }
+
     /// Static/quiescence eval. `depth <= 0` = leaf (cert oracle eligible when gated).
     fn evaluate(&mut self, depth: i32) -> i32 {
         let me = self.g.turn;
@@ -2014,6 +2161,11 @@ impl AceSearch {
                     }
                 }
             }
+            let probe_parent_hash = if self.reduction_probe_enabled {
+                Some((self.g.hash_lo, self.g.hash_hi))
+            } else {
+                None
+            };
             self.g.make_move(m);
             if let Some(bridge) = self.bridge.as_mut() {
                 bridge.push(m);
@@ -2037,11 +2189,41 @@ impl AceSearch {
             {
                 // graduated LMR
                 let red = ace_graduated_lmr_reduction(i, depth);
-                let rd = (new_depth - red).max(0);
-                match self.ab(rd, -alpha - 1, -alpha, ply + 1, true, m) {
+                if self.reduction_sidecar.is_some() {
+                    let started = Instant::now();
+                    let hidden = self.current_hidden_features();
+                    let context = [
+                        ((depth - 1).max(0) as f64 / 30.0).clamp(0.0, 1.0),
+                        (i as f64 / 128.0).clamp(0.0, 1.0),
+                        (red as f64 / 4.0).clamp(0.0, 1.0),
+                        if m < 200 { 1.0 } else { 0.0 },
+                        if m >= 200 { 1.0 } else { 0.0 },
+                    ];
+                    let sidecar = self.reduction_sidecar.as_ref().expect("checked above");
+                    let probability = sidecar.predict(&hidden, &context);
+                    self.reduction_shadow_stats.evaluations += 1;
+                    self.reduction_shadow_stats.hypothetical_activations +=
+                        u64::from(sidecar.would_activate(probability));
+                    self.reduction_shadow_stats.inference_nanos +=
+                        started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                }
+                let probe_ordinal = if self.reduction_probe_enabled {
+                    let ordinal = self.reduction_probe_next;
+                    self.reduction_probe_next += 1;
+                    Some(ordinal)
+                } else {
+                    None
+                };
+                let extra_reduction = probe_ordinal
+                    .is_some_and(|ordinal| self.reduction_probe_target == Some(ordinal));
+                let rd = (new_depth - red - i32::from(extra_reduction)).max(0);
+                let nodes_before = self.nodes;
+                let mut verification_triggered = false;
+                let pipeline_result = match self.ab(rd, -alpha - 1, -alpha, ply + 1, true, m) {
                     Ok(s) => {
                         let mut score = -s;
                         if score > alpha {
+                            verification_triggered = true;
                             match self.ab(new_depth, -beta, -alpha, ply + 1, true, m) {
                                 Ok(s2) => score = -s2,
                                 Err(e) => {
@@ -2053,7 +2235,38 @@ impl AceSearch {
                         Ok(score)
                     }
                     Err(e) => Err(e),
+                };
+                if let (Some(ordinal), Ok(score), Some((parent_hash_lo, parent_hash_hi))) =
+                    (probe_ordinal, pipeline_result.as_ref(), probe_parent_hash)
+                {
+                    let should_record = self.reduction_probe_events.len()
+                        < self.reduction_probe_limit
+                        && (self.reduction_probe_target.is_none()
+                            || self.reduction_probe_target == Some(ordinal));
+                    if should_record {
+                        let hidden = self.current_hidden_features();
+                        self.reduction_probe_events.push(ReductionProbeEvent {
+                            ordinal,
+                            parent_hash_lo,
+                            parent_hash_hi,
+                            child_hash_lo: self.g.hash_lo,
+                            child_hash_hi: self.g.hash_hi,
+                            mv: m,
+                            depth,
+                            ply,
+                            alpha,
+                            beta,
+                            move_index: i,
+                            base_reduction: red,
+                            applied_extra_reduction: extra_reduction,
+                            verification_triggered,
+                            score: *score,
+                            nodes: self.nodes.saturating_sub(nodes_before),
+                            hidden,
+                        });
+                    }
                 }
+                pipeline_result
             } else if i > 0 {
                 match self.ab(new_depth, -alpha - 1, -alpha, ply + 1, true, m) {
                     Ok(s) => {

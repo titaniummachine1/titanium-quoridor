@@ -11,6 +11,7 @@
 //!   goal_inv_p0, goal_inv_p1, pawn_fwd_p0, pawn_fwd_p1,
 //!   corridor_delta_p0, corridor_delta_p1, path_cross_p0, path_cross_p1,
 //!   choke_p0, choke_p1, contested  (each 81×32 except contested is shared)
+use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 pub const NET_H: usize = 32;
 pub const WSKIP_LEN: usize = 16;
@@ -96,6 +97,10 @@ pub fn net() -> &'static Net {
 pub fn net_frozen() -> &'static Net {
     static NET: OnceLock<Net> = OnceLock::new();
     NET.get_or_init(|| load_net_from_bytes(NET_FROZEN_BYTES))
+}
+
+pub fn live_weights_sha256() -> [u8; 32] {
+    Sha256::digest(NET_BYTES).into()
 }
 // ── Symmetry tables (match the JS NET_MIRC / NET_MIRS / NET_BKT loops) ────────
 const fn build_mirc() -> [usize; 81] {

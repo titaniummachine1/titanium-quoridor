@@ -67,6 +67,8 @@ fn main() {
         "cat" => run_cat(&args),
         "eval" => run_eval(&args),
         "eval-batch" => run_eval_batch(),
+        "reduction-probe" => run_reduction_probe(&args),
+        "reduction-shadow" => run_reduction_shadow(&args),
         "fields" => run_fields(&args),
         "lmr" => run_lmr(&args),
         "rollout" => run_rollout(&args),
@@ -111,6 +113,110 @@ fn print_usage() {
     println!(
         "  titanium fields [moves...] [--check]  — ASCII distance/corridor field grids + invariants"
     );
+}
+
+fn run_reduction_probe(args: &[String]) {
+    let mut depth = 5i32;
+    let mut target = None;
+    let mut limit = 64usize;
+    let mut moves = Vec::new();
+    let mut i = 2usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--depth" => {
+                depth = args
+                    .get(i + 1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(depth);
+                i += 2;
+            }
+            "--target" => {
+                target = args.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--limit" => {
+                limit = args
+                    .get(i + 1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(limit);
+                i += 2;
+            }
+            value if looks_like_algebraic_move(value) => {
+                moves.push(value.to_string());
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some((result, events)) =
+        titanium::acev13::reduction_counterfactual_probe(&moves, depth, target, limit)
+    else {
+        println!("{{\"schema\":\"reduction-probe-v1\",\"status\":\"terminal\"}}");
+        return;
+    };
+    for event in events {
+        let hidden = event
+            .hidden
+            .iter()
+            .map(|v| format!("{v:.9}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{{\"schema\":\"reduction-probe-event-v1\",\"ordinal\":{},\"parent_hash\":\"{:08x}{:08x}\",\"child_hash\":\"{:08x}{:08x}\",\"move\":\"{}\",\"depth\":{},\"ply\":{},\"alpha\":{},\"beta\":{},\"move_index\":{},\"base_reduction\":{},\"extra_reduction\":{},\"verification_triggered\":{},\"score\":{},\"nodes\":{},\"hidden\":[{}]}}",
+            event.ordinal, event.parent_hash_hi, event.parent_hash_lo,
+            event.child_hash_hi, event.child_hash_lo,
+            titanium::acev13::ace_to_algebraic(event.mv), event.depth, event.ply,
+            event.alpha, event.beta, event.move_index, event.base_reduction,
+            event.applied_extra_reduction, event.verification_triggered,
+            event.score, event.nodes, hidden,
+        );
+    }
+    println!(
+        "{{\"schema\":\"reduction-probe-root-v1\",\"target\":{},\"bestmove\":\"{}\",\"score\":{},\"depth\":{},\"nodes\":{},\"elapsed_ms\":{}}}",
+        target.map_or_else(|| "null".to_string(), |v| v.to_string()),
+        titanium::acev13::ace_to_algebraic(result.mv), result.score, result.depth, result.nodes,
+        result.ms,
+    );
+}
+
+fn run_reduction_shadow(args: &[String]) {
+    let mut depth = 5i32;
+    let mut sidecar = None;
+    let mut moves = Vec::new();
+    let mut i = 2usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--depth" => {
+                depth = args
+                    .get(i + 1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(depth);
+                i += 2;
+            }
+            "--sidecar" => {
+                sidecar = args.get(i + 1).map(std::path::PathBuf::from);
+                i += 2;
+            }
+            value if looks_like_algebraic_move(value) => {
+                moves.push(value.to_string());
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(sidecar) = sidecar else {
+        eprintln!("reduction-shadow requires --sidecar PATH");
+        return;
+    };
+    match titanium::acev13::reduction_shadow_probe(&moves, depth, &sidecar) {
+        Ok((result, stats)) => println!(
+            "{{\"schema\":\"reduction-shadow-v1\",\"runtime_changed\":false,\"bestmove\":\"{}\",\"score\":{},\"depth\":{},\"nodes\":{},\"elapsed_ms\":{},\"evaluations\":{},\"hypothetical_activations\":{},\"inference_nanos\":{}}}",
+            titanium::acev13::ace_to_algebraic(result.mv), result.score, result.depth,
+            result.nodes, result.ms, stats.evaluations, stats.hypothetical_activations,
+            stats.inference_nanos,
+        ),
+        Err(error) => eprintln!("reduction shadow disabled: {error}"),
+    }
 }
 
 const DEFAULT_PERFT_DEPTH: u32 = 3;
