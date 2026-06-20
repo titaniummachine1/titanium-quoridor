@@ -166,8 +166,10 @@ pub enum RaceProof {
     Unknown,
 }
 
-pub const RACE_STATE_COUNT: usize = 81 * 81 * 2;
-const RACE_VISITING_WORDS: usize = (RACE_STATE_COUNT + 63) / 64;
+pub const RACE_STATE_COUNT: usize = 81 * 81 * 2; // 13,122 — max index 13,121
+const RACE_VISITING_WORDS: usize = RACE_STATE_COUNT.div_ceil(64); // 206 × 64 = 13,184 bits
+const _: () = assert!(RACE_VISITING_WORDS == 206);
+const _: () = assert!(RACE_VISITING_WORDS * 64 >= RACE_STATE_COUNT);
 /// Resolver ply cap: 2× max observed legitimate depth on empty board (see tests).
 pub const RACE_RESOLVER_DEPTH_CAP: u32 = 128;
 
@@ -960,6 +962,29 @@ mod tests {
         let k1 = race_state_index(40, 50, 1);
         assert_ne!(k0, k1);
         assert_eq!(k0, race_state_index(40, 50, 0));
+    }
+
+    #[test]
+    fn race_state_index_fits_visiting_bitset() {
+        assert_eq!(RACE_STATE_COUNT, 13_122);
+        assert_eq!(RACE_VISITING_WORDS, 206);
+        assert_eq!(race_state_index(80, 80, 1), 13_121);
+        for p0 in 0..81 {
+            for p1 in 0..81 {
+                for turn in 0..2 {
+                    let idx = race_state_index(p0, p1, turn);
+                    assert!(
+                        idx < RACE_VISITING_WORDS * 64,
+                        "p0={p0} p1={p1} turn={turn} idx={idx}"
+                    );
+                }
+            }
+        }
+        let mut visiting = [0u64; RACE_VISITING_WORDS];
+        visiting_set(&mut visiting, 13_121);
+        assert!(visiting_test(&visiting, 13_121));
+        visiting_clear(&mut visiting, 13_121);
+        assert!(!visiting_test(&visiting, 13_121));
     }
 
     #[test]
