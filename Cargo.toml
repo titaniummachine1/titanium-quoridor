@@ -53,6 +53,7 @@ getrandom = { version = "0.2", features = ["js"] }
 [dev-dependencies]
 core_affinity = "0.8"
 criterion = "0.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [[bench]]
 name = "path_bfs"
