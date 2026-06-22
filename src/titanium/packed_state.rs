@@ -77,11 +77,15 @@ pub fn pack_state(g: &GameState) -> [u8; PACKED_STATE_LEN] {
     }
     let mut out = [0u8; PACKED_STATE_LEN];
     out[0] = POSITION_SCHEMA_VERSION;
-    out[1] = g.pawn[0] as u8;
-    out[2] = g.pawn[1] as u8;
-    out[3] = g.wl[0] as u8;
-    out[4] = g.wl[1] as u8;
-    out[5] = g.turn as u8;
+    // Write in canonical dataset format so titanium_game_from_packed is the exact inverse:
+    //   dataset player0 = engine pawn[1] (starts at top, goal = row 8)
+    //   dataset player1 = engine pawn[0] (starts at bottom, goal = row 0)
+    //   side_to_move = 0 means pawn[1]'s turn (engine turn == 1)
+    out[1] = g.pawn[1] as u8;
+    out[2] = g.pawn[0] as u8;
+    out[3] = g.wl[1] as u8;
+    out[4] = g.wl[0] as u8;
+    out[5] = (1 - g.turn) as u8;
     out[8..16].copy_from_slice(&hw_mask.to_le_bytes());
     out[16..24].copy_from_slice(&vw_mask.to_le_bytes());
     out
@@ -155,6 +159,7 @@ mod tests {
         let g = GameState::new();
         let packed = pack_state(&g);
         let g2 = titanium_game_from_packed(&packed).unwrap();
+        // pack_state writes dataset format; titanium_game_from_packed is its exact inverse.
         assert_eq!(g.pawn, g2.pawn);
         assert_eq!(g.wl, g2.wl);
         assert_eq!(g.turn, g2.turn);
@@ -191,13 +196,19 @@ mod tests {
 
     #[test]
     fn side_to_move_preserved() {
+        // After 2 moves: engine turn=0 (pawn[0]'s turn).
+        // Dataset side_to_move=0 means pawn[1]'s turn (engine turn=1), so packed[5] = 1-0 = 1.
         let g = game_from_moves(&["e2", "e8"]);
         let packed = pack_state(&g);
-        assert_eq!(packed[5], 0);
+        assert_eq!(g.turn, 0);
+        assert_eq!(packed[5], 1); // 1 - engine.turn
+        // After 3 moves: engine turn=1 (pawn[1]'s turn).
+        // Dataset side_to_move = 1-1 = 0.
         let g2 = game_from_moves(&["e2", "e8", "e3"]);
         let packed2 = pack_state(&g2);
-        assert_eq!(packed2[5], 1);
+        assert_eq!(g2.turn, 1);
+        assert_eq!(packed2[5], 0); // 1 - engine.turn
         let restored = titanium_game_from_packed(&packed2).unwrap();
-        assert_eq!(restored.turn, 1);
+        assert_eq!(restored.turn, g2.turn);
     }
 }
