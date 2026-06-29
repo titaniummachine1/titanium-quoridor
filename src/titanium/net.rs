@@ -21,8 +21,16 @@ const PO_LEN: usize = 81 * NET_H;
 const PX_LEN: usize = 81 * NET_H;
 const FIELD_PLANE_LEN: usize = 81;
 const FIELD_PLANE_SETS: usize = 5;
+/// Legacy blob size: the 5 route field planes only.
 pub const NET_WEIGHT_F64S: usize =
     WSKIP_LEN + NET_H + NET_H + W1C_LEN + PO_LEN + PX_LEN + FIELD_PLANE_LEN * FIELD_PLANE_SETS;
+/// Retraining-ready blob size: adds ONE `cat_heat` plane (the combined CAT impact
+/// heatmap as a direct net input, alongside the atomic route/near/contested planes
+/// so the net needn't reconstruct CAT from its parts). Current weights files are the
+/// legacy size; the loader zero-pads `cat_heat`, so the live net is unaffected until
+/// a retrain ships a blob of this larger size. New planes (raw distance fields,
+/// extra path-set bands) extend here the same way.
+pub const NET_WEIGHT_F64S_CAT: usize = NET_WEIGHT_F64S + FIELD_PLANE_LEN;
 static NET_BYTES: &[u8] = include_bytes!("net_weights.bin");
 static NET_FROZEN_BYTES: &[u8] = include_bytes!("net_weights_frozen.bin");
 static NET_MEDIUM_BYTES: &[u8] = include_bytes!("net_weights_medium.bin");
@@ -40,6 +48,12 @@ pub struct Net {
     pub route_near_opp: Vec<f64>,
     pub route_contested: Vec<f64>,
     pub route_active: bool,
+    /// Combined CAT impact heatmap as a direct input plane (81, side-to-move
+    /// canonical). Zero in legacy blobs (loader zero-pads) → `cat_active` false →
+    /// not even computed, so the live net is unaffected. A retrained blob carries
+    /// learned weights → `cat_active` true → contributes.
+    pub cat_heat: Vec<f64>,
+    pub cat_active: bool,
 }
 fn read_f64s(bytes: &[u8], offset: &mut usize, count: usize) -> Vec<f64> {
     let mut out = Vec::with_capacity(count);
@@ -51,9 +65,11 @@ fn read_f64s(bytes: &[u8], offset: &mut usize, count: usize) -> Vec<f64> {
     out
 }
 fn load_net_from_bytes(bytes: &[u8]) -> Net {
-    assert_eq!(
-        bytes.len(),
-        NET_WEIGHT_F64S * 8,
+    // Accept the legacy blob (5 route planes) OR the retraining-ready blob that
+    // additionally carries the `cat_heat` plane. Legacy → cat_heat zero-padded.
+    let has_cat = bytes.len() == NET_WEIGHT_F64S_CAT * 8;
+    assert!(
+        bytes.len() == NET_WEIGHT_F64S * 8 || has_cat,
         "net_weights blob size mismatch — run training/freeze_baseline_weights.py"
     );
     let mut offset = 0;
@@ -75,6 +91,12 @@ fn load_net_from_bytes(bytes: &[u8]) -> Net {
         .chain(&route_near_opp)
         .chain(&route_contested)
         .any(|&w| w != 0.0);
+    let cat_heat = if has_cat {
+        read_f64s(bytes, &mut offset, FIELD_PLANE_LEN)
+    } else {
+        vec![0.0; FIELD_PLANE_LEN]
+    };
+    let cat_active = cat_heat.iter().any(|&w| w != 0.0);
     Net {
         ws: ws_v.try_into().unwrap(),
         b1: b1_v.try_into().unwrap(),
@@ -88,6 +110,8 @@ fn load_net_from_bytes(bytes: &[u8]) -> Net {
         route_near_opp,
         route_contested,
         route_active,
+        cat_heat,
+        cat_active,
     }
 }
 /// Training / deployed weights (`net_weights.bin`, overridable via `TITANIUM_NET_WEIGHTS_PATH`).
@@ -123,7 +147,7 @@ static NET_MEDIUM: OnceLock<Net> = OnceLock::new();
 
 /// Runtime medium-tier weights (fetched by the browser worker).
 pub fn install_medium_weights(bytes: &[u8]) -> Result<(), &'static str> {
-    if bytes.len() != NET_WEIGHT_BYTE_LEN {
+    if bytes.len() != NET_WEIGHT_BYTE_LEN && bytes.len() != NET_WEIGHT_F64S_CAT * 8 {
         return Err("medium weights size mismatch");
     }
     let net = load_net_from_bytes(bytes);

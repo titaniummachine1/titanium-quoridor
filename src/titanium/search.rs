@@ -30,7 +30,8 @@ use crate::util::clock::{Duration, Instant};
 use crate::cat::prune::{
     cat_heat_refs_from_scores, cat_v16_lmr_fringe_pct_for_worker, cat_v16_lmr_reduction_plies,
     gap_play_zone_mask, get_shortest_path, move_corridor_attention_with_denial,
-    move_corridor_attention_with_path, wall_in_dead_zone, wall_should_search, CatHeatRefs,
+    move_corridor_attention_with_path, move_impact_heat, wall_in_dead_zone, wall_should_search,
+    CatHeatRefs,
 };
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move as BoardMove, Player, Undo, WallOrientation};
@@ -50,11 +51,13 @@ use crate::titanium::race::{
 };
 use crate::titanium::reduction_sidecar::ReductionSidecar;
 use crate::util::grid::{flood_bit_sq, flood_sq_from_bit, FLOOD_PLAYABLE};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, RwLock,
 };
+#[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
+use std::sync::Mutex;
 pub const MATE: i32 = 100_000;
 pub const MAX_PLY: usize = 64;
 const INF: i32 = 2 * MATE;
@@ -386,7 +389,7 @@ const TT_MASK: u32 = (TT_SIZE - 1) as u32;
 
 const LAZY_SMP_WIDTHS: [usize; 5] = [100, 80, 60, 40, 20];
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 pub const LAZY_SMP_MAX_THREADS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,7 +416,7 @@ pub fn lazy_smp_allowed_root_moves(root_move_count: usize, root_width_percent: u
     allowed.max(1).min(root_move_count)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 #[derive(Debug, Clone, Copy, Default)]
 struct SharedTtEntry {
     key_hi: u32,
@@ -426,7 +429,7 @@ struct SharedTtEntry {
     entry_gen: u8,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 struct SharedTitaniumTt {
     slots: Vec<RwLock<SharedTtEntry>>,
     mask: u32,
@@ -434,7 +437,7 @@ struct SharedTitaniumTt {
     filled: AtomicUsize,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 impl SharedTitaniumTt {
     fn from_search(search: &TitaniumSearch) -> Self {
         let slots = (0..search.tt_meta.len())
@@ -488,14 +491,14 @@ impl SharedTitaniumTt {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 struct LazySmpRuntime {
     stop: AtomicBool,
     global_nodes: AtomicU64,
     deadline: Instant,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 impl LazySmpRuntime {
     fn new(deadline: Instant) -> Self {
         Self {
@@ -688,6 +691,9 @@ pub fn think_result_progress_json(engine_label: &str, result: &ThinkResult) -> S
         &result.depth_log,
         result.depth,
         result.nodes,
+        result.main_thread_nodes,
+        &result.helper_nodes,
+        result.total_nodes,
         result.score,
         result.white_dist,
         result.black_dist,
@@ -700,6 +706,9 @@ fn ace_progress_json(
     depth_log: &[AceDepthLogEntry],
     search_depth: i32,
     nodes: u64,
+    main_thread_nodes: u64,
+    helper_nodes: &[u64],
+    total_nodes: u64,
     root_score: i32,
     white_dist: u8,
     black_dist: u8,
@@ -718,9 +727,16 @@ fn ace_progress_json(
             e.depth, e.score, score_text, e.nodes, e.elapsed_ms, e.marginal_nodes, pv
         ));
     }
+    let mut helper_json = String::new();
+    for (i, nodes) in helper_nodes.iter().enumerate() {
+        if i > 0 {
+            helper_json.push(',');
+        }
+        helper_json.push_str(&nodes.to_string());
+    }
     let root_score_text = score_label(root_score);
     format!(
-        r#"{{"engine":"{engine_label}","stoppedBy":"{engine_label}","searchDepth":{search_depth},"nodes":{nodes},"rootScore":{root_score},"rootScoreText":"{root_score_text}","whiteDist":{white_dist},"blackDist":{black_dist},"elapsedMs":{elapsed_ms},"depthLog":[{depth_json}]}}"#
+        r#"{{"engine":"{engine_label}","stoppedBy":"{engine_label}","searchDepth":{search_depth},"nodes":{nodes},"mainThreadNodes":{main_thread_nodes},"helperNodes":[{helper_json}],"totalNodes":{total_nodes},"totalNodesAcrossWorkers":{total_nodes},"rootScore":{root_score},"rootScoreText":"{root_score_text}","whiteDist":{white_dist},"blackDist":{black_dist},"elapsedMs":{elapsed_ms},"depthLog":[{depth_json}]}}"#
     )
 }
 
@@ -749,6 +765,9 @@ fn emit_ace_progress(
         engine_label,
         depth_log,
         search_depth,
+        nodes,
+        nodes,
+        &[],
         nodes,
         root_score,
         white_dist,
@@ -933,26 +952,29 @@ pub struct TitaniumSearch {
     stream_last_emit_nodes: u64,
     stream_last_emit_ms: u64,
     stream_last_best: i16,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     shared_tt: Option<Arc<SharedTitaniumTt>>,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     lazy_runtime: Option<Arc<LazySmpRuntime>>,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     lazy_root_moves: Option<Arc<Vec<i16>>>,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     lazy_root_visit_map: Option<Arc<Vec<usize>>>,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     lazy_root_allowed: usize,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     lazy_worker_id: usize,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     lazy_skip_setup: bool,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     lazy_root_visits: Vec<usize>,
     /// GitHub Pages: live `info json` payloads forwarded to the browser worker.
     #[cfg(feature = "wasm")]
     wasm_progress: Option<js_sys::Function>,
 }
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
+unsafe impl Send for TitaniumSearch {}
 
 /// Periodic progress cadence: every 64K nodes AND ≥ 100ms apart — stdout/stderr
 /// writes are expensive; spamming them steals think time from the search.
@@ -1076,21 +1098,21 @@ impl TitaniumSearch {
             stream_last_emit_nodes: 0,
             stream_last_emit_ms: 0,
             stream_last_best: 0,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             shared_tt: None,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             lazy_runtime: None,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             lazy_root_moves: None,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             lazy_root_visit_map: None,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             lazy_root_allowed: usize::MAX,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             lazy_worker_id: 0,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             lazy_skip_setup: false,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             lazy_root_visits: Vec::new(),
             #[cfg(feature = "wasm")]
             wasm_progress: None,
@@ -1464,7 +1486,7 @@ impl TitaniumSearch {
         self.set_cat_lmr_fringe_pct(cat_v16_lmr_fringe_pct_for_worker(worker_id));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     fn lazy_smp_width_percent(worker_id: usize) -> usize {
         LAZY_SMP_WIDTHS
             .get(worker_id)
@@ -1472,7 +1494,7 @@ impl TitaniumSearch {
             .unwrap_or(*LAZY_SMP_WIDTHS.last().expect("width schedule is non-empty"))
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     fn apply_think_start_state(&mut self) {
         if !self.pure_mode && !self.is_pondering {
             self.tt_gen = self.tt_gen.wrapping_add(1);
@@ -1482,7 +1504,7 @@ impl TitaniumSearch {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     fn ordered_root_moves_snapshot(&mut self, depth: i32) -> Vec<i16> {
         self.refresh_dist(0);
         if self.bridge.is_some() {
@@ -1512,7 +1534,7 @@ impl TitaniumSearch {
         moves[..n].to_vec()
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     fn gcd_usize(mut a: usize, mut b: usize) -> usize {
         while b != 0 {
             let r = a % b;
@@ -1522,7 +1544,7 @@ impl TitaniumSearch {
         a
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     fn lazy_smp_profile_root_moves(
         root_moves: &[i16],
         worker_id: usize,
@@ -1560,7 +1582,7 @@ impl TitaniumSearch {
         (profiled, original_indices)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     fn fork_lazy_worker(&self, root: &GameState) -> Box<Self> {
         let mut worker = Self::new(root.clone());
         worker.history_tbl = self.history_tbl;
@@ -1584,13 +1606,28 @@ impl TitaniumSearch {
         worker.tt_mask = self.tt_mask;
         worker.tt_bits = self.tt_bits;
         worker.tt_adaptive = false;
+        // Helpers search against the shared lazy-SMP TT only, so drop the full
+        // local TT that Self::new allocated. At TT_BITS=20 that is ~26MB per
+        // worker; 7 helpers previously allocated ~182MB of dead tables and
+        // overflowed the wasm memory cap (the first threaded search aborted in
+        // handle_alloc_error → bare `unreachable`). Local TT probes/stores are
+        // gated on `shared_tt.is_none()`, so these 1-element vecs are never
+        // indexed once install_lazy_smp_context() runs.
+        worker.tt_key_hi = vec![0; 1];
+        worker.tt_key_lo = vec![0; 1];
+        worker.tt_meta = vec![0; 1];
+        worker.tt_score = vec![0; 1];
+        worker.tt_rep = vec![0; 1];
+        worker.tt_anc_lo = vec![0; 1];
+        worker.tt_anc_hi = vec![0; 1];
+        worker.tt_entry_gen = vec![0; 1];
         if self.bridge.is_some() {
             worker.bridge = Some(TiBridge::from_game(root));
         }
         worker
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     fn install_lazy_smp_context(
         &mut self,
         worker_id: usize,
@@ -1691,6 +1728,16 @@ impl TitaniumSearch {
             }
             s
         };
+        let field16 = |arr: &[u16; 81]| {
+            let mut s = String::new();
+            for (i, &v) in arr.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&v.to_string());
+            }
+            s
+        };
         let d0f = self.d0[self.dist0_idx];
         let d1f = self.d1[self.dist1_idx];
         let mut p0_steps = [255u8; 81];
@@ -1717,10 +1764,11 @@ impl TitaniumSearch {
         let mut flank1 = [0u8; 81];
         fill_sparse_route_masks(&self.g, self.g.pawn[0], &d0f, &mut route0, &mut flank0);
         fill_sparse_route_masks(&self.g, self.g.pawn[1], &d1f, &mut route1, &mut flank1);
-        let (cat_best_p0, cat_best_p1) = {
+        let (cat_best_p0, cat_best_p1, cat_heat) = {
             let mut bridge = TiBridge::from_game(&self.g);
-            let cat = bridge.bfs.build_corridor_attention(&bridge.board);
-            crate::cat::best_pawn_cat_heats(&bridge.board, &cat, &mut bridge.bfs)
+            let cat = crate::cat::build::build_impact_heatmap(&bridge.board);
+            let (best0, best1) = crate::cat::best_pawn_cat_heats(&bridge.board, &cat, &mut bridge.bfs);
+            (best0, best1, cat.square_heat)
         };
         let legal_walls = self.geometric_legal_wall_count();
         let (cross_p0, cross_p1) = self.legal_path_crossing_counts_arr(&route0, &route1);
@@ -1735,7 +1783,7 @@ impl TitaniumSearch {
         format!(
             "{{\"turn\":{},\"pawn0\":{},\"pawn1\":{},\"wl0\":{},\"wl1\":{},\
              \"d0\":{},\"d1\":{},\"legal_wall_count\":{},\"legal_path_cross_p0\":{},\"legal_path_cross_p1\":{},\
-             \"cat_best_p0\":{},\"cat_best_p1\":{},\
+             \"cat_best_p0\":{},\"cat_best_p1\":{},\"cat_heat_field\":[{}],\
              \"corridor_width0\":{},\"corridor_width1\":{},\
              \"goal_inv_p0_field\":[{}],\"goal_inv_p1_field\":[{}],\
              \"pawn_fwd_p0_field\":[{}],\"pawn_fwd_p1_field\":[{}],\
@@ -1762,6 +1810,7 @@ impl TitaniumSearch {
             cross_p1,
             cat_best_p0,
             cat_best_p1,
+            field16(&cat_heat),
             width_me,
             width_opp,
             field(&d0f),
@@ -1855,7 +1904,7 @@ impl TitaniumSearch {
 
     #[inline(always)]
     fn check_time(&mut self) -> Result<(), TimeUp> {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         if let Some(runtime) = self.lazy_runtime.as_ref() {
             if runtime.stop.load(Ordering::Relaxed) {
                 return Err(TimeUp);
@@ -1863,7 +1912,7 @@ impl TitaniumSearch {
         }
         if (self.nodes & 1023) == 0 {
             if Instant::now() > self.deadline {
-                #[cfg(not(target_arch = "wasm32"))]
+                #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
                 if let Some(runtime) = self.lazy_runtime.as_ref() {
                     runtime.stop.store(true, Ordering::Relaxed);
                 }
@@ -2476,6 +2525,25 @@ impl TitaniumSearch {
         );
         let (route_score, route0_bits, route1_bits) = self.route_feature_score(nw);
         out += route_score;
+        // CAT impact heatmap as a direct net input plane. Zeroed in legacy weights
+        // (loader zero-pads) → `cat_active` false → NOT computed, so the live net is
+        // byte-for-byte unaffected. Retrain-ready: a blob with learned `cat_heat`
+        // weights activates it, giving the net the combined CAT signal alongside the
+        // atomic route/near/contested planes (so it needn't reconstruct CAT itself).
+        if nw.cat_active {
+            if let Some(bridge) = self.bridge.as_ref() {
+                let cat = crate::cat::build::build_impact_heatmap(&bridge.board);
+                let canonical = |sq: usize| if me == 0 { sq } else { NET_MIRC[sq] };
+                let mut cat_score = 0.0;
+                for sq in 0..81usize {
+                    let h = cat[sq];
+                    if h != 0 {
+                        cat_score += nw.cat_heat[canonical(sq)] * (f64::from(h) / 256.0);
+                    }
+                }
+                out += cat_score;
+            }
+        }
         // ws[14]: unrealized wall action capacity (path-valid slots / 128). NOT corridor width.
         let legal_wall_norm = self.geometric_legal_wall_count() as f64 / 128.0;
         // ws[15]: opponent corridor width on their goal field (matches halfpw.py).
@@ -2502,18 +2570,14 @@ impl TitaniumSearch {
             || self.legal_path_crossing_counts_bits(route_me_bits, route_opp_bits),
         );
         out += ws[16] * cross_me as f64 / 128.0 + ws[17] * cross_opp as f64 / 128.0;
-        {
-            let mut bridge = TiBridge::from_game(&self.g);
-            let cat = bridge.bfs.build_corridor_attention(&bridge.board);
-            let (cat_p0, cat_p1) =
-                crate::cat::best_pawn_cat_heats(&bridge.board, &cat, &mut bridge.bfs);
-            let (cat_me, cat_opp) = if me == 0 {
-                (cat_p0, cat_p1)
-            } else {
-                (cat_p1, cat_p0)
-            };
-            out += ws[18] * f64::from(cat_me) / 256.0 + ws[19] * f64::from(cat_opp) / 256.0;
-        }
+        // CAT eval features (ws[18]/ws[19]) are DECOUPLED: computing them per leaf
+        // (a full corridor-attention build + two legal-movegen passes in
+        // best_pawn_cat_heats) was ~⅔ of total search time. CAT is being rebuilt
+        // as a cheap BFF heatmap used for LMR move ordering only. Until that lands
+        // and the net is retrained on CAT-free data, the two CAT inputs are 0 —
+        // i.e. the live net runs as a non-CAT NNUE. Sanity check: if the engine
+        // opens with a non-pawn move, the net needs retraining.
+        // out += ws[18] * cat_me / 256.0 + ws[19] * cat_opp / 256.0;  // re-enable post-retrain
 
         let b0 = NET_BKT[self.g.pawn[0]] as i32;
         let b1 = NET_BKT[NET_MIRC[self.g.pawn[1]]] as i32;
@@ -3003,7 +3067,7 @@ impl TitaniumSearch {
         prev_move: i16,
     ) -> Result<i32, TimeUp> {
         self.nodes += 1;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         if let Some(runtime) = self.lazy_runtime.as_ref() {
             runtime.global_nodes.fetch_add(1, Ordering::Relaxed);
         }
@@ -3061,24 +3125,31 @@ impl TitaniumSearch {
         // TT probe (typed, always-replace)
         let idx = (self.g.hash_lo & self.tt_mask) as usize;
         let mut tt_move: i16 = 0;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         let shared_entry = self
             .shared_tt
             .as_ref()
             .and_then(|tt| tt.probe(self.g.hash_lo, self.g.hash_hi));
-        #[cfg(not(target_arch = "wasm32"))]
-        let meta = shared_entry.map_or(self.tt_meta[idx], |entry| entry.meta);
-        #[cfg(target_arch = "wasm32")]
+        // Lazy SMP: when a shared TT is installed it is the ONLY TT — helper
+        // workers carry no local TT (it would cost ~26MB each and blow the wasm
+        // memory cap), so a shared miss must NOT fall back to the local arrays.
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+        let meta = match shared_entry {
+            Some(entry) => entry.meta,
+            None if self.shared_tt.is_some() => 0,
+            None => self.tt_meta[idx],
+        };
+        #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
         let meta = self.tt_meta[idx];
         crate::bench_instr::bump(|b| &mut b.tt_probe);
         if meta != 0 && {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             {
                 shared_entry.is_some()
                     || (self.tt_key_hi[idx] == self.g.hash_hi
                         && self.tt_key_lo[idx] == self.g.hash_lo)
             }
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
             {
                 self.tt_key_hi[idx] == self.g.hash_hi && self.tt_key_lo[idx] == self.g.hash_lo
             }
@@ -3088,9 +3159,12 @@ impl TitaniumSearch {
             let tdepth = meta >> 12;
             let tflag = (meta >> 10) & 3;
             if tdepth >= depth && ply > 0 {
-                #[cfg(not(target_arch = "wasm32"))]
-                let mut es = shared_entry.map_or(self.tt_score[idx], |entry| entry.score);
-                #[cfg(target_arch = "wasm32")]
+                #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+                let mut es = match shared_entry {
+                    Some(entry) => entry.score,
+                    None => self.tt_score[idx],
+                };
+                #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
                 let mut es = self.tt_score[idx]; // mate scores stored node-relative
                 if es > MATE - 2 * MAX_PLY as i32 {
                     es -= ply as i32;
@@ -3098,9 +3172,12 @@ impl TitaniumSearch {
                     es += ply as i32;
                 }
                 if (tflag == 0) || (tflag == 1 && es >= beta) || (tflag == 2 && es <= alpha) {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    let tt_rep = shared_entry.map_or(self.tt_rep[idx], |entry| entry.rep);
-                    #[cfg(target_arch = "wasm32")]
+                    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+                    let tt_rep = match shared_entry {
+                        Some(entry) => entry.rep,
+                        None => self.tt_rep[idx],
+                    };
+                    #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
                     let tt_rep = self.tt_rep[idx];
                     if tt_rep == 0 {
                         crate::bench_instr::bump(|b| &mut b.tt_cutoff);
@@ -3170,7 +3247,7 @@ impl TitaniumSearch {
             0
         };
         self.order_moves(ply, &mut moves[..n], tt_move, cm_move);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         if ply == 0 {
             if let Some(root_moves) = self.lazy_root_moves.as_ref() {
                 let allowed = self
@@ -3189,36 +3266,16 @@ impl TitaniumSearch {
         let cat_lmr_active = self.cat_lmr_v16 && depth >= 2 && n > 0;
         if cat_lmr_active {
             if let Some(bridge) = self.bridge.as_mut() {
-                let cat = bridge.bfs.build_corridor_attention(&bridge.board);
-                let white_dist = bridge
-                    .bfs
-                    .shortest_distance(&bridge.board, Player::One)
-                    .unwrap_or(crate::cat::DIST_PENALTY);
-                let black_dist = bridge
-                    .bfs
-                    .shortest_distance(&bridge.board, Player::Two)
-                    .unwrap_or(crate::cat::DIST_PENALTY);
+                // Cheap BFF impact heatmap (bitboard path-set + flood) replaces both
+                // the dense corridor build AND the per-move shortest-path recompute
+                // (`move_corridor_attention_with_path` ran 2 BFS per wall move). A
+                // move's impact is now a heatmap lookup via `wall_edge_heat`.
+                let cat = crate::cat::build::build_impact_heatmap(&bridge.board);
                 let mut buf = [BoardMove::Pawn { row: 0, col: 0 }; MAX_LEGAL_MOVES];
                 for i in 0..n {
                     buf[i] = move_id_to_board(moves[i]);
-                    cat_heats[i] = move_corridor_attention_with_path(
-                        &mut bridge.board,
-                        buf[i],
-                        &cat,
-                        white_dist,
-                        black_dist,
-                        &mut bridge.bfs,
-                    );
-                }
-                for i in 0..n {
-                    cat_heats[i] = move_corridor_attention_with_denial(
-                        &bridge.board,
-                        buf[i],
-                        &cat,
-                        &buf[..n],
-                        &cat_heats[..n],
-                        n,
-                    );
+                    // Wall inherits the hottest square it touches; pawn its destination.
+                    cat_heats[i] = move_impact_heat(buf[i], &cat);
                 }
                 cat_refs = cat_heat_refs_from_scores(&buf[..n], n, &cat_heats[..n]);
             }
@@ -3259,7 +3316,7 @@ impl TitaniumSearch {
                     }
                 }
             }
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             if ply == 0 {
                 let original_idx = self
                     .lazy_root_visit_map
@@ -3514,7 +3571,7 @@ impl TitaniumSearch {
         // Depth-preferred replacement (gen-aware when pure_mode=false).
         // Recompute idx: a child may have grown the TT (adaptive path) after our probe.
         let idx = (self.g.hash_lo & self.tt_mask) as usize;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         if let Some(shared) = self.shared_tt.as_ref() {
             crate::bench_instr::bump(|b| &mut b.tt_store);
             shared.store(
@@ -3561,7 +3618,7 @@ impl TitaniumSearch {
                 }
             }
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
         {
             let was_empty = self.tt_meta[idx] == 0;
             let stale_gen = !self.pure_mode && !was_empty && self.tt_entry_gen[idx] != self.tt_gen;
@@ -3768,7 +3825,7 @@ impl TitaniumSearch {
         )
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     pub fn think_with_threads(
         &mut self,
         time_ms: u64,
@@ -3789,7 +3846,7 @@ impl TitaniumSearch {
         self.think_lazy_smp(time_ms, max_depth, full, log, engine_label, threads)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     fn lazy_smp_helper_partial<'a>(
         main_result: &ThinkResult,
         helper_results: &'a [(usize, ThinkResult, Vec<usize>)],
@@ -3809,7 +3866,7 @@ impl TitaniumSearch {
             .max_by_key(|result| (result.depth, result.nodes))
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     fn think_lazy_smp(
         &mut self,
         time_ms: u64,
@@ -3852,6 +3909,7 @@ impl TitaniumSearch {
             })
             .collect();
 
+        #[cfg(not(target_arch = "wasm32"))]
         let mut helper_results: Vec<(usize, ThinkResult, Vec<usize>)> = Vec::new();
         let main_allowed = plans[0].allowed_root_moves();
         let (main_root_moves, main_visit_map) =
@@ -3886,7 +3944,8 @@ impl TitaniumSearch {
             })
             .collect();
 
-        std::thread::scope(|scope| {
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut main_result = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(threads.saturating_sub(1));
             for (plan, mut worker) in helper_workers {
                 handles.push(scope.spawn(move || {
@@ -3904,7 +3963,7 @@ impl TitaniumSearch {
             }
 
             let mut stop_reason = "unknown";
-            let mut main_result = self.think_search(
+            let main_result = self.think_search(
                 time_ms,
                 max_depth,
                 full,
@@ -3919,38 +3978,113 @@ impl TitaniumSearch {
                     helper_results.push(result);
                 }
             }
-            helper_results.sort_by_key(|(worker_id, _, _)| *worker_id);
+            main_result
+        });
 
-            let main_completed_depth = main_result.depth;
-            let main_nodes = main_result.nodes;
-            if let Some(helper) =
-                Self::lazy_smp_helper_partial(&main_result, &helper_results, &root_moves_raw)
-            {
-                main_result.mv = helper.mv;
-                main_result.score = helper.score;
-                main_result.depth = helper.depth;
-                main_result.ms = main_result.ms.max(helper.ms);
-                main_result.white_dist = helper.white_dist;
-                main_result.black_dist = helper.black_dist;
-                main_result.depth_log = helper.depth_log.clone();
-                main_result.stop_reason = "lazy_smp_helper_partial";
+        #[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
+        let helper_results_shared =
+            Arc::new(Mutex::new(Vec::with_capacity(threads.saturating_sub(1))));
+        // Lazy SMP on wasm: dispatch helper searches with fire-and-forget
+        // `rayon::spawn` onto the wasm-bindgen-rayon pool, run the main search on
+        // this (seat) worker thread, then wait on an atomic completion latch.
+        //
+        // We deliberately AVOID `rayon::scope`/`join`: their join blocks the
+        // external (non-pool) seat-worker thread on a Condvar that does not wake
+        // under wasm-bindgen-rayon, which deadlocked every threaded search
+        // The shared `stop` flag makes helpers return promptly once main
+        // finishes, so the latch spin-wait below is brief.
+        #[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
+        let mut main_result = {
+            let pending = Arc::new(AtomicUsize::new(helper_workers.len()));
+            let engine_label_owned = engine_label.to_string();
+            for (plan, mut worker) in helper_workers {
+                let helper_results_shared = helper_results_shared.clone();
+                let pending = pending.clone();
+                let engine_label = engine_label_owned.clone();
+                rayon::spawn(move || {
+                    crate::wasm::note_helper_start();
+                    let mut stop_reason = "unknown";
+                    let result = worker.think_search(
+                        time_ms,
+                        max_depth,
+                        full,
+                        false,
+                        &engine_label,
+                        &mut stop_reason,
+                    );
+                    helper_results_shared.lock().expect("helper results").push((
+                        plan.worker_id,
+                        result,
+                        worker.lazy_root_visits,
+                    ));
+                    pending.fetch_sub(1, Ordering::Release);
+                });
             }
 
-            let helper_nodes: Vec<u64> = helper_results.iter().map(|(_, r, _)| r.nodes).collect();
-            let helper_depths: Vec<i32> = helper_results.iter().map(|(_, r, _)| r.depth).collect();
-            let mut root_visits = vec![self.lazy_root_visits.clone()];
-            root_visits.extend(helper_results.iter().map(|(_, _, visits)| visits.clone()));
-            let total_nodes = main_nodes + helper_nodes.iter().copied().sum::<u64>();
-            main_result.main_thread_nodes = main_nodes;
-            main_result.helper_nodes = helper_nodes;
-            main_result.total_nodes = total_nodes;
-            main_result.nodes = total_nodes;
-            main_result.main_completed_depth = main_completed_depth;
-            main_result.helper_completed_depths = helper_depths;
-            main_result.root_widths = plans;
-            main_result.root_visits = root_visits;
+            let mut stop_reason = "unknown";
+            let main_result = self.think_search(
+                time_ms,
+                max_depth,
+                full,
+                log,
+                engine_label,
+                &mut stop_reason,
+            );
+            runtime.stop.store(true, Ordering::Relaxed);
+            // Helpers observe `stop` in check_time() and return within ~1k nodes.
+            // The seat worker is a Web Worker (not the UI thread), so a brief spin
+            // here is safe. Bounded by a generous fallback deadline so a wedged
+            // helper can never hang the move forever.
+            let latch_deadline = Instant::now() + Duration::from_millis(time_ms.max(1) + 2000);
+            while pending.load(Ordering::Acquire) > 0 && Instant::now() < latch_deadline {
+                std::hint::spin_loop();
+            }
             main_result
-        })
+        };
+
+        // Drain the collected helper results by locking — NOT `Arc::try_unwrap`,
+        // which races: a helper decrements `pending` (its last statement) before
+        // its captured `Arc` clone drops, so once the latch sees `pending == 0`
+        // the clones may still be alive and `try_unwrap` would fail, silently
+        // discarding every helper result. Locking is correct regardless of how
+        // many `Arc` clones remain; `pending == 0` already guarantees all pushes
+        // completed.
+        #[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
+        let mut helper_results = {
+            let mut guard = helper_results_shared.lock().expect("helper results");
+            std::mem::take(&mut *guard)
+        };
+        helper_results.sort_by_key(|(worker_id, _, _)| *worker_id);
+
+        let main_completed_depth = main_result.depth;
+        let main_nodes = main_result.nodes;
+        if let Some(helper) =
+            Self::lazy_smp_helper_partial(&main_result, &helper_results, &root_moves_raw)
+        {
+            main_result.mv = helper.mv;
+            main_result.score = helper.score;
+            main_result.depth = helper.depth;
+            main_result.ms = main_result.ms.max(helper.ms);
+            main_result.white_dist = helper.white_dist;
+            main_result.black_dist = helper.black_dist;
+            main_result.depth_log = helper.depth_log.clone();
+            main_result.stop_reason = "lazy_smp_helper_partial";
+        }
+
+        let helper_nodes: Vec<u64> = helper_results.iter().map(|(_, r, _)| r.nodes).collect();
+        let helper_depths: Vec<i32> = helper_results.iter().map(|(_, r, _)| r.depth).collect();
+        let mut root_visits = vec![self.lazy_root_visits.clone()];
+        root_visits.extend(helper_results.iter().map(|(_, _, visits)| visits.clone()));
+        let total_nodes = main_nodes + helper_nodes.iter().copied().sum::<u64>();
+        main_result.main_thread_nodes = main_nodes;
+        main_result.helper_nodes = helper_nodes;
+        main_result.total_nodes = total_nodes;
+        main_result.nodes = total_nodes;
+        main_result.main_completed_depth = main_completed_depth;
+        main_result.helper_completed_depths = helper_depths;
+        main_result.root_widths = plans;
+        main_result.root_visits = root_visits;
+        main_result
     }
 
     /// Iterative deepening within `time_ms`. `full` disables the easy-move stop.
@@ -3977,34 +4111,32 @@ impl TitaniumSearch {
                 .max((time_ms as f64 * 0.15) as u64)
                 .min(cap);
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(runtime) = self.lazy_runtime.as_ref() {
-            self.deadline = runtime.deadline;
-        } else {
-            self.deadline = t0 + Duration::from_millis(time_ms.saturating_sub(gate_reserve_ms));
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.deadline = t0 + Duration::from_millis(time_ms.saturating_sub(gate_reserve_ms));
-        }
+        // Each thread derives its deadline from its OWN monotonic clock. Under
+        // wasm, `web_time::Instant` is backed by per-Worker `performance.now()`
+        // origins, so a deadline created on the main thread is meaningless to a
+        // rayon helper thread — it would never time out and the scope join would
+        // hang. Cross-thread early-exit is handled by `LazySmpRuntime::stop`
+        // (checked in `check_time`), NOT by a shared Instant. (Native clocks are
+        // cross-thread comparable, so per-thread t0 is equivalent there ±µs.)
+        self.deadline = t0 + Duration::from_millis(time_ms.saturating_sub(gate_reserve_ms));
         self.nodes = 0;
         self.root_best = super::TITANIUM_NO_MOVE;
         self.root_score = 0;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         let skip_setup = self.lazy_skip_setup;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         {
             self.lazy_skip_setup = false;
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
         let skip_setup = false;
         if !skip_setup {
             // Advance TT generation and decay history once at think start.
             // Lazy SMP does this before forking workers so every worker stores
             // into the same generation and starts from the same ordered root.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             self.apply_think_start_state();
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
             if !self.pure_mode && !self.is_pondering {
                 self.tt_gen = self.tt_gen.wrapping_add(1);
                 for h in self.history_tbl.iter_mut() {
@@ -4052,23 +4184,28 @@ impl TitaniumSearch {
         // Disabled in pure_mode (faithful JS baseline).
         let start_depth = if !self.pure_mode {
             let ridx = (self.g.hash_lo & self.tt_mask) as usize;
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             let root_entry = self
                 .shared_tt
                 .as_ref()
                 .and_then(|tt| tt.probe(self.g.hash_lo, self.g.hash_hi));
-            #[cfg(not(target_arch = "wasm32"))]
-            let rmeta = root_entry.map_or(self.tt_meta[ridx], |entry| entry.meta);
-            #[cfg(target_arch = "wasm32")]
+            // Lazy SMP shared TT is authoritative; no local fallback (see ab()).
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+            let rmeta = match root_entry {
+                Some(entry) => entry.meta,
+                None if self.shared_tt.is_some() => 0,
+                None => self.tt_meta[ridx],
+            };
+            #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
             let rmeta = self.tt_meta[ridx];
             if rmeta != 0 && {
-                #[cfg(not(target_arch = "wasm32"))]
+                #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
                 {
                     root_entry.is_some()
                         || (self.tt_key_hi[ridx] == self.g.hash_hi
                             && self.tt_key_lo[ridx] == self.g.hash_lo)
                 }
-                #[cfg(target_arch = "wasm32")]
+                #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
                 {
                     self.tt_key_hi[ridx] == self.g.hash_hi && self.tt_key_lo[ridx] == self.g.hash_lo
                 }
@@ -4077,11 +4214,14 @@ impl TitaniumSearch {
                 let tt_flag = (rmeta >> 10) & 3;
                 if tt_depth >= 4 && tt_flag == 0 {
                     // Exact score: safe to use as aspiration seed and skip iterations.
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
                     {
-                        last_score = root_entry.map_or(self.tt_score[ridx], |entry| entry.score);
+                        last_score = match root_entry {
+                            Some(entry) => entry.score,
+                            None => self.tt_score[ridx],
+                        };
                     }
-                    #[cfg(target_arch = "wasm32")]
+                    #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
                     {
                         last_score = self.tt_score[ridx];
                     }
@@ -4097,7 +4237,7 @@ impl TitaniumSearch {
         };
 
         for d in start_depth..=max_depth {
-            if d > 1 && Self::ace_over_time_budget(t0, time_ms, last_score) {
+            if !full && d > 1 && Self::ace_over_time_budget(t0, time_ms, last_score) {
                 *stop_reason = "ace_over_time_budget_before_depth";
                 break;
             }
@@ -4203,7 +4343,7 @@ impl TitaniumSearch {
                     break; // state already restored by unwinding unmakes
                 }
             }
-            if Self::ace_over_time_budget(t0, time_ms, last_score) {
+            if !full && Self::ace_over_time_budget(t0, time_ms, last_score) {
                 *stop_reason = "ace_over_time_budget_after_depth";
                 break;
             }

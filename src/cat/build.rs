@@ -5,10 +5,13 @@ use crate::cat::constants::{
     BOTTLENECK_BONUS_CM, BOTTLENECK_CORRIDOR_DELTA, CAT_CORRIDOR_CM, MAX_RELEVANT_CORRIDOR_DELTA,
 };
 use crate::core::board::{Board, Player};
-use crate::path::distance::{fill_dist_from_sq, fill_dist_to_goal_row};
+use crate::path::distance::{
+    fill_dist_from_sq, fill_dist_layers_from_sq, fill_dist_layers_to_goal_row, fill_dist_to_goal_row,
+    DistLayers,
+};
 use crate::path::masks::DirMasks;
 use crate::path::BfsScratch;
-use crate::util::grid::{flood_bit_sq, square_index};
+use crate::util::grid::{flood_bit_sq, flood_sq_from_bit, square_index, FLOOD_PLAYABLE};
 
 fn corridor_heat(delta: u16) -> u16 {
     if delta > MAX_RELEVANT_CORRIDOR_DELTA {
@@ -177,23 +180,10 @@ pub fn build_player_corridor_attention(
 ///
 /// Search sums both players into one `CorridorAttention` (contested corridors run hotter
 /// in LMR). The board tint uses `max` so two overlapping paths do not paint the whole grid.
-pub fn build_corridor_display_squares(scratch: &mut BfsScratch, board: &Board) -> [u16; 81] {
-    let white = build_player_corridor_attention(scratch, board, Player::One);
-    let black = build_player_corridor_attention(scratch, board, Player::Two);
-    let mut out = [0u16; 81];
-    for i in 0..81 {
-        let white_heat = white.square_heat[i];
-        let black_heat = black.square_heat[i];
-        let shared = white_heat.min(black_heat);
-        let corridor = white_heat
-            .max(black_heat)
-            .saturating_add(shared.saturating_mul(3) / 4);
-        let bottleneck = white.bottleneck_heat[i]
-            .max(black.bottleneck_heat[i])
-            .saturating_add(white.bottleneck_heat[i].min(black.bottleneck_heat[i]) / 2);
-        out[i] = corridor.saturating_add(bottleneck);
-    }
-    out
+pub fn build_corridor_display_squares(_scratch: &mut BfsScratch, board: &Board) -> [u16; 81] {
+    // CAT vision shows the SAME heatmap the v16 LMR ordering uses, so what you see
+    // on the board is exactly what drives move reduction.
+    build_impact_heatmap(board).square_heat
 }
 
 fn merge_corridor_max(a: &mut CorridorAttention, b: &CorridorAttention) {
@@ -259,11 +249,118 @@ pub fn corridor_bottleneck_count(scratch: &mut BfsScratch, board: &Board, player
     bottlenecks.min(8)
 }
 
+// ---------------------------------------------------------------------------
+// BFF impact heatmap (fast path for LMR move ordering)
+//
+// CAT is a cheap APPROXIMATION of move impact, not an exact field. This builds a
+// per-square heatmap straight from bitboard distance LAYERS (no dense [u8;81]
+// scatter, no per-cell 0..81 corridor/flex loops, no per-move shortest-path
+// recompute): hottest on the near-shortest-path SET of both players (shared
+// corridors run hottest), decaying outward by a binary flood. A wall/move's
+// impact is then a heatmap lookup (see `CorridorAttention::wall_edge_heat`),
+// which is what feeds the v16 CAT-LMR fringe cutoff.
+// ---------------------------------------------------------------------------
+
+/// Add `w` to `heat[sq]` for every set cell of `mask` (saturating). Bounded by the
+/// set-bit count of one path-set / BFS layer (a few dozen), NOT all 81 — the
+/// bitboard layers keep this an O(reached) scatter, unlike the old dense rebuild.
+#[inline]
+fn scatter_add(heat: &mut [u16; 81], mask: u128, w: u16) {
+    if w == 0 {
+        return;
+    }
+    let mut bits = mask & FLOOD_PLAYABLE;
+    while bits != 0 {
+        let fb = bits.trailing_zeros();
+        bits &= bits - 1;
+        if let Some(sq) = flood_sq_from_bit(fb) {
+            let slot = &mut heat[sq as usize];
+            *slot = slot.saturating_add(w);
+        }
+    }
+}
+
+/// One player's impact contribution: hottest on the near-shortest path SET (every
+/// route within `MAX_RELEVANT_CORRIDOR_DELTA` of optimal, weighted by optimality),
+/// decaying outward by a binary flood. Pure bitboard layers — no dense field.
+fn add_player_impact_heat(board: &Board, player: Player, masks: DirMasks, heat: &mut [u16; 81]) {
+    let (sr, sc) = board.pawn(player);
+    let start = square_index(sr, sc);
+    let mut from = DistLayers::default();
+    let mut to = DistLayers::default();
+    fill_dist_layers_from_sq(start, masks, &mut from);
+    fill_dist_layers_to_goal_row(player, masks, &mut to);
+
+    let start_bit = flood_bit_sq(start);
+    let Some(shortest) = (0..to.depth).find(|&d| to.masks[d] & start_bit != 0) else {
+        return; // goal unreachable (illegal position) — contribute nothing
+    };
+    let tol = MAX_RELEVANT_CORRIDOR_DELTA as usize;
+
+    // Near-shortest path SET: cells where dist_from + dist_to <= shortest + tol
+    // (every route within `tol` suboptimal moves). Each cell sits in exactly one
+    // `from` layer i and one `to` layer j, so its (dist_from + dist_to) == i + j.
+    // The δ≤tol band IS the tolerance halo — hottest on optimal routes, decaying
+    // to ~0 by the 4th-suboptimal fringe (corridor_heat: 200,77,40,25,18). Off
+    // the band → 0. Both players accumulate, so shared corridors run hottest.
+    for i in 0..from.depth {
+        let fi = from.masks[i];
+        if fi == 0 {
+            continue;
+        }
+        let jmax = (shortest + tol).saturating_sub(i).min(to.depth.saturating_sub(1));
+        for j in 0..=jmax {
+            let cells = fi & to.masks[j] & FLOOD_PLAYABLE;
+            if cells == 0 {
+                continue;
+            }
+            let delta = (i + j).saturating_sub(shortest).min(tol) as u16;
+            scatter_add(heat, cells, corridor_heat(delta));
+        }
+    }
+}
+
+/// Cheap BFF impact heatmap — drop-in replacement for `build_corridor_attention`
+/// in the v16 CAT-LMR ordering path. Both players accumulate so shared corridors
+/// run hottest. Only `square_heat` is populated (route_flex / bottleneck stay 0;
+/// `wall_edge_heat` degrades to the pure corridor signal, which is the intent).
+pub fn build_impact_heatmap(board: &Board) -> CorridorAttention {
+    let masks = DirMasks::from_board(board);
+    let mut out = CorridorAttention::default();
+    add_player_impact_heat(board, Player::One, masks, &mut out.square_heat);
+    add_player_impact_heat(board, Player::Two, masks, &mut out.square_heat);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::board::WallOrientation;
     use crate::util::grid::set_wall;
+
+    #[test]
+    fn impact_heatmap_hot_on_shared_corridor_cold_in_corner() {
+        let board = Board::new();
+        let cat = build_impact_heatmap(&board);
+        let center = cat.square_heat(4, 4); // e5 — both players' shortest corridor
+        let corner = cat.square_heat(0, 0); // a1 — far off any near-shortest path
+        assert!(center > 0, "center should be hot: {center}");
+        assert!(
+            center > corner.saturating_mul(2),
+            "shared corridor {center} >> corner {corner}"
+        );
+    }
+
+    #[test]
+    fn impact_heatmap_wall_on_corridor_beats_wall_in_corner() {
+        // A wall edge sitting on the central shared corridor must read hotter than
+        // one tucked in the corner — the whole point of CAT for LMR.
+        let board = Board::new();
+        let cat = build_impact_heatmap(&board);
+        let central = cat.wall_edge_heat(3, 3, WallOrientation::Horizontal);
+        let corner = cat.wall_edge_heat(0, 0, WallOrientation::Horizontal);
+        assert!(central > corner, "central wall {central} > corner wall {corner}");
+    }
 
     #[test]
     fn center_hotter_than_corner_at_startpos() {
@@ -272,8 +369,10 @@ mod tests {
         let cat = build_corridor_attention(&mut scratch, &board);
         let center = cat.square_heat(4, 4);
         let corner = cat.square_heat(0, 0);
-        assert!(center > corner);
-        assert_eq!(corner, 0);
+        // With the δ≤4 path-set tolerance the corner sits on a *4th-suboptimal*
+        // route, so it carries minimal heat (corridor_heat(4)=18) rather than
+        // exactly 0 — the invariant is that the central corridor runs far hotter.
+        assert!(center > corner.saturating_mul(4), "center {center} ≫ corner {corner}");
     }
 
     #[test]
@@ -312,7 +411,12 @@ mod tests {
         let board = Board::new();
         let mut scratch = BfsScratch::new();
         let cat = build_corridor_attention(&mut scratch, &board);
-        assert_eq!(cat.square_heat(0, 0), 0, "a9 should have no corridor heat");
+        // δ≤4 tolerance: corners sit on a 4th-suboptimal route → minimal (not zero) heat.
+        assert!(
+            cat.square_heat(0, 0) <= corridor_heat(MAX_RELEVANT_CORRIDOR_DELTA),
+            "corner stays minimal, got {}",
+            cat.square_heat(0, 0)
+        );
         assert_eq!(cat.square_heat(0, 0), cat.square_heat(8, 8));
         assert!(
             cat.square_heat(4, 4) < cat.square_heat(0, 4),

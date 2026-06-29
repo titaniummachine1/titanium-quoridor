@@ -110,7 +110,13 @@ fn load_position(name: &str) -> GameState {
 
 fn fresh_search(position: &str) -> Box<TitaniumSearch> {
     let g = load_position(position);
-    TitaniumSearch::grafted(g, Some(TT_BITS))
+    // TITANIUM_BENCH_V16=1 profiles the v16 CAT-LMR engine (default ceiling 1000)
+    // so we can A/B the CAT cost vs the v15 baseline on identical positions.
+    if std::env::var("TITANIUM_BENCH_V16").as_deref() == Ok("1") {
+        TitaniumSearch::grafted_v16_with_ceiling(g, Some(TT_BITS), 1000)
+    } else {
+        TitaniumSearch::grafted(g, Some(TT_BITS))
+    }
 }
 
 fn run_think(

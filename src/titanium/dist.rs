@@ -61,6 +61,69 @@ fn flood_scatter_inner(seed: u128, masks: DirMasks, out: &mut [u8; 81]) {
     }
 }
 
+/// Layer-native BFS flood: records each `expand_frontier` wavefront as a `u128`
+/// layer mask into `layers` (no per-cell "bit stealing" scatter). Returns the
+/// number of layers written. `layers[d]` holds exactly the cells at BFS distance
+/// `d` from `seed`. This is the cheap form the search uses for distance features
+/// (width via `popcount`, a square's distance via `dist_in_layers`) — the dense
+/// `[u8;81]` field is only materialized when a consumer truly needs random reads.
+pub fn flood_into_layers(seed: u128, masks: DirMasks, layers: &mut [u128; 81]) -> usize {
+    let mut reached = seed & FLOOD_PLAYABLE;
+    let mut frontier = reached;
+    layers[0] = frontier;
+    let mut depth = 1usize;
+    while frontier != 0 && depth < 81 {
+        let new = expand_frontier(frontier, masks) & !reached & FLOOD_PLAYABLE;
+        if new == 0 {
+            break;
+        }
+        layers[depth] = new;
+        depth += 1;
+        reached |= new;
+        frontier = new;
+    }
+    // Zero any stale tail so popcount/lookups over `..depth` stay clean on reuse.
+    for slot in layers.iter_mut().take(81).skip(depth) {
+        *slot = 0;
+    }
+    depth
+}
+
+/// Inverse layer flood: distance-to-goal-row layer masks for `player` (ACE index).
+/// `layers[d]` = cells `d` steps from the goal row. No dense scatter.
+pub fn fill_ace_dist_layers_to_goal(player: usize, masks: DirMasks, layers: &mut [u128; 81]) -> usize {
+    let grow = ace_goal_row(player);
+    let mut seed = 0u128;
+    for c in 0..9u8 {
+        seed |= flood_bit_sq(square_index(grow, c));
+    }
+    flood_into_layers(seed, masks, layers)
+}
+
+/// BFS distance of square `sq` from the layer masks (255 = unreachable). O(depth)
+/// bit tests — replaces a dense `dist[sq]` random read.
+#[inline]
+pub fn dist_in_layers(layers: &[u128; 81], depth: usize, sq: u8) -> u8 {
+    let bit = flood_bit_sq(sq);
+    for (d, layer) in layers.iter().take(depth).enumerate() {
+        if layer & bit != 0 {
+            return d as u8;
+        }
+    }
+    255
+}
+
+/// Count of squares at BFS distance `d` (the "width" eval feature) — `popcount`
+/// of one layer mask instead of scanning all 81 cells.
+#[inline]
+pub fn width_in_layers(layers: &[u128; 81], depth: usize, d: u8) -> u32 {
+    let di = d as usize;
+    if di >= depth {
+        return 0;
+    }
+    (layers[di] & FLOOD_PLAYABLE).count_ones()
+}
+
 /// Inverse flood: distance from each cell to `player`'s goal row (ACE index).
 pub fn fill_ace_dist_to_goal(g: &GameState, player: usize, ace_dist: &mut [u8; 81]) {
     let masks = DirMasks::from_ace_game(g);

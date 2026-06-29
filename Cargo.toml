@@ -40,7 +40,8 @@ required-features = ["parallel"]
 default = ["parallel"]
 # Per-op call counts and phase timers for search_bench (compiled out when disabled).
 bench-instrument = []
-# Multi-threaded perft / Lazy SMP (rayon). Disable for wasm.
+# Multi-threaded perft / Lazy SMP (rayon). Normal wasm builds leave this off;
+# browser Lazy SMP uses the explicit wasm-threads profile below.
 parallel = ["dep:rayon"]
 # Bake the precomputed pawn O1 tables (~1.85MB) into the binary instead of
 # building them at cold start. Use for prewarmed / latency-sensitive targets
@@ -50,6 +51,8 @@ embed-tables = []
 #   wasm-pack build --no-default-features --features wasm
 # or cargo build --lib --target wasm32-unknown-unknown --no-default-features --features wasm)
 wasm = ["dep:wasm-bindgen", "dep:js-sys"]
+# Browser Lazy SMP: WebAssembly atomics + wasm-bindgen-rayon worker pool.
+wasm-threads = ["wasm", "parallel", "dep:wasm-bindgen-rayon"]
 
 [dependencies]
 rand = "0.8"
@@ -57,6 +60,7 @@ sha2 = "0.10"
 rayon = { version = "1.10", optional = true }
 wasm-bindgen = { version = "=0.2.100", optional = true }
 js-sys = { version = "0.3", optional = true }
+wasm-bindgen-rayon = { version = "1.2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 core_affinity = "0.8"

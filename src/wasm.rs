@@ -7,36 +7,95 @@ use wasm_bindgen::prelude::*;
 
 use crate::cat::cat_snapshot_json;
 use crate::core::board::Board;
-use crate::titanium::net::{
-    frozen_weights_sha256, install_medium_weights, live_weights_sha256, NET_WEIGHT_BYTE_LEN,
-};
+use crate::titanium::net::live_weights_sha256;
 use crate::titanium::search::think_result_progress_json;
 use crate::titanium::{
-    algebraic_to_move_id, move_id_to_algebraic, GameState, ThinkResult, TitaniumParams,
-    TitaniumSearch, TITANIUM_NO_MOVE,
+    algebraic_to_move_id, move_id_to_algebraic, GameState, TitaniumSearch, TITANIUM_NO_MOVE,
 };
 
-const ENGINE_VERSION: &str = "titanium-v15";
-const WASM_FEATURES: &str = "wasm,embed-tables";
+const ENGINE_VERSION: &str = "titanium-v16";
 
-fn titanium_v15_params_from_mode(
-    engine_mode: &str,
-    movetime_ms: u32,
-    max_depth: i32,
-) -> TitaniumParams {
-    let ti_movegen = engine_mode.contains("-ti") || engine_mode == "ace-v13";
-    let eme = engine_mode.contains("pmc");
-    TitaniumParams {
-        time_ms: (movetime_ms as u64).max(1),
-        max_depth: if max_depth > 0 { max_depth } else { 30 },
-        threads: 1,
-        full: false,
-        cat: false,
-        ti_movegen,
-        log: false,
-        eme,
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console)]
+    fn error(msg: &str);
+}
+
+/// Lock-free capture of the last panic message into shared linear memory, so a
+/// rayon helper-thread panic (whose own worker `console` is not surfaced to the
+/// page) can be read back from the main thread via `last_panic()` after the
+/// trap. Lock-free on purpose: a panic hook must not risk blocking on a poisoned
+/// lock.
+#[cfg(target_arch = "wasm32")]
+mod panic_capture {
+    use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    pub static LEN: AtomicUsize = AtomicUsize::new(0);
+    pub static BUF: [AtomicU8; 2048] = [const { AtomicU8::new(0) }; 2048];
+    pub fn record(msg: &str) {
+        let b = msg.as_bytes();
+        let n = b.len().min(BUF.len());
+        for (i, &byte) in b.iter().take(n).enumerate() {
+            BUF[i].store(byte, Ordering::Relaxed);
+        }
+        LEN.store(n, Ordering::Relaxed);
+    }
+    pub fn read() -> String {
+        let n = LEN.load(Ordering::Relaxed);
+        let bytes: Vec<u8> = (0..n).map(|i| BUF[i].load(Ordering::Relaxed)).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 }
+
+/// Read the last captured panic message (see `panic_capture`). Returns "" if no
+/// panic has occurred. Safe to call after a trapped threaded search.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn last_panic() -> String {
+    panic_capture::read()
+}
+
+/// Count how many lazy-SMP helper closures have started in this WASM module.
+/// The site uses this as telemetry to prove browser searches are using the
+/// internal Rayon pool rather than JavaScript-distributed fake workers.
+#[cfg(target_arch = "wasm32")]
+pub static HELPER_STARTS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(target_arch = "wasm32")]
+pub fn note_helper_start() {
+    HELPER_STARTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub fn note_helper_start() {}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn helper_starts() -> usize {
+    HELPER_STARTS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Route Rust panics (including in rayon helper threads) to `console` AND a
+/// shared buffer before `panic=abort` turns them into a bare wasm `unreachable`.
+/// Without this a panic in the threaded search surfaces only as "unreachable",
+/// hiding the real message and location.
+#[cfg(target_arch = "wasm32")]
+fn install_panic_hook() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let msg = format!("[titanium-panic] {info}");
+            panic_capture::record(&msg);
+            error(&msg);
+        }));
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_panic_hook() {}
+#[cfg(feature = "wasm-threads")]
+const WASM_FEATURES: &str = "wasm-threads,embed-tables";
+#[cfg(not(feature = "wasm-threads"))]
+const WASM_FEATURES: &str = "wasm,embed-tables";
 
 fn ace_params_from_mode(
     engine_mode: &str,
@@ -56,69 +115,6 @@ fn ace_params_from_mode(
     }
 }
 
-fn is_titanium_v15_mode(engine_mode: &str) -> bool {
-    engine_mode.starts_with("ace-v13") || engine_mode == "ace-v13"
-}
-
-fn build_titanium_search(
-    g: GameState,
-    params: TitaniumParams,
-    engine_label: &str,
-) -> TitaniumSearch {
-    let mut search = match engine_label {
-        "titanium-v15" | "titanium-v14" | "ace-v13-grafted" => *TitaniumSearch::grafted(g, None),
-        "titanium-v16" => *TitaniumSearch::grafted_v16(g, None),
-        "titanium-v15-frozen" => *TitaniumSearch::grafted_frozen(g, None),
-        "titanium-v15-medium" => *TitaniumSearch::grafted_medium(g, None),
-        "titanium-v15-no-raceproof" | "ace-v13-grafted-no-raceproof" => {
-            *TitaniumSearch::grafted_no_raceproof(g, None)
-        }
-        "ace-v13" | "ace-v13-ti" => *TitaniumSearch::with_ti_movegen_frozen(g),
-        "ace-v13-ti-pure" => *TitaniumSearch::with_ti_movegen_pure(g),
-        _ if params.ti_movegen && params.cat => *TitaniumSearch::with_ti_movegen_and_cat(g),
-        _ if params.ti_movegen => *TitaniumSearch::with_ti_movegen(g),
-        _ if params.cat => *TitaniumSearch::with_cat(g),
-        _ => *TitaniumSearch::new(g),
-    };
-    if params.eme {
-        search.enable_eme();
-    }
-    search
-}
-
-fn titanium_genmove_with_progress(
-    moves: &str,
-    params: TitaniumParams,
-    engine_label: &str,
-    on_progress: Option<js_sys::Function>,
-) -> Option<(String, ThinkResult)> {
-    let g = replay_moves(moves).ok()?;
-    if g.winner() >= 0 {
-        return None;
-    }
-    let mut search = build_titanium_search(g, params, engine_label);
-    search.set_wasm_progress(on_progress.clone());
-    let stream = on_progress.is_some();
-    let result = search.think(
-        params.time_ms,
-        params.max_depth,
-        params.full,
-        stream,
-        engine_label,
-    );
-    if result.mv == TITANIUM_NO_MOVE {
-        return None;
-    }
-    if result.mv == 0 && search.g.winner() >= 0 {
-        return None;
-    }
-    if let Some(f) = on_progress.as_ref() {
-        let json = think_result_progress_json(engine_label, &result);
-        let _ = f.call1(&JsValue::NULL, &JsValue::from_str(&json));
-    }
-    Some((move_id_to_algebraic(result.mv), result))
-}
-
 fn replay_moves(moves: &str) -> Result<GameState, JsError> {
     let mut g = GameState::new();
     for text in moves.split_whitespace().filter(|s| !s.is_empty()) {
@@ -134,6 +130,24 @@ fn replay_moves(moves: &str) -> Result<GameState, JsError> {
 
 fn hex32(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn replay_board_from_moves(moves: &str) -> Board {
@@ -157,27 +171,9 @@ pub fn wasm_build_identity_json() -> String {
     let git = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
     let built_at = option_env!("WASM_BUILD_TIMESTAMP").unwrap_or("unknown");
     format!(
-        r#"{{"engine_version":"{ENGINE_VERSION}","git_commit":"{git}","build_timestamp":"{built_at}","features":"{WASM_FEATURES}","weights_live_sha256":"{live}","weights_frozen_sha256":"{frozen}"}}"#,
+        r#"{{"engine_version":"{ENGINE_VERSION}","git_commit":"{git}","build_timestamp":"{built_at}","features":"{WASM_FEATURES}","weights_live_sha256":"{live}"}}"#,
         live = hex32(&live_weights_sha256()),
-        frozen = hex32(&frozen_weights_sha256()),
     )
-}
-
-/// Byte length of an NNUE weights blob (`net_weights*.bin`).
-#[wasm_bindgen]
-pub fn net_weight_byte_len() -> usize {
-    NET_WEIGHT_BYTE_LEN
-}
-
-/// Install runtime medium-tier weights (`tier` must be `1`).
-#[wasm_bindgen]
-pub fn install_net_weights(tier: u8, bytes: &[u8]) -> Result<(), JsError> {
-    if tier != 1 {
-        return Err(JsError::new(
-            "install_net_weights: only tier 1 (medium) is supported",
-        ));
-    }
-    install_medium_weights(bytes).map_err(|e| JsError::new(e))
 }
 
 /// ACE Rust port in WASM — one-shot genmove from a move list (GitHub Pages; no native binary).
@@ -199,18 +195,12 @@ impl WasmAceEngine {
         engine_mode: &str,
         on_progress: Option<js_sys::Function>,
     ) -> String {
+        let _ = on_progress;
         let list: Vec<String> = moves
             .split_whitespace()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect();
-        if is_titanium_v15_mode(engine_mode) {
-            let params = titanium_v15_params_from_mode(engine_mode, movetime_ms, max_depth);
-            return match titanium_genmove_with_progress(moves, params, engine_mode, on_progress) {
-                Some((alg, _)) => alg,
-                None => "(none)".to_string(),
-            };
-        }
         let params = ace_params_from_mode(engine_mode, movetime_ms, max_depth);
         match crate::ace::ace_genmove(&list, params, engine_mode) {
             Some((alg, _)) => alg,
@@ -219,7 +209,7 @@ impl WasmAceEngine {
     }
 }
 
-/// Warm titanium-v15 session — TT / history persist between plies (GitHub Pages Titanium).
+/// Warm Titanium v16 session. TT and history persist between plies.
 #[wasm_bindgen]
 pub struct WasmEngine {
     search: TitaniumSearch,
@@ -231,36 +221,18 @@ pub struct WasmEngine {
 
 #[wasm_bindgen]
 impl WasmEngine {
-    /// `tier`: 0 = frozen (Easy), 1 = medium, 2 = hard (v15 live),
-    /// 3/4/5 = v16 CAT LMR with ceiling 500 / 800 / 1000 cm.
+    /// `tier`: 3 = CAT 500, 4 = CAT 800, 5 = CAT 1000. Other values use CAT 800.
     #[wasm_bindgen(constructor)]
     pub fn new(tier: u8) -> WasmEngine {
+        install_panic_hook();
         let g = GameState::new();
-        let (search, engine_label) = match tier {
-            0 => (
-                *TitaniumSearch::grafted_frozen(g, None),
-                "titanium-v15-frozen".to_string(),
-            ),
-            1 => (
-                *TitaniumSearch::grafted_medium(g, None),
-                "titanium-v15-medium".to_string(),
-            ),
-            3 | 4 | 5 => {
-                let ceiling = match tier {
-                    3 => 500,
-                    5 => 1000,
-                    _ => 800,
-                };
-                (
-                    *TitaniumSearch::grafted_v16_with_ceiling(g, None, ceiling),
-                    "titanium-v16".to_string(),
-                )
-            }
-            _ => (
-                *TitaniumSearch::grafted(g, None),
-                "titanium-v15".to_string(),
-            ),
+        let ceiling = match tier {
+            3 => 500,
+            5 => 1000,
+            _ => 800,
         };
+        let search = *TitaniumSearch::grafted_v16_with_ceiling(g, None, ceiling);
+        let engine_label = "titanium-v16".to_string();
         WasmEngine {
             search,
             engine_label,
@@ -295,36 +267,49 @@ impl WasmEngine {
         _max_nodes: u32,
         on_progress: Option<js_sys::Function>,
     ) -> String {
-        self.go_with_profile(movetime_ms, _max_nodes, 0, 0, 0, on_progress)
+        self.go_threads(movetime_ms, _max_nodes, 1, on_progress)
     }
 
-    /// `worker_id`: only worker 0 streams progress callbacks (matches multi-worker client).
-    pub fn go_with_profile(
+    pub fn go_threads(
         &mut self,
         movetime_ms: u32,
         _max_nodes: u32,
-        worker_id: u32,
-        _late_wall_skip_pct: u32,
-        _lmr_bias: i32,
+        threads: u32,
         on_progress: Option<js_sys::Function>,
     ) -> String {
-        self.search.set_cat_lmr_worker_profile(worker_id as usize);
-        let stream = on_progress.is_some() && worker_id == 0;
-        self.search
-            .set_wasm_progress(if stream { on_progress.clone() } else { None });
+        let stream = on_progress.is_some();
+        self.search.set_wasm_progress(on_progress.clone());
         if self.search.g.winner() >= 0 {
             self.last_depth = 0;
             self.last_nodes = 0;
             self.last_stop_reason = "terminal";
             return "(none)".to_string();
         }
-        let result = self.search.think(
+        let thread_count = usize::try_from(threads.max(1)).unwrap_or(1);
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+        let result = self.search.think_with_threads(
             (movetime_ms as u64).max(1),
             30,
-            false,
+            true,
             stream,
             &self.engine_label,
+            thread_count,
         );
+        #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
+        let result = {
+            // Static web builds currently compile without wasm atomics/SharedArrayBuffer,
+            // so the browser worker hosts one standalone Titanium instance. The thread
+            // count stays in the WASM API contract for the future threaded build.
+            let _ = thread_count;
+            self.search.set_cat_lmr_worker_profile(0);
+            self.search.think(
+                (movetime_ms as u64).max(1),
+                30,
+                true,
+                stream,
+                &self.engine_label,
+            )
+        };
         self.search.set_wasm_progress(None);
         self.last_depth = result.depth;
         self.last_nodes = result.nodes;
@@ -340,6 +325,23 @@ impl WasmEngine {
         } else {
             move_id_to_algebraic(result.mv)
         }
+    }
+
+    pub fn go_threads_json(
+        &mut self,
+        movetime_ms: u32,
+        _max_nodes: u32,
+        threads: u32,
+        on_progress: Option<js_sys::Function>,
+    ) -> String {
+        let best = self.go_threads(movetime_ms, _max_nodes, threads, on_progress);
+        format!(
+            "{{\"move\":{},\"depth\":{},\"nodes\":{},\"stopReason\":{}}}",
+            json_string(&best),
+            self.last_depth,
+            self.last_nodes,
+            json_string(self.last_stop_reason)
+        )
     }
 
     pub fn last_search_depth(&self) -> i32 {

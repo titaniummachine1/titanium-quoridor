@@ -557,7 +557,11 @@ fn run_eval(args: &[String]) {
         }
         g.make_move(algebraic_to_move_id(a));
     }
-    let mut s = TitaniumSearch::grafted(g, None);
+    // No-raceproof: the certificate floor fires on cert-eligible races (d_me<=d_opp+1)
+    // and overrides the net score, which the Python HalfPW trainer does NOT model.
+    // This command's purpose is the PURE NET eval (see doc above), so disable cert
+    // to keep py↔engine parity exact for training.
+    let mut s = TitaniumSearch::grafted_no_raceproof(g, None);
     if args.iter().any(|a| a == "--json") {
         println!("{}", s.eval_dump_json());
     } else {

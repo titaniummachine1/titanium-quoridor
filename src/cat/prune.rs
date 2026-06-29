@@ -953,6 +953,24 @@ pub fn move_corridor_attention(board: &Board, mv: Move, cat: &CorridorAttention)
     cat_score_for_move(mv, cat) + wall_shape_attention_bonus(board, mv, cat)
 }
 
+/// Simple move impact from the BFF heatmap (v16 LMR ordering): a pawn move
+/// inherits its destination square's heat; a wall inherits the HIGHEST heat of
+/// the squares it touches. No per-move pathfinding, no defensive special-casing —
+/// just "how hot is the part of the board this move acts on".
+pub fn move_impact_heat(mv: Move, cat: &CorridorAttention) -> i32 {
+    match mv {
+        Move::Pawn { row, col } => i32::from(cat.square_heat(row, col)),
+        Move::Wall { row, col, .. } => {
+            // A wall borders the 2×2 block of cells (row,col)..=(row+1,col+1).
+            let h = |r: u8, c: u8| i32::from(cat.square_heat(r, c));
+            h(row, col)
+                .max(h(row + 1, col))
+                .max(h(row, col + 1))
+                .max(h(row + 1, col + 1))
+        }
+    }
+}
+
 pub fn wall_path_impact_attention(
     board: &mut Board,
     mv: Move,
