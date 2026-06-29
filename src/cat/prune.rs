@@ -877,12 +877,12 @@ pub fn cat_v16_lmr_extra_plies(
     ceiling: u16,
     fringe_pct: u16,
     child_depth_full: u32,
+    max_extra: f64,
 ) -> u32 {
-    if child_depth_full <= 1 {
+    if child_depth_full <= 1 || max_extra <= 0.0 {
         return 0;
     }
     const GAMMA: f64 = 2.0;
-    const MAX_EXTRA: f64 = 3.0;
     let cat_ref = cat_heat_ref_max(mv, refs).min(ceiling);
     let cat_norm = if cat_ref == 0 {
         0.0 // no corridor structure for this player → treat as low-impact
@@ -890,9 +890,11 @@ pub fn cat_v16_lmr_extra_plies(
         (cat_cm.max(0) as f64 / f64::from(cat_ref)).clamp(0.0, 1.0)
     };
     let unimportance = 1.0 - cat_norm;
-    // Per-worker weight: worker 0 (~5%) ≈ 0.25, helpers up to ~4.0.
-    let cat_weight = (f64::from(fringe_pct.min(100)) / 20.0).clamp(0.25, 4.0);
-    let extra = (MAX_EXTRA * unimportance.powf(GAMMA) * cat_weight).round();
+    // Per-worker weight centred on the main worker: worker 0 (~5%) ≈ 1.0 so the
+    // main search prunes meaningfully and the LMR-vision slider has a clear
+    // effect; helpers scale up to ~3.0 for lazy-SMP diversity.
+    let cat_weight = (0.85 + f64::from(fringe_pct.min(100)) / 33.0).clamp(0.5, 3.0);
+    let extra = (max_extra * unimportance.powf(GAMMA) * cat_weight).round();
     (extra.max(0.0) as u32).min(child_depth_full.saturating_sub(1))
 }
 

@@ -2,15 +2,16 @@
 
 use crate::cat::constants::DIST_PENALTY;
 use crate::cat::prune::{
-    cat_heat_fraction, cat_heat_ref_max, cat_heat_refs, cat_lmr_total_reduction,
-    collect_search_moves, get_shortest_path, is_lmr_heat_hot, is_tactical_move,
-    move_corridor_attention, order_moves, path_distance,
+    cat_heat_fraction, cat_heat_ref_max, cat_heat_refs, cat_v16_lmr_extra_plies,
+    cat_v16_lmr_fringe_pct_for_worker, collect_search_moves, get_shortest_path, is_lmr_heat_hot,
+    is_tactical_move, move_corridor_attention, order_moves, path_distance,
 };
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move};
 use crate::movegen::MAX_LEGAL_MOVES;
 use crate::path::BfsScratch;
-use crate::search::lmr_profile::{build_lmr_table, compute_stage_t, LmrProfile};
+use crate::search::lmr_profile::{compute_stage_t, LmrProfile};
+use crate::titanium::search::ace_graduated_lmr_reduction;
 use crate::util::perft::format_move;
 
 const LMR_MIN_DEPTH: u32 = 2;
@@ -55,6 +56,7 @@ pub fn plan_root_lmr(
     id_depth: u32,
     time_ms: u64,
     pierce_fraction: f32,
+    max_extra: f64,
 ) -> (LmrProfile, Vec<RootLmrPlan>) {
     let root_side = board.side();
     let opp_side = root_side.opposite();
@@ -117,7 +119,6 @@ pub fn plan_root_lmr(
     let cat_refs = cat_heat_refs(&buf, n, board, &cat);
     let cat_max = cat_refs.all;
 
-    let lmr_table = build_lmr_table(profile.aggression);
     let depth = id_depth.max(1);
     let child_depth_full = depth.saturating_sub(1);
 
@@ -143,21 +144,21 @@ pub fn plan_root_lmr(
         let reduction = if i == 0 || depth < LMR_MIN_DEPTH {
             0u32
         } else {
-            let d = (depth as usize).min(63);
-            let m = (i + 1).min(63);
-            let base_r = lmr_table[d][m];
-            cat_lmr_total_reduction(
+            // Mirror the live Titanium LMR exactly: base index reduction + the
+            // continuous CAT modifier at this aggressiveness (the max_extra slider).
+            let ace_red = ace_graduated_lmr_reduction(i, depth as i32).max(0) as u32;
+            let cat_extra = cat_v16_lmr_extra_plies(
                 mv,
                 cat_cm,
                 cat_refs,
-                profile.cold_cm,
-                depth,
-                base_r,
-                &opp_path,
-                opp_path_len,
-                corridor_relevant,
-            )
+                u16::MAX,
+                cat_v16_lmr_fringe_pct_for_worker(0),
+                child_depth_full,
+                max_extra,
+            );
+            (ace_red + cat_extra).min(child_depth_full.saturating_sub(1))
         };
+        let _ = corridor_relevant;
 
         let child_depth_used = child_depth_full.saturating_sub(reduction);
         let in_full_window = child_depth_used >= child_depth_full.saturating_sub(1);
@@ -219,10 +220,10 @@ pub fn format_lmr_plans_json(plans: &[RootLmrPlan]) -> String {
 }
 
 /// Pre-search LMR plan — static profile at pierce peak.
-pub fn lmr_snapshot_json(board: &mut Board, time_ms: u64, id_depth: u32) -> String {
+pub fn lmr_snapshot_json(board: &mut Board, time_ms: u64, id_depth: u32, max_extra: f64) -> String {
     let mut bfs = BfsScratch::new();
     let depth = id_depth.clamp(4, 32);
-    let (profile, plans) = plan_root_lmr(board, &mut bfs, depth, time_ms, 0.0);
+    let (profile, plans) = plan_root_lmr(board, &mut bfs, depth, time_ms, 0.0, max_extra);
     format!(
         "{{\"source\":\"shallow\",\"idDepth\":{},\"timeMs\":{},\"lmrProfile\":{},\"moves\":[{}]}}",
         depth,
@@ -241,7 +242,7 @@ mod tests {
     fn shallow_snapshot_has_legal_moves() {
         let mut board = Board::new();
         let mut bfs = BfsScratch::new();
-        let (_, plans) = plan_root_lmr(&mut board, &mut bfs, 8, TIME_REFERENCE_MS, 0.0);
+        let (_, plans) = plan_root_lmr(&mut board, &mut bfs, 8, TIME_REFERENCE_MS, 0.0, 3.0);
         assert!(plans.len() >= 4);
         assert!(plans[0].tactical);
     }
@@ -253,7 +254,7 @@ mod tests {
         board.apply_algebraic("e1h");
         board.apply_algebraic("e3");
         let mut bfs = BfsScratch::new();
-        let (_, plans) = plan_root_lmr(&mut board, &mut bfs, 8, TIME_REFERENCE_MS, 0.0);
+        let (_, plans) = plan_root_lmr(&mut board, &mut bfs, 8, TIME_REFERENCE_MS, 0.0, 3.0);
         assert!(
             plans.len() >= 20,
             "expected CAT-filtered root list, got {}",
@@ -283,7 +284,7 @@ mod tests {
             board.apply_algebraic(m);
         }
         let mut bfs = BfsScratch::new();
-        let (_, plans) = plan_root_lmr(&mut board, &mut bfs, 8, TIME_REFERENCE_MS, 0.0);
+        let (_, plans) = plan_root_lmr(&mut board, &mut bfs, 8, TIME_REFERENCE_MS, 0.0, 3.0);
         assert!(
             plans.len() >= 15,
             "expected CAT-filtered root list at e4/e6, got {}",

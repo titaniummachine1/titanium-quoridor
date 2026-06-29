@@ -70,8 +70,15 @@ const ACE_LMR_AFTER_MOVE: usize = 4;
 /// Both LMR and EME require at least this remaining depth.
 const ACE_LMR_MIN_DEPTH: i32 = 3;
 
-/// Late-move reduction plies — same formula as JS graduated LMR.
-fn ace_graduated_lmr_reduction(move_index: usize, depth: i32) -> i32 {
+/// Default CAT-LMR aggressiveness — max extra reduction plies for a zero-impact
+/// move (the `max_extra` in `cat_v16_lmr_extra_plies`). The LMR-vision slider
+/// overrides this for eyeballing; once tuned, set this to the chosen value.
+pub const CAT_LMR_DEFAULT_MAX_EXTRA: f64 = 3.0;
+
+/// Late-move reduction plies — same formula as JS graduated LMR. Made `pub` so
+/// the LMR-vision plan (`search::lmr_viz`) uses the exact same base reduction as
+/// the live search, then layers the CAT modifier identically.
+pub fn ace_graduated_lmr_reduction(move_index: usize, depth: i32) -> i32 {
     let mut red = 1;
     if move_index >= 12 {
         red += 1;
@@ -3372,6 +3379,7 @@ impl TitaniumSearch {
                         self.cat_lmr_ceiling,
                         self.cat_lmr_fringe_pct,
                         new_depth as u32,
+                        CAT_LMR_DEFAULT_MAX_EXTRA,
                     ) as i32;
                     (ace_red + cat_extra).min((new_depth - 1).max(0))
                 } else {

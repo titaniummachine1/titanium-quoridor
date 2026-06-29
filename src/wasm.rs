@@ -188,6 +188,35 @@ impl WasmCatEngine {
 
     /// CAT JSON for `moves` (space-separated algebraic), reusing the warm board.
     pub fn snapshot(&mut self, moves: &str) -> String {
+        self.sync_to(moves);
+        cat_snapshot_json(&mut self.board)
+    }
+
+    /// LMR plan JSON for `moves` at aggressiveness `max_extra` — same warm board,
+    /// single-thread. Per-move `childDepthUsed`/`childDepthFull` give the search-
+    /// depth %. Mirrors the live Titanium LMR (base index reduction + CAT modifier),
+    /// so the overlay shows what the engine actually does.
+    pub fn lmr_snapshot(
+        &mut self,
+        moves: &str,
+        time_ms: u32,
+        id_depth: u32,
+        max_extra: f64,
+    ) -> String {
+        self.sync_to(moves);
+        crate::search::lmr_viz::lmr_snapshot_json(
+            &mut self.board,
+            u64::from(time_ms),
+            id_depth,
+            max_extra,
+        )
+    }
+}
+
+impl WasmCatEngine {
+    /// Advance the warm board to `moves`: forward play applies only the appended
+    /// moves; divergence/undo rewinds to the longest common prefix.
+    fn sync_to(&mut self, moves: &str) {
         let want: Vec<&str> = moves.split_whitespace().filter(|s| !s.is_empty()).collect();
         let mut common = 0usize;
         while common < self.applied.len()
@@ -196,7 +225,6 @@ impl WasmCatEngine {
         {
             common += 1;
         }
-        // Divergence / undo: rewind to the common prefix by replaying it.
         if common < self.applied.len() {
             self.board = Board::new();
             for m in &want[..common] {
@@ -204,12 +232,10 @@ impl WasmCatEngine {
             }
             self.applied.truncate(common);
         }
-        // Forward: apply only the appended moves.
         for m in &want[common..] {
             self.board.apply_algebraic(m);
             self.applied.push((*m).to_string());
         }
-        cat_snapshot_json(&mut self.board)
     }
 }
 

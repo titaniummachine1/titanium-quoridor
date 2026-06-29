@@ -699,7 +699,10 @@ fn run_lmr(args: &[String]) {
         }
         i += 1;
     }
-    println!("{}", lmr_snapshot_json(&mut board, time_ms, id_depth));
+    println!(
+        "{}",
+        lmr_snapshot_json(&mut board, time_ms, id_depth, 3.0)
+    );
 }
 
 /// EXPERIMENTAL — measure how well eval-guided rollouts predict the deep
