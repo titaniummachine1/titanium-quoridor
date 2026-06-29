@@ -159,10 +159,64 @@ fn replay_board_from_moves(moves: &str) -> Board {
 }
 
 /// CAT v3 heatmap JSON for the website overlay (`catHeatmap.js`).
+///
+/// Stateless: rebuilds the board from the full move list each call. Prefer
+/// `WasmCatEngine` (below), which keeps the board warm and only applies the new
+/// move — the overlay was re-replaying the whole game on every ply.
 #[wasm_bindgen]
 pub fn cat_snapshot(moves: &str) -> String {
     let mut board = replay_board_from_moves(moves);
     cat_snapshot_json(&mut board)
+}
+
+/// Warm, single-purpose CAT instance for the overlay worker. Holds the board
+/// across plies: forward play applies only the appended move(s); undo/jump
+/// rebuilds from the longest common prefix. No search, no thread pool — its only
+/// job is to return the CAT snapshot for the current node fast.
+#[wasm_bindgen]
+pub struct WasmCatEngine {
+    board: Board,
+    applied: Vec<String>,
+}
+
+#[wasm_bindgen]
+impl WasmCatEngine {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmCatEngine {
+        WasmCatEngine { board: Board::new(), applied: Vec::new() }
+    }
+
+    /// CAT JSON for `moves` (space-separated algebraic), reusing the warm board.
+    pub fn snapshot(&mut self, moves: &str) -> String {
+        let want: Vec<&str> = moves.split_whitespace().filter(|s| !s.is_empty()).collect();
+        let mut common = 0usize;
+        while common < self.applied.len()
+            && common < want.len()
+            && self.applied[common] == want[common]
+        {
+            common += 1;
+        }
+        // Divergence / undo: rewind to the common prefix by replaying it.
+        if common < self.applied.len() {
+            self.board = Board::new();
+            for m in &want[..common] {
+                self.board.apply_algebraic(m);
+            }
+            self.applied.truncate(common);
+        }
+        // Forward: apply only the appended moves.
+        for m in &want[common..] {
+            self.board.apply_algebraic(m);
+            self.applied.push((*m).to_string());
+        }
+        cat_snapshot_json(&mut self.board)
+    }
+}
+
+impl Default for WasmCatEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// JSON build identity for browser debug panel / console.
