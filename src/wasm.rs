@@ -192,23 +192,23 @@ impl WasmCatEngine {
         cat_snapshot_json(&mut self.board)
     }
 
-    /// LMR plan JSON for `moves` at aggressiveness `max_extra` — same warm board,
+    /// LMR plan JSON for `moves` at `aggression` ∈ [0,1] — same warm board,
     /// single-thread. Per-move `childDepthUsed`/`childDepthFull` give the search-
-    /// depth %. Mirrors the live Titanium LMR (base index reduction + CAT modifier),
-    /// so the overlay shows what the engine actually does.
+    /// depth %. Mirrors the live Titanium connected LMR (one knob over index +
+    /// impact), so the overlay shows what the engine actually does.
     pub fn lmr_snapshot(
         &mut self,
         moves: &str,
         time_ms: u32,
         id_depth: u32,
-        max_extra: f64,
+        aggression: f64,
     ) -> String {
         self.sync_to(moves);
         crate::search::lmr_viz::lmr_snapshot_json(
             &mut self.board,
             u64::from(time_ms),
             id_depth,
-            max_extra,
+            aggression,
         )
     }
 }

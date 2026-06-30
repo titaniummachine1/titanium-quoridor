@@ -858,44 +858,46 @@ pub fn cat_v16_lmr_reduction_plies(
     reduction.min(child_depth_full.saturating_sub(2))
 }
 
-/// CAT as a *continuous modifier* on top of base LMR — the v16 design.
+/// Connected CAT-LMR reduction — ONE intuitive model over both the move index
+/// and its corridor impact. `aggression` ∈ [0,1] is the single tuning knob:
+///   0.0 → no reduction at all (every move searched full depth);
+///   1.0 → maximal reduction of every non-PV move (down to ~1 ply).
+/// In between, a move's *reducibility* — a blend of low impact (cold heatmap)
+/// and late move index — decides how fast it gives up depth as aggression rises:
+/// cold + late moves shed depth first, hot + early moves only near 100%.
 ///
-/// Returns the EXTRA reduction to add to the conventional (move-index) LMR, not
-/// a standalone reduction. `r_cat = max_extra · u^γ` where `u = 1 − cat_norm`
-/// and `cat_norm = cat_cm / cat_ref` (clamped 0..1). High-impact moves get ~0
-/// extra (searched near full); only genuinely low-impact moves get heavily
-/// reduced. CAT answers "how dangerous is it to under-search this move?", never
-/// "is it good?" — strength is decided by eval + the re-search recovery.
-///
-/// `fringe_pct` carries the lazy-SMP per-worker aggressiveness (main worker
-/// gentle, helpers bolder) so search diversity is preserved without the old
-/// hard tail-threshold.
-pub fn cat_v16_lmr_extra_plies(
+/// Connected, not additive: index and impact feed the same reducibility, so
+/// there's exactly one knob to tune and the 0%/100% endpoints are intuitive.
+/// Returns total reduction plies (subsumes the old base index-LMR).
+pub fn cat_v16_lmr_reduction(
     mv: Move,
     cat_cm: i32,
     refs: CatHeatRefs,
-    ceiling: u16,
-    fringe_pct: u16,
+    move_index: usize,
     child_depth_full: u32,
-    max_extra: f64,
+    aggression: f64,
 ) -> u32 {
-    if child_depth_full <= 1 || max_extra <= 0.0 {
+    if child_depth_full <= 1 || move_index == 0 || aggression <= 0.0 {
         return 0;
     }
-    const GAMMA: f64 = 2.0;
-    let cat_ref = cat_heat_ref_max(mv, refs).min(ceiling);
+    let cat_ref = cat_heat_ref_max(mv, refs);
     let cat_norm = if cat_ref == 0 {
         0.0 // no corridor structure for this player → treat as low-impact
     } else {
         (cat_cm.max(0) as f64 / f64::from(cat_ref)).clamp(0.0, 1.0)
     };
-    let unimportance = 1.0 - cat_norm;
-    // Per-worker weight centred on the main worker: worker 0 (~5%) ≈ 1.0 so the
-    // main search prunes meaningfully and the LMR-vision slider has a clear
-    // effect; helpers scale up to ~3.0 for lazy-SMP diversity.
-    let cat_weight = (0.85 + f64::from(fringe_pct.min(100)) / 33.0).clamp(0.5, 3.0);
-    let extra = (max_extra * unimportance.powf(GAMMA) * cat_weight).round();
-    (extra.max(0.0) as u32).min(child_depth_full.saturating_sub(1))
+    let unimportance = 1.0 - cat_norm; // impact heatmap: 0 hot .. 1 cold
+    const INDEX_CAP: f64 = 16.0;
+    let lateness = (move_index as f64 / INDEX_CAP).min(1.0); // move index: 0 .. 1
+    let reducibility = 0.5 * unimportance + 0.5 * lateness; // connected, 0 .. 1
+    // Reducible (cold + late) → exponent ~1 (sheds depth early); critical (hot +
+    // early) → exponent ~4 (only near aggression 1). At aggression=1 frac→1 for
+    // all, so 100% = maximal reduction of everything (PV move excepted above).
+    const SHARP: f64 = 3.0;
+    let exponent = 1.0 + (1.0 - reducibility) * SHARP;
+    let frac = aggression.clamp(0.0, 1.0).powf(exponent);
+    let reduction = (f64::from(child_depth_full) * frac).round() as u32;
+    reduction.min(child_depth_full.saturating_sub(1))
 }
 
 /// CAT-shaped LMR plies from heat fraction — scales child depth like the heatmap (245 ≫ 98).

@@ -701,7 +701,7 @@ fn run_lmr(args: &[String]) {
     }
     println!(
         "{}",
-        lmr_snapshot_json(&mut board, time_ms, id_depth, 3.0)
+        lmr_snapshot_json(&mut board, time_ms, id_depth, 0.5)
     );
 }
 

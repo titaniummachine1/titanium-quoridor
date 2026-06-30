@@ -28,7 +28,7 @@ use crate::titanium::move_id_to_board;
 use crate::util::clock::{Duration, Instant};
 
 use crate::cat::prune::{
-    cat_heat_refs_from_scores, cat_v16_lmr_extra_plies, cat_v16_lmr_fringe_pct_for_worker,
+    cat_heat_refs_from_scores, cat_v16_lmr_fringe_pct_for_worker, cat_v16_lmr_reduction,
     gap_play_zone_mask, get_shortest_path, move_corridor_attention_with_denial,
     move_corridor_attention_with_path, move_impact_heat, wall_in_dead_zone, wall_should_search,
     CatHeatRefs,
@@ -70,10 +70,10 @@ const ACE_LMR_AFTER_MOVE: usize = 4;
 /// Both LMR and EME require at least this remaining depth.
 const ACE_LMR_MIN_DEPTH: i32 = 3;
 
-/// Default CAT-LMR aggressiveness — max extra reduction plies for a zero-impact
-/// move (the `max_extra` in `cat_v16_lmr_extra_plies`). The LMR-vision slider
+/// Default CAT-LMR aggression ∈ [0,1] (the single knob in `cat_v16_lmr_reduction`):
+/// 0 = no reduction, 1 = everything maximally reduced. The LMR-vision slider
 /// overrides this for eyeballing; once tuned, set this to the chosen value.
-pub const CAT_LMR_DEFAULT_MAX_EXTRA: f64 = 3.0;
+pub const CAT_LMR_DEFAULT_AGGRESSION: f64 = 0.5;
 
 /// Late-move reduction plies — same formula as JS graduated LMR. Made `pub` so
 /// the LMR-vision plan (`search::lmr_viz`) uses the exact same base reduction as
@@ -3364,26 +3364,22 @@ impl TitaniumSearch {
                 && m != tt_move
             {
                 // graduated LMR — v16 stacks CAT-scaled depth on top of ACE baseline
-                let ace_red = ace_graduated_lmr_reduction(i, depth);
                 let red = if cat_lmr_active {
                     let mv = move_id_to_board(m);
-                    // CAT as a continuous modifier ON TOP of base index-LMR (v16
-                    // design): red = ace_red + max_extra·(1−cat_norm)^γ. High-impact
-                    // moves add ~0; low-impact moves get the extra reduction. Capped
-                    // so the move keeps >=1 ply — the reduced search re-searches at
-                    // full depth on a raised alpha (below), so underestimates recover.
-                    let cat_extra = cat_v16_lmr_extra_plies(
+                    // Connected CAT-LMR: one model over move index + impact, scaled
+                    // by a single aggression knob. Subsumes the base index-LMR. The
+                    // reduced search re-searches at full depth on a raised alpha
+                    // (below), so underestimated moves recover.
+                    cat_v16_lmr_reduction(
                         mv,
                         cat_heats[i],
                         cat_refs,
-                        self.cat_lmr_ceiling,
-                        self.cat_lmr_fringe_pct,
+                        i,
                         new_depth as u32,
-                        CAT_LMR_DEFAULT_MAX_EXTRA,
-                    ) as i32;
-                    (ace_red + cat_extra).min((new_depth - 1).max(0))
+                        CAT_LMR_DEFAULT_AGGRESSION,
+                    ) as i32
                 } else {
-                    ace_red
+                    ace_graduated_lmr_reduction(i, depth)
                 };
                 if self.reduction_sidecar.is_some() {
                     let started = Instant::now();
