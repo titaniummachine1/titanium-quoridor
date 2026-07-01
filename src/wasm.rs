@@ -287,16 +287,47 @@ impl WasmAceEngine {
         engine_mode: &str,
         on_progress: Option<js_sys::Function>,
     ) -> String {
-        let _ = on_progress;
+        install_panic_hook();
         let list: Vec<String> = moves
             .split_whitespace()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect();
         let params = ace_params_from_mode(engine_mode, movetime_ms, max_depth);
-        match crate::ace::ace_genmove(&list, params, engine_mode) {
-            Some((alg, _)) => alg,
-            None => "(none)".to_string(),
+        let stream = on_progress.is_some();
+        let mut g = crate::ace::AceGame::new();
+        for text in &list {
+            g.make_move(crate::ace::algebraic_to_ace(text));
+        }
+        if g.winner() >= 0 {
+            return "(none)".to_string();
+        }
+        let mut search = if params.ti_movegen && params.cat {
+            crate::ace::AceSearch::with_ti_movegen_and_cat(g)
+        } else if params.ti_movegen {
+            crate::ace::AceSearch::with_ti_movegen(g)
+        } else if params.cat {
+            crate::ace::AceSearch::with_cat(g)
+        } else {
+            crate::ace::AceSearch::new(g)
+        };
+        if params.eme {
+            search.enable_eme();
+        }
+        search.set_wasm_progress(on_progress);
+        let result = search.think(
+            params.time_ms,
+            params.max_depth,
+            params.full,
+            stream,
+            engine_mode,
+        );
+        if result.mv == crate::ace::ACE_NO_MOVE {
+            "(none)".to_string()
+        } else if result.mv == 0 && search.g.winner() >= 0 {
+            "(none)".to_string()
+        } else {
+            move_id_to_algebraic(result.mv)
         }
     }
 }
@@ -323,7 +354,8 @@ impl WasmEngine {
             5 => 1000,
             _ => 800,
         };
-        let search = *TitaniumSearch::grafted_v16_with_ceiling(g, None, ceiling);
+        let mut search = *TitaniumSearch::grafted_v16_with_ceiling(g, None, ceiling);
+        search.set_opening_book(crate::titanium::opening_book::OpeningBookMode::Play, None);
         let engine_label = "titanium-v16".to_string();
         WasmEngine {
             search,

@@ -1,6 +1,6 @@
 //! Root LMR plan snapshot — mirrors alphabeta root move list + planned reductions.
 
-use crate::cat::build::{build_impact_heatmap, build_impact_heatmap_for_stm};
+use crate::cat::build::build_impact_heatmap;
 use crate::cat::constants::DIST_PENALTY;
 use crate::cat::prune::{
     get_shortest_path, is_lmr_heat_hot, is_tactical_move, move_impact_heat, order_moves,
@@ -10,8 +10,9 @@ use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move};
 use crate::movegen::{generate_legal_moves_slice, MAX_LEGAL_MOVES};
 use crate::path::BfsScratch;
-use crate::search::cat_index_lmr::CAT_ATTENTION_TAIL_CUTOFF;
-use crate::search::cat_index_lmr::{cat_index_lmr_reduction, lmr_tuning_to_aggression_g};
+use crate::search::v16_lmr::{
+    plan_v16_pawn_lmr, plan_v16_wall_lmr, ACE_LMR_AFTER_MOVE, ACE_LMR_MIN_DEPTH, V16HardOverride,
+};
 use crate::search::lmr_profile::{compute_stage_t, LmrProfile};
 use crate::util::perft::format_move;
 
@@ -26,7 +27,6 @@ pub struct RootLmrPlan {
     pub tactical: bool,
     pub hot: bool,
     pub cold: bool,
-    pub protected: bool,
     pub pruned: bool,
     pub baseline_reduction_fp: f64,
     pub baseline_reduction: u32,
@@ -40,11 +40,13 @@ pub struct RootLmrPlan {
     pub in_full_window: bool,
     pub attention_ratio: f64,
     pub dead_tail: bool,
+    pub ace_base_reduction: u32,
+    pub hard_override: &'static str,
+    pub final_reduction: u32,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct LmrPlanSummary {
-    pub protected_moves_changed: u32,
     pub moves_more_reduction: u32,
     pub avg_baseline_reduction_fp: f64,
     pub avg_adjusted_reduction_fp: f64,
@@ -54,76 +56,56 @@ pub struct LmrPlanSummary {
     pub cold_count: u32,
 }
 
-fn lmr_move_protected(
+fn plan_v16_root_move(
     move_index: usize,
-    child_depth_full: u32,
     depth: u32,
-    tactical: bool,
-) -> bool {
-    move_index == 0 || child_depth_full <= 1 || depth < LMR_MIN_DEPTH || tactical
-}
-
-fn scale_lmr_reduction(
-    cat_cm: i32,
-    max_move_impact: u32,
-    move_rank: usize,
-    move_count: usize,
     child_depth_full: u32,
-    _depth: u32,
-    lmr_tuning_percent: i32,
-    first_reducible_rank: usize,
-    protected: bool,
-) -> (bool, f64, u32, u32, f64, u32, u32, bool) {
-    if protected {
+    attention_ratio: f64,
+    wall_opponent_delay: Option<i32>,
+    pawn_self_gain: Option<i32>,
+    is_wall: bool,
+) -> (u32, &'static str, u32, u32) {
+    if is_wall
+        && move_index >= ACE_LMR_AFTER_MOVE
+        && depth >= ACE_LMR_MIN_DEPTH as u32
+        && child_depth_full > 1
+    {
+        let p = plan_v16_wall_lmr(
+            move_index,
+            depth as i32,
+            child_depth_full as i32,
+            attention_ratio,
+            wall_opponent_delay.unwrap_or(1),
+        );
         return (
-            true,
-            0.0,
-            0,
-            child_depth_full,
-            0.0,
-            0,
-            child_depth_full,
-            false,
+            p.ace_base_reduction as u32,
+            p.hard_override.as_str(),
+            p.final_reduction as u32,
+            p.child_depth_used as u32,
         );
     }
-
-    let baseline_g = 1.0;
-    let requested_g = lmr_tuning_to_aggression_g(lmr_tuning_percent);
-
-    let baseline_reduction = cat_index_lmr_reduction(
-        child_depth_full,
-        move_rank,
-        move_count,
-        cat_cm,
-        max_move_impact,
-        baseline_g,
-        false,
-        first_reducible_rank,
-    );
-    let effective_reduction = cat_index_lmr_reduction(
-        child_depth_full,
-        move_rank,
-        move_count,
-        cat_cm,
-        max_move_impact,
-        requested_g,
-        false,
-        first_reducible_rank,
-    );
-
-    let baseline_used = child_depth_full.saturating_sub(baseline_reduction);
-    let child_used = child_depth_full.saturating_sub(effective_reduction);
-    let max_safe = child_depth_full;
-
+    if !is_wall && move_index > 0 && depth >= ACE_LMR_MIN_DEPTH as u32 && child_depth_full > 1 {
+        if let Some(gain) = pawn_self_gain {
+            if let Some(p) = plan_v16_pawn_lmr(
+                move_index,
+                depth as i32,
+                child_depth_full as i32,
+                gain,
+            ) {
+                return (
+                    p.ace_base_reduction as u32,
+                    p.hard_override.as_str(),
+                    p.final_reduction as u32,
+                    p.child_depth_used as u32,
+                );
+            }
+        }
+    }
     (
-        false,
-        baseline_reduction as f64,
-        baseline_reduction,
-        baseline_used,
-        effective_reduction as f64,
-        effective_reduction,
-        child_used,
-        effective_reduction > max_safe,
+        0,
+        V16HardOverride::None.as_str(),
+        0,
+        child_depth_full,
     )
 }
 
@@ -153,12 +135,6 @@ fn summarize_plans(plans: &[RootLmrPlan]) -> LmrPlanSummary {
         if p.cold {
             summary.cold_count += 1;
         }
-        if p.protected {
-            if p.reduction > 0 {
-                summary.protected_moves_changed += 1;
-            }
-            continue;
-        }
         n_eligible += 1;
         baseline_sum += p.baseline_reduction_fp;
         adjusted_sum += p.requested_reduction_fp;
@@ -185,6 +161,7 @@ pub fn plan_root_lmr(
     pierce_fraction: f32,
     depth_kept_percent: i32,
 ) -> (LmrProfile, Vec<RootLmrPlan>) {
+    let _depth_kept_percent = depth_kept_percent;
     let root_side = board.side();
     let opp_side = root_side.opposite();
     let our_dist = bfs
@@ -245,14 +222,12 @@ pub fn plan_root_lmr(
 
     let depth = id_depth.max(1);
     let child_depth_full = depth.saturating_sub(1);
-    let first_reducible_rank = profile.lmr_after_move.saturating_add(1).max(2);
 
     let mut plans = Vec::with_capacity(n);
 
     for i in 0..n {
         let mv = buf[i];
         let cat_cm = cat_values[i];
-        let move_rank = i + 1;
         let heat_ratio_hot = is_lmr_heat_hot(
             cat_cm,
             max_move_impact as u16,
@@ -260,69 +235,80 @@ pub fn plan_root_lmr(
             profile.hot_ratio_pct,
         );
         let cold = cat_cm < i32::from(profile.cold_cm);
+        let is_wall = matches!(mv, Move::Wall { .. });
         let is_tactical = if i == 0 || depth < LMR_MIN_DEPTH {
             true
-        } else if matches!(mv, Move::Wall { .. })
-            && !crate::cat::prune::wall_intersects_path(mv, &opp_path, opp_path_len)
+        } else if is_wall && !crate::cat::prune::wall_intersects_path(mv, &opp_path, opp_path_len)
         {
             false
         } else {
             is_tactical_move(board, mv, our_dist, opp_dist_path, bfs)
         };
-        let protected = lmr_move_protected(i, child_depth_full, depth, is_tactical);
-
-        let (
-            protected_flag,
-            baseline_fp,
-            baseline_reduction,
-            baseline_used,
-            requested_fp,
-            effective_reduction,
-            child_used,
-            clamped,
-        ) = scale_lmr_reduction(
-            cat_cm,
-            max_move_impact,
-            move_rank,
-            n,
-            child_depth_full,
-            depth,
-            depth_kept_percent,
-            first_reducible_rank,
-            protected,
-        );
-
-        let in_full_window = child_used >= child_depth_full.saturating_sub(1);
         let attention = if max_move_impact > 0 {
             cat_cm.max(0) as f64 / max_move_impact as f64
         } else {
             0.0
         };
-        let dead_tail =
-            !protected_flag && max_move_impact > 0 && attention <= CAT_ATTENTION_TAIL_CUTOFF;
+
+        let wall_opponent_delay = if is_wall && i >= ACE_LMR_AFTER_MOVE {
+            let mut trial = board.clone();
+            trial.apply_move(mv);
+            let after = bfs
+                .shortest_distance(&trial, opp_side)
+                .unwrap_or(DIST_PENALTY);
+            Some(i32::from(after) - i32::from(opp_dist_path))
+        } else {
+            None
+        };
+
+        let pawn_self_gain = if !is_wall && i > 0 {
+            let mut trial = board.clone();
+            trial.apply_move(mv);
+            let after = bfs
+                .shortest_distance(&trial, root_side)
+                .unwrap_or(DIST_PENALTY);
+            Some(i32::from(our_dist) - i32::from(after))
+        } else {
+            None
+        };
+
+        let (ace_base, hard_override, final_reduction, child_used) = plan_v16_root_move(
+            i,
+            depth,
+            child_depth_full,
+            attention,
+            wall_opponent_delay,
+            pawn_self_gain,
+            is_wall,
+        );
+
+        let in_full_window = child_used >= child_depth_full.saturating_sub(1);
+        let dead_tail = hard_override == V16HardOverride::DeadTail.as_str();
 
         plans.push(RootLmrPlan {
             mv: format_move(mv),
-            is_pawn: matches!(mv, Move::Pawn { .. }),
+            is_pawn: !is_wall,
             order: i,
             cat_cm,
             tactical: is_tactical,
             hot: heat_ratio_hot || attention >= 0.72,
             cold,
-            protected: protected_flag,
             pruned: false,
-            baseline_reduction_fp: baseline_fp,
-            baseline_reduction,
+            baseline_reduction_fp: ace_base as f64,
+            baseline_reduction: ace_base,
             baseline_child_depth_full: child_depth_full,
-            baseline_child_depth_used: baseline_used,
-            requested_reduction_fp: requested_fp,
-            reduction: effective_reduction,
+            baseline_child_depth_used: child_depth_full.saturating_sub(ace_base),
+            requested_reduction_fp: final_reduction as f64,
+            reduction: final_reduction,
             child_depth_full,
             child_depth_used: child_used,
-            reduction_clamped: clamped,
+            reduction_clamped: final_reduction > child_depth_full.saturating_sub(1),
             in_full_window,
             attention_ratio: attention,
             dead_tail,
+            ace_base_reduction: ace_base,
+            hard_override,
+            final_reduction,
         });
     }
 
@@ -351,9 +337,10 @@ pub fn format_lmr_plans_json(plans: &[RootLmrPlan]) -> String {
             out.push(',');
         }
         out.push_str(&format!(
-            "{{\"move\":\"{}\",\"kind\":\"{}\",\"order\":{},\"catCm\":{},\"tactical\":{},\"hot\":{},\"cold\":{},\"protected\":{},\"pruned\":{},\
+            "{{\"move\":\"{}\",\"kind\":\"{}\",\"order\":{},\"catCm\":{},\"tactical\":{},\"hot\":{},\"cold\":{},\"pruned\":{},\
 \"baselineReductionFp\":{:.4},\"baselineReduction\":{},\"baselineChildDepthFull\":{},\"baselineChildDepthUsed\":{},\
-\"requestedReductionFp\":{:.4},\"reduction\":{},\"childDepthFull\":{},\"childDepthUsed\":{},\"reductionClamped\":{},\"inFullWindow\":{},\"attentionRatio\":{:.4},\"deadTail\":{}}}",
+\"requestedReductionFp\":{:.4},\"reduction\":{},\"childDepthFull\":{},\"childDepthUsed\":{},\"reductionClamped\":{},\"inFullWindow\":{},\"attentionRatio\":{:.4},\"deadTail\":{},\
+\"aceBaseReduction\":{},\"hardOverride\":\"{}\",\"finalReduction\":{}}}",
             p.mv,
             if p.is_pawn { "pawn" } else { "wall" },
             p.order,
@@ -361,7 +348,6 @@ pub fn format_lmr_plans_json(plans: &[RootLmrPlan]) -> String {
             p.tactical,
             p.hot,
             p.cold,
-            p.protected,
             p.pruned,
             p.baseline_reduction_fp,
             p.baseline_reduction,
@@ -375,11 +361,13 @@ pub fn format_lmr_plans_json(plans: &[RootLmrPlan]) -> String {
             p.in_full_window,
             p.attention_ratio,
             p.dead_tail,
+            p.ace_base_reduction,
+            p.hard_override,
+            p.final_reduction,
         ));
     }
     format!(
-        "\"summary\":{{\"protectedMovesChanged\":{},\"movesMoreReduction\":{},\"avgBaselineReductionFp\":{:.4},\"avgAdjustedReductionFp\":{:.4},\"maxBaselineReduction\":{},\"maxAdjustedReduction\":{},\"hotCount\":{},\"coldCount\":{}}},\"moves\":[{}]",
-        summary.protected_moves_changed,
+        "\"summary\":{{\"movesMoreReduction\":{},\"avgBaselineReductionFp\":{:.4},\"avgAdjustedReductionFp\":{:.4},\"maxBaselineReduction\":{},\"maxAdjustedReduction\":{},\"hotCount\":{},\"coldCount\":{}}},\"moves\":[{}]",
         summary.moves_more_reduction,
         summary.avg_baseline_reduction_fp,
         summary.avg_adjusted_reduction_fp,
@@ -439,27 +427,6 @@ mod tests {
     }
 
     #[test]
-    fn zero_tuning_max_reduces_without_protecting_eligible_moves() {
-        let mut board = Board::new();
-        board.apply_algebraic("e2");
-        board.apply_algebraic("e8");
-        board.apply_algebraic("e3");
-        let mut bfs = BfsScratch::new();
-        let (_, plans) = plan_root_lmr(&mut board, &mut bfs, 8, TIME_REFERENCE_MS, 0.0, 0);
-        let late_wall = plans
-            .iter()
-            .filter(|p| !p.is_pawn && p.order > 4)
-            .find(|p| !p.protected && p.baseline_reduction_fp > 0.0);
-        if let Some(p) = late_wall {
-            assert!(p.reduction > 0);
-            assert!(
-                !p.protected,
-                "0% tuning must not mark eligible moves protected"
-            );
-        }
-    }
-
-    #[test]
     fn lmr_vision_cat_cm_matches_impact_heatmap() {
         let mut board = Board::new();
         for m in ["e2", "e8", "e3", "e7", "e4", "e6"] {
@@ -489,110 +456,88 @@ mod tests {
     }
 
     #[test]
-    fn tuning_150_disables_adjusted_reduction() {
+    fn dead_tail_forces_depth_one_at_ten_percent() {
+        let child_full = 7i32;
+        let dead = plan_v16_wall_lmr(8, 8, child_full, 0.05, 1);
+        let fringe = plan_v16_wall_lmr(8, 8, child_full, 0.12, 1);
+        let side = plan_v16_wall_lmr(8, 8, child_full, 0.65, 1);
+        assert_eq!(dead.child_depth_used, 1);
+        assert_eq!(dead.hard_override, V16HardOverride::DeadTail);
+        assert!(fringe.child_depth_used > dead.child_depth_used);
+        assert!(side.child_depth_used >= fringe.child_depth_used);
+    }
+
+    #[test]
+    fn ace_baseline_ignores_cat_ratio_above_tail() {
+        let child_full = 7i32;
+        let mid = plan_v16_wall_lmr(12, 8, child_full, 0.50, 1);
+        let hot = plan_v16_wall_lmr(12, 8, child_full, 1.0, 1);
+        assert_eq!(mid.ace_base_reduction, hot.ace_base_reduction);
+        assert_eq!(mid.final_reduction, hot.final_reduction);
+        assert_eq!(mid.child_depth_used, hot.child_depth_used);
+        assert_eq!(mid.hard_override, V16HardOverride::None);
+    }
+
+    #[test]
+    fn backward_move_override_forces_depth_one() {
+        let p = plan_v16_pawn_lmr(3, 8, 7, 0).expect("non-progress");
+        assert_eq!(p.hard_override, V16HardOverride::BackwardMove);
+        assert_eq!(p.child_depth_used, 1);
+    }
+
+    #[test]
+    fn ace_graduated_increases_with_move_index() {
+        let child_full = 10i32;
+        let early = plan_v16_wall_lmr(4, 8, child_full, 0.5, 1);
+        let late = plan_v16_wall_lmr(12, 8, child_full, 0.5, 1);
+        let very_late = plan_v16_wall_lmr(24, 8, child_full, 0.5, 1);
+        assert!(late.final_reduction > early.final_reduction);
+        assert!(very_late.final_reduction > late.final_reduction);
+    }
+
+    #[test]
+    fn tuning_slider_no_longer_changes_planned_reduction() {
         let mut board = Board::new();
         let mut bfs = BfsScratch::new();
-        let (_, plans) = plan_root_lmr(&mut board, &mut bfs, 8, TIME_REFERENCE_MS, 0.0, 150);
-        assert!(plans.len() >= 100);
+        let (_, at_zero) = plan_root_lmr(&mut board, &mut bfs, 8, TIME_REFERENCE_MS, 0.0, 0);
+        let (_, at_full) = plan_root_lmr(&mut board, &mut bfs, 8, TIME_REFERENCE_MS, 0.0, 150);
+        for (a, b) in at_zero.iter().zip(at_full.iter()) {
+            assert_eq!(a.mv, b.mv);
+            assert_eq!(
+                a.final_reduction, b.final_reduction,
+                "{} reduction must not depend on tuning slider",
+                a.mv
+            );
+            assert_eq!(a.child_depth_used, b.child_depth_used);
+        }
+    }
+
+    #[test]
+    fn engine_default_snapshot_shows_full_depth_and_hard_wall_reductions() {
+        let mut board = Board::new();
+        board.apply_algebraic("e3");
+        board.apply_algebraic("e8");
+        let mut bfs = BfsScratch::new();
+        let (_, plans) = plan_root_lmr(
+            &mut board,
+            &mut bfs,
+            11,
+            TIME_REFERENCE_MS,
+            0.0,
+            100,
+        );
         assert!(
             plans
                 .iter()
-                .all(|p| p.reduction == 0 && p.child_depth_used == p.child_depth_full),
-            "200% tuning → full depth for all"
+                .any(|p| p.reduction == 0 && p.child_depth_used == 10),
+            "hot/PV moves should still keep full depth"
         );
-    }
-
-    #[test]
-    fn tuning_slider_is_monotone_around_default() {
-        let mut board = Board::new();
-        let mut bfs = BfsScratch::new();
-        let id_depth = 8;
-        let child_depth_full = id_depth - 1;
-        let (_, max_cut) = plan_root_lmr(&mut board, &mut bfs, id_depth, TIME_REFERENCE_MS, 0.0, 0);
-        let (_, default_cut) =
-            plan_root_lmr(&mut board, &mut bfs, id_depth, TIME_REFERENCE_MS, 0.0, 100);
-        let (_, full_depth) =
-            plan_root_lmr(&mut board, &mut bfs, id_depth, TIME_REFERENCE_MS, 0.0, 150);
-        for ((a, b), c) in max_cut
-            .iter()
-            .zip(default_cut.iter())
-            .zip(full_depth.iter())
-        {
-            assert_eq!(a.mv, b.mv);
-            assert_eq!(a.mv, c.mv);
-            assert!(
-                a.reduction >= b.reduction && b.reduction >= c.reduction,
-                "{} reductions should decrease as tuning rises: {} >= {} >= {}",
-                a.mv,
-                a.reduction,
-                b.reduction,
-                c.reduction
-            );
-            assert_eq!(
-                c.child_depth_used, child_depth_full,
-                "{} should be full-depth at 150%",
-                c.mv
-            );
-        }
-    }
-
-    #[test]
-    fn tail_cutoff_at_ten_percent_of_peak() {
-        let hmax = 621u32;
-        let dead = scale_lmr_reduction(40, hmax, 8, 20, 10, 11, 0, 2, false);
-        let fringe = scale_lmr_reduction(77, hmax, 8, 20, 10, 11, 0, 2, false);
-        let side = scale_lmr_reduction(400, hmax, 8, 20, 10, 11, 0, 2, false);
-
-        assert_eq!(dead.6, 0, "40/621 ≈ 6.4% → dead tail → child d0 (leaf)");
-        assert!(fringe.6 > dead.6, "77/621 ≈ 12.4% should survive hard tail");
-        assert!(side.6 > fringe.6, "400/621 should keep more depth than 77");
-    }
-
-    #[test]
-    fn zero_tuning_is_cat_ratio_shaped_not_flat() {
-        let hmax = 1000u32;
-        let cold = scale_lmr_reduction(10, hmax, 8, 20, 10, 11, 0, 2, false);
-        let mid = scale_lmr_reduction(500, hmax, 8, 20, 10, 11, 0, 2, false);
-        let hot = scale_lmr_reduction(1000, hmax, 1, 20, 10, 11, 0, 2, false);
-
-        assert_eq!(cold.6, 0, "1% CAT should leaf-eval at child d0");
         assert!(
-            mid.6 > cold.6 && mid.6 < hot.6,
-            "50% CAT should keep an intermediate child depth"
+            plans
+                .iter()
+                .any(|p| p.hard_override == V16HardOverride::BackwardMove.as_str()
+                    && p.child_depth_used <= 1),
+            "backward/useless walls should be visibly reduced to child depth 1"
         );
-        assert_eq!(
-            hot.6, 10,
-            "100% CAT on first move should keep full child depth"
-        );
-    }
-
-    #[test]
-    fn negative_tuning_overrides_cat_shape_toward_absolute_max_cut() {
-        let hmax = 1000u32;
-        let hot_cat_shaped = scale_lmr_reduction(1000, hmax, 1, 20, 10, 11, 0, 2, false);
-        let cold_absolute = scale_lmr_reduction(10, hmax, 8, 20, 10, 11, -500, 2, false);
-
-        assert_eq!(
-            hot_cat_shaped.6, 10,
-            "0% still honors a 100% CAT first move"
-        );
-        assert_eq!(
-            cold_absolute.6, 0,
-            "-500% forces leaf eval on dead-tail move"
-        );
-    }
-
-    #[test]
-    fn protected_moves_changed_stays_zero() {
-        let mut board = Board::new();
-        let mut bfs = BfsScratch::new();
-        for pct in [-500, 0, 50, 100, 150] {
-            let (_, plans) = plan_root_lmr(&mut board, &mut bfs, 8, TIME_REFERENCE_MS, 0.0, pct);
-            let summary = summarize_plans(&plans);
-            assert_eq!(
-                summary.protected_moves_changed, 0,
-                "protected must not change at {pct}%"
-            );
-        }
     }
 }

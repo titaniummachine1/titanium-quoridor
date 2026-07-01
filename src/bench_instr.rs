@@ -30,6 +30,8 @@ pub struct BenchInstr {
     pub stop_reason: &'static str,
     pub evaluate: OpStat,
     pub eval_race_bound: OpStat,
+    pub race_gate_cached: OpStat,
+    pub race_winner_table: OpStat,
     pub eval_route_features: OpStat,
     pub eval_nnue_prep: OpStat,
     pub eval_nnue_infer: OpStat,
@@ -104,9 +106,11 @@ impl BenchInstr {
         }
         let nodes = self.search_nodes;
         let total_ns = self.measured_ns;
-        let ops: [(&str, &OpStat); 29] = [
+        let ops: [(&str, &OpStat); 31] = [
             ("evaluate", &self.evaluate),
             ("eval_race_bound", &self.eval_race_bound),
+            ("race_gate_cached", &self.race_gate_cached),
+            ("race_winner_table", &self.race_winner_table),
             ("eval_route_features", &self.eval_route_features),
             ("eval_nnue_prep", &self.eval_nnue_prep),
             ("eval_nnue_infer", &self.eval_nnue_infer),

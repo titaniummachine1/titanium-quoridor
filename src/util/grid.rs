@@ -101,13 +101,7 @@ pub const fn flood_bit_index(row: u8, col: u8) -> u32 {
 
 #[inline]
 pub fn flood_bit_sq(sq: u8) -> u128 {
-    crate::bench_instr::count(
-        |b| &mut b.flood_bit_sq,
-        || {
-            let (r, c) = unpack_square(sq);
-            1u128 << flood_bit_index(r, c)
-        },
-    )
+    crate::bench_instr::count(|b| &mut b.flood_bit_sq, || FLOOD_BIT_BY_SQ[sq as usize])
 }
 
 #[inline]
@@ -123,19 +117,39 @@ fn flood_sq_from_bit_inner(bit: u32) -> Option<u8> {
     if bit >= 128 {
         return None;
     }
-    let row = bit / FLOOD_STRIDE;
-    let col = bit % FLOOD_STRIDE;
-    if row < FLOOD_ROW_PAD || row > FLOOD_ROW_PAD + 8 {
+    let sq = FLOOD_SQ_BY_BIT[bit as usize];
+    if sq == u8::MAX {
         return None;
     }
-    if col < FLOOD_COL_PAD || col > FLOOD_COL_PAD + 8 {
-        return None;
-    }
-    Some(square_index(
-        (row - FLOOD_ROW_PAD) as u8,
-        (col - FLOOD_COL_PAD) as u8,
-    ))
+    Some(sq)
 }
+
+const fn flood_bit_by_sq_table() -> [u128; 81] {
+    let mut out = [0u128; 81];
+    let mut sq = 0u8;
+    while sq < 81 {
+        let row = sq / 9;
+        let col = sq % 9;
+        out[sq as usize] = 1u128 << flood_bit_index(row, col);
+        sq += 1;
+    }
+    out
+}
+
+const fn flood_sq_by_bit_table() -> [u8; 128] {
+    let mut out = [u8::MAX; 128];
+    let mut sq = 0u8;
+    while sq < 81 {
+        let row = sq / 9;
+        let col = sq % 9;
+        out[flood_bit_index(row, col) as usize] = sq;
+        sq += 1;
+    }
+    out
+}
+
+pub const FLOOD_BIT_BY_SQ: [u128; 81] = flood_bit_by_sq_table();
+pub const FLOOD_SQ_BY_BIT: [u8; 128] = flood_sq_by_bit_table();
 
 const fn flood_playable_mask() -> u128 {
     let mut mask = 0u128;

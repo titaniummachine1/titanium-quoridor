@@ -96,7 +96,19 @@ fn position_moves(name: &str) -> &'static [&'static str] {
             "d6", "b5v", "f3v", "e7v", "c3h", "d7h", "b2v", "h6h",
         ],
         "low-wall" => &["e2", "e8", "e3", "e7", "d4h"],
-        other => panic!("unknown position {other}; use startpos|c3h-midgame|wall-maze|low-wall"),
+        "endgame-c5" => &[
+            "e2", "e8", "e3", "e7", "e4", "e6", "f3h", "c3h", "d1h", "d4v", "e2v", "f6h", "d6v",
+            "d8v", "h3h", "e7h", "e4h", "h6h", "b1h", "f6", "f7v", "f5", "e3", "g5", "g4h", "h5",
+            "d3", "i5", "c3", "i4", "b3", "h4", "b4", "g4", "b5", "f4", "b6", "b6h", "a2v", "e4",
+            "b5", "e3",
+        ],
+        "dense-maze" => &[
+            "e2", "e8", "e3", "e7", "e4", "e6", "e3h", "f6h", "c3h", "d6h", "a3h", "h6h", "d4",
+            "f6", "f5v", "c4v", "d5", "d5h", "g3h", "b6h", "e4h", "f5", "b5h",
+        ],
+        other => panic!(
+            "unknown position {other}; use startpos|c3h-midgame|wall-maze|low-wall|endgame-c5|dense-maze"
+        ),
     }
 }
 
@@ -367,6 +379,17 @@ fn bench_profile(sec: u64, position: &str, full: bool, threads: usize) {
     if let Some(instr) = bench_instr::take_json_report() {
         println!("{instr}");
     }
+    println!("{}", r.race_outcome_stats.to_json());
+    bench_instr::with_bench(|b| {
+        eprintln!(
+            "race profile: gate_cached_ns={} race_tbl_solve_ns={} gate1_hit_rate={:.1}% race_tbl_rebuilds={} race_tbl_hits={}",
+            b.race_gate_cached.ns,
+            b.race_winner_table.ns,
+            r.race_outcome_stats.gate1_hit_rate_pct(),
+            r.race_outcome_stats.race_tbl_lru_rebuilds,
+            r.race_outcome_stats.race_tbl_lru_hits,
+        );
+    });
 }
 
 fn parse_flag(args: &[String], name: &str) -> bool {

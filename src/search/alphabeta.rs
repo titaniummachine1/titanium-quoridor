@@ -7,7 +7,7 @@ use crate::cat::constants::DIST_PENALTY;
 use crate::cat::prune::OrderExtras;
 use crate::cat::prune::{
     self, collect_search_moves, get_shortest_path, is_tactical_move, move_corridor_attention,
-    move_impact_heat_race, move_immediate_gain, order_moves, our_path_gain, path_distance,
+    move_immediate_gain, move_impact_heat_race, order_moves, our_path_gain, path_distance,
 };
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move, Player};
@@ -1111,8 +1111,7 @@ fn negamax_inner(
 
     let mut max_move_impact = 0u32;
     for i in 0..n {
-        let impact = move_impact_heat_race(board, buf[i], &impact_cat, state.bfs)
-        .max(0) as u32;
+        let impact = move_impact_heat_race(board, buf[i], &impact_cat, state.bfs).max(0) as u32;
         max_move_impact = max_move_impact.max(impact);
     }
 
@@ -1186,7 +1185,7 @@ fn negamax_inner(
 
         // [LMR_BLOCK_START]
         // CAT × move-index LMR — normalize against max legal-move impact at this node.
-        let lmr_protected = moves_searched == 0 || is_tactical || depth < LMR_MIN_DEPTH;
+        let lmr_skip_reduction = moves_searched == 0 || is_tactical || depth < LMR_MIN_DEPTH;
         let reduction = cat_index_lmr_reduction(
             child_depth_full,
             move_rank,
@@ -1194,7 +1193,7 @@ fn negamax_inner(
             impact_cm,
             max_move_impact,
             aggression_g,
-            lmr_protected,
+            lmr_skip_reduction,
             first_reducible_rank,
         );
         // [LMR_BLOCK_END]

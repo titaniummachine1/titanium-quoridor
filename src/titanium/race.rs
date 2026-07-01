@@ -298,15 +298,11 @@ fn arrival_ply(side: usize, turn: usize, distance: u8) -> i16 {
 /// Gate 1 only (ETA `delta_eta > 1` interception-impossible). Gate 2 is
 /// non-decisive (Case B — see the body). Used by audits and by
 /// [`race_outcome_detailed`] before the winner-table tier.
-fn race_outcome_gates_ab(g: &mut GameState) -> RaceBound {
+pub fn race_outcome_gates_ab_with_dist(g: &GameState, d0: &[u8; 81], d1: &[u8; 81]) -> RaceBound {
     debug_assert!(
         g.pawn[0] >= 9 && g.pawn[1] < 72,
         "race_outcome on terminal state"
     );
-    let mut d0 = [0u8; 81];
-    let mut d1 = [0u8; 81];
-    g.compute_dist(0, &mut d0);
-    g.compute_dist(1, &mut d1);
 
     let r0 = d0[g.pawn[0]];
     let r1 = d1[g.pawn[1]];
@@ -322,7 +318,7 @@ fn race_outcome_gates_ab(g: &mut GameState) -> RaceBound {
         let chaser = runner ^ 1;
         let runner_eta = if runner == 0 { eta0 } else { eta1 };
 
-        let d_runner_goal: &[u8; 81] = if runner == 0 { &d0 } else { &d1 };
+        let d_runner_goal: &[u8; 81] = if runner == 0 { d0 } else { d1 };
         let chaser_d = d_runner_goal[g.pawn[chaser]];
 
         let fires = chaser_d == u8::MAX || {
@@ -350,6 +346,92 @@ fn race_outcome_gates_ab(g: &mut GameState) -> RaceBound {
     RaceBound::Unknown
 }
 
+fn race_outcome_gates_ab(g: &mut GameState) -> RaceBound {
+    let mut d0 = [0u8; 81];
+    let mut d1 = [0u8; 81];
+    g.compute_dist(0, &mut d0);
+    g.compute_dist(1, &mut d1);
+    race_outcome_gates_ab_with_dist(g, &d0, &d1)
+}
+
+/// Counters for the cached-distance race fast path (think-level aggregate).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RaceOutcomeStats {
+    pub calls: u64,
+    pub gate1_decisive: u64,
+    pub gate1_unknown: u64,
+    /// `race_tbl` LRU hits this think (not Tier-3 winner scratch).
+    pub race_tbl_lru_hits: u64,
+    /// New `race_tbl` builds this think (`solve_race_config` via LRU).
+    pub race_tbl_lru_rebuilds: u64,
+    /// Stage 1: hands-empty eval resolved from an existing `race_tbl` LRU entry.
+    pub resolved_memo: u64,
+    /// Stage 2: Gate 1 proved a win bound.
+    pub resolved_gate1: u64,
+    /// Stage 2: Gate 1 proved a loss floor (upper bound).
+    pub resolved_gate1_loss: u64,
+    /// Stage 3: `race_tbl(false)` returned a decisive retrograde value.
+    pub resolved_race_tbl: u64,
+    /// Hands-empty distance heuristic (no proof).
+    pub resolved_race_heuristic: u64,
+    /// Stage 4: `cert_win` memo hit (`cw_cache` proven entry).
+    pub resolved_cert_memo: u64,
+    /// Stage 4: `cert_win` freshly proved a win this call.
+    pub resolved_cert_win: u64,
+}
+
+impl RaceOutcomeStats {
+    pub fn gate1_hit_rate_pct(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            100.0 * self.gate1_decisive as f64 / self.calls as f64
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        format!(
+            r#"{{"calls":{},"gate1_decisive":{},"gate1_unknown":{},"race_tbl_lru_hits":{},"race_tbl_lru_rebuilds":{},"gate1_hit_rate_pct":{:.2},"resolved_memo":{},"resolved_gate1":{},"resolved_gate1_loss":{},"resolved_race_tbl":{},"resolved_race_heuristic":{},"resolved_cert_memo":{},"resolved_cert_win":{}}}"#,
+            self.calls,
+            self.gate1_decisive,
+            self.gate1_unknown,
+            self.race_tbl_lru_hits,
+            self.race_tbl_lru_rebuilds,
+            self.gate1_hit_rate_pct(),
+            self.resolved_memo,
+            self.resolved_gate1,
+            self.resolved_gate1_loss,
+            self.resolved_race_tbl,
+            self.resolved_race_heuristic,
+            self.resolved_cert_memo,
+            self.resolved_cert_win,
+        )
+    }
+}
+
+/// Service A Gate 1 only — cached `d0`/`d1`, no `compute_dist`, no winner-table tier.
+/// Search leaf path: decisive bound here, `Unknown` → `race_tbl(false)` LRU (ACE v13).
+pub fn race_outcome_with_dist(
+    g: &GameState,
+    d0: &[u8; 81],
+    d1: &[u8; 81],
+    stats: &mut RaceOutcomeStats,
+) -> RaceBound {
+    stats.calls += 1;
+
+    let ab = crate::bench_instr::record(
+        |b| &mut b.race_gate_cached,
+        || race_outcome_gates_ab_with_dist(g, d0, d1),
+    );
+
+    if ab != RaceBound::Unknown {
+        stats.gate1_decisive += 1;
+    } else {
+        stats.gate1_unknown += 1;
+    }
+    ab
+}
+
 /// Forced-outcome bound for the side to move at the current hands-empty state.
 ///
 /// Sound on ANY fixed-wall topology. Three decision tiers:
@@ -364,7 +446,7 @@ pub fn race_outcome_detailed(g: &mut GameState, s: &mut RaceScratch) -> RaceDedu
     let bound = if ab != RaceBound::Unknown {
         ab
     } else {
-        winner_table_bound(g, s)
+        winner_table_bound(g, s, None)
     };
     RaceDeduction {
         estimated_plies: ply_estimate_for_bound(g, bound),
@@ -756,10 +838,16 @@ fn wall_topology_key(g: &GameState) -> u64 {
 /// winner-table verdict for the current state and translate it to a sound
 /// α-β bound. Builds the table at most once per wall topology; subsequent
 /// queries on the same topology are O(1).
-fn winner_table_bound(g: &mut GameState, s: &mut RaceScratch) -> RaceBound {
+fn winner_table_bound(
+    g: &mut GameState,
+    s: &mut RaceScratch,
+    _stats: Option<&mut RaceOutcomeStats>,
+) -> RaceBound {
     let key = wall_topology_key(g);
-    if s.winner_key != key || s.winner_tbl.is_none() {
-        let tbl = build_winner_table(g);
+    let rebuild = s.winner_key != key || s.winner_tbl.is_none();
+    if rebuild {
+        let tbl =
+            crate::bench_instr::record(|b| &mut b.race_winner_table, || build_winner_table(g));
         s.winner_tbl = Some(Box::new(tbl));
         s.winner_key = key;
     }

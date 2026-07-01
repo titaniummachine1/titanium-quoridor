@@ -621,8 +621,16 @@ mod tests {
         let cat = build_impact_heatmap(&board);
         let w = board.pawn(Player::One);
         let b = board.pawn(Player::Two);
-        assert_eq!(cat.square_heat(w.0, w.1), 0, "white pawn entry must not be corridor heat");
-        assert_eq!(cat.square_heat(b.0, b.1), 0, "black pawn entry must not be corridor heat");
+        assert_eq!(
+            cat.square_heat(w.0, w.1),
+            0,
+            "white pawn entry must not be corridor heat"
+        );
+        assert_eq!(
+            cat.square_heat(b.0, b.1),
+            0,
+            "black pawn entry must not be corridor heat"
+        );
     }
 
     #[test]
@@ -635,9 +643,7 @@ mod tests {
         let mut bfs = BfsScratch::new();
         let stm = board.side();
         let our_dist = bfs.shortest_distance(&board, stm).unwrap_or(255);
-        let opp_dist = bfs
-            .shortest_distance(&board, stm.opposite())
-            .unwrap_or(255);
+        let opp_dist = bfs.shortest_distance(&board, stm.opposite()).unwrap_or(255);
         assert_eq!(our_dist, opp_dist, "tied sprint fixture");
 
         let race = build_impact_heatmap_for_stm(&board, &mut bfs);

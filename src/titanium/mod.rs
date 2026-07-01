@@ -27,11 +27,14 @@
 
 pub mod cert_bridge;
 pub mod certify;
+pub mod dataset_state;
 pub mod dist;
 pub mod field_planes;
 pub mod fields_viz;
 pub mod game;
 pub mod net;
+pub mod opening_book;
+pub mod opening_book_embedded;
 pub mod oracle;
 pub mod packed_state;
 pub mod perft;
@@ -46,16 +49,18 @@ pub mod wall_ignore_corridor;
 
 pub use game::GameState;
 pub use packed_state::{
-    decode_packed_state, pack_state, titanium_game_from_packed, FEATURE_SCHEMA, PACKED_STATE_LEN,
-    POSITION_SCHEMA_VERSION,
+    ace_pawn_cell_to_python, decode_packed_state, pack_state, pack_state_dag,
+    titanium_game_from_packed, FEATURE_SCHEMA, PACKED_STATE_LEN, POSITION_SCHEMA_VERSION,
 };
 pub use perft::{
     default_timeout, oracle_nodes, perft_engine_timed, perft_titanium_native_timed,
     perft_titanium_ti_timed, perft_titanium_timed, TimedPerftResult, TITANIUM_PERFT4_STARTPOS,
 };
 pub use search::{
-    board_move_to_move_id, ReductionProbeEvent, ReductionShadowStats, ThinkResult, TitaniumSearch,
+    board_move_to_move_id, format_root_defense_diag_json, ReductionProbeEvent, ReductionShadowStats,
+    RootDefenseDiag, ThinkResult, TitaniumSearch,
 };
+pub use race::RaceOutcomeStats;
 pub use session::run_titanium_session_stdio;
 pub use session_v15::run_v15_session_stdio;
 
@@ -118,7 +123,7 @@ pub fn move_id_to_algebraic(m: i16) -> String {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TitaniumParams {
     pub time_ms: u64,
     pub max_depth: i32,
@@ -133,6 +138,10 @@ pub struct TitaniumParams {
     pub log: bool,
     /// Early Move Extensions on ordered wall moves (mirror of graduated LMR).
     pub eme: bool,
+    /// Root opening book mode (`off` | `order` | `play`).
+    pub book: crate::titanium::opening_book::OpeningBookMode,
+    /// Optional path to opening DAG SQLite (default: training/data/opening_book/...).
+    pub book_db: Option<String>,
 }
 
 impl Default for TitaniumParams {
@@ -146,6 +155,8 @@ impl Default for TitaniumParams {
             ti_movegen: false,
             log: false,
             eme: false,
+            book: crate::titanium::opening_book::OpeningBookMode::Off,
+            book_db: None,
         }
     }
 }
@@ -179,6 +190,16 @@ pub fn titanium_genmove(
     };
     if params.eme {
         search.enable_eme();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::path::PathBuf;
+        let db = params.book_db.as_deref().map(PathBuf::from);
+        search.set_opening_book(params.book, db);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        search.set_opening_book(params.book, None);
     }
     #[cfg(not(target_arch = "wasm32"))]
     let result = search.think_with_threads(
@@ -304,6 +325,8 @@ mod tests {
             ti_movegen: true,
             log: false,
             eme: false,
+            book: crate::titanium::opening_book::OpeningBookMode::Off,
+            book_db: None,
         };
         let (alg, result) = titanium_genmove(&moves, params, "ace-v13-ti").expect("best move");
         assert_eq!(alg, "a9");

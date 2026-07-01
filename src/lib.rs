@@ -70,6 +70,8 @@ pub use util::perft::{
 // Titanium v15 production API (formerly `acev13` module path).
 pub use titanium::fields_viz;
 #[cfg(not(target_arch = "wasm32"))]
+pub use titanium::opening_book;
+#[cfg(not(target_arch = "wasm32"))]
 pub use titanium::reduction_shadow_probe;
 pub use titanium::{
     algebraic_to_move_id, board_move_to_move_id, decode_packed_state, move_id_to_algebraic,

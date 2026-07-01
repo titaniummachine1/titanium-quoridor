@@ -217,7 +217,11 @@ pub fn run() {
     for sym in 0..8 {
         for swap_orient in [false, true] {
             for msb_index in [false, true] {
-                let m = Mapping { sym, swap_orient, msb_index };
+                let m = Mapping {
+                    sym,
+                    swap_orient,
+                    msb_index,
+                };
                 let mut all_ok = true;
                 for game in 0..15 {
                     match setup(game, m) {
@@ -246,7 +250,11 @@ pub fn run() {
         for sym in 0..8 {
             for msb_index in [false, true] {
                 for swap_orient in [false, true] {
-                    let m = Mapping { sym, swap_orient, msb_index };
+                    let m = Mapping {
+                        sym,
+                        swap_orient,
+                        msb_index,
+                    };
                     let mut ok = 0;
                     let mut applied = 0;
                     for game in 0..15 {
@@ -269,7 +277,10 @@ pub fn run() {
     let m = winners[0];
     println!(
         "MAPPING FOUND: sym={} swap_orient={} msb_index={}  ({} candidate(s))",
-        m.sym, m.swap_orient, m.msb_index, winners.len()
+        m.sym,
+        m.swap_orient,
+        m.msb_index,
+        winners.len()
     );
     // Validate depths 1..5 against the reference.
     let max_depth = std::env::args()

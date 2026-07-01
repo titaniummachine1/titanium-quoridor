@@ -163,6 +163,7 @@ fn emit_ace_progress(
     white_dist: u8,
     black_dist: u8,
     elapsed_ms: u64,
+    #[cfg(feature = "wasm")] wasm_cb: Option<&js_sys::Function>,
 ) {
     let mut depth_json = String::new();
     for (i, e) in depth_log.iter().enumerate() {
@@ -175,18 +176,18 @@ fn emit_ace_progress(
             e.depth, e.score, e.nodes, e.elapsed_ms, e.marginal_nodes, pv
         ));
     }
-    eprintln!(
-        "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"depthLog\":[{}]}}",
-        engine_label,
-        engine_label,
-        search_depth,
-        nodes,
-        root_score,
-        white_dist,
-        black_dist,
-        elapsed_ms,
-        depth_json
+    let json = format!(
+        r#"{{"engine":"{engine_label}","stoppedBy":"{engine_label}","searchDepth":{search_depth},"nodes":{nodes},"rootScore":{root_score},"whiteDist":{white_dist},"blackDist":{black_dist},"elapsedMs":{elapsed_ms},"depthLog":[{depth_json}]}}"#
     );
+    #[cfg(feature = "wasm")]
+    if let Some(f) = wasm_cb {
+        let _ = f.call1(
+            &wasm_bindgen::JsValue::NULL,
+            &wasm_bindgen::JsValue::from_str(&json),
+        );
+        return;
+    }
+    eprintln!("info json {json}");
     let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
@@ -285,6 +286,8 @@ pub struct AceSearch {
     stream_last_emit_nodes: u64,
     stream_last_emit_ms: u64,
     stream_last_best: i16,
+    #[cfg(feature = "wasm")]
+    wasm_progress: Option<js_sys::Function>,
 }
 
 /// Periodic progress cadence: every 64K nodes AND ≥ 100ms apart — stdout/stderr
@@ -372,7 +375,14 @@ impl AceSearch {
             stream_last_emit_nodes: 0,
             stream_last_emit_ms: 0,
             stream_last_best: 0,
+            #[cfg(feature = "wasm")]
+            wasm_progress: None,
         })
+    }
+
+    #[cfg(feature = "wasm")]
+    pub fn set_wasm_progress(&mut self, cb: Option<js_sys::Function>) {
+        self.wasm_progress = cb;
     }
 
     /// Enable Early Move Extensions — same gates/tuning as graduated LMR, early indices.
@@ -472,6 +482,8 @@ impl AceSearch {
             white_dist,
             black_dist,
             elapsed_ms,
+            #[cfg(feature = "wasm")]
+            self.wasm_progress.as_ref(),
         );
     }
 

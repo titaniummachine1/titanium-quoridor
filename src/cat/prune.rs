@@ -715,9 +715,7 @@ pub fn cat_heavy_fringe_cutoff_cm(cat_ref_max: u16) -> i32 {
     if cat_ref_max == 0 {
         return 0;
     }
-    i32::from(
-        cat_ref_max.saturating_mul(crate::cat::constants::CAT_HEAVY_FRINGE_RATIO_PCT) / 100,
-    )
+    i32::from(cat_ref_max.saturating_mul(crate::cat::constants::CAT_HEAVY_FRINGE_RATIO_PCT) / 100)
 }
 
 /// Above dead tail but still weak (e.g. 41–80 cm when peak is 400) — heavy cut, not absolute max.
@@ -820,9 +818,7 @@ pub fn cat_heat_child_depth(
         return 1.min(child_depth_full);
     }
     if cat_ref_max > 0 && cat_is_heavy_fringe(cat_cm, cat_ref_max) {
-        let heavy = ((child_depth_full as f32) * 0.28)
-            .round()
-            .max(2.0) as u32;
+        let heavy = ((child_depth_full as f32) * 0.28).round().max(2.0) as u32;
         return heavy.min(child_depth_full);
     }
     if cat_ref_max == 0 || cat_cm <= 0 {
@@ -1129,8 +1125,7 @@ pub fn move_impact_heat_race(
                 if !square_ahead_of_any_pawn(board, masks, sq) {
                     continue;
                 }
-                let on_path =
-                    white_path[..wl].contains(&sq) || black_path[..bl].contains(&sq);
+                let on_path = white_path[..wl].contains(&sq) || black_path[..bl].contains(&sq);
                 if !on_path {
                     continue;
                 }
@@ -1465,8 +1460,14 @@ mod tests {
         assert_eq!(cat_heat_child_depth(10, 400, 60, full), 1);
         let at_41 = cat_heat_child_depth(41, 400, 60, full);
         let at_77 = cat_heat_child_depth(77, 400, 60, full);
-        assert!(at_41 >= 2, "41cm heavy fringe should keep >1 ply, got {at_41}");
-        assert!(at_77 >= 2, "77cm heavy fringe should keep >1 ply, got {at_77}");
+        assert!(
+            at_41 >= 2,
+            "41cm heavy fringe should keep >1 ply, got {at_41}"
+        );
+        assert!(
+            at_77 >= 2,
+            "77cm heavy fringe should keep >1 ply, got {at_77}"
+        );
         assert!(
             at_41 > 1 && at_77 > 1,
             "heavy fringe must not use absolute max cut"

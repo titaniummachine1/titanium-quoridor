@@ -91,6 +91,39 @@ pub fn pack_state(g: &GameState) -> [u8; PACKED_STATE_LEN] {
     out
 }
 
+/// ACE pawn cell index → Python `PositionState` cell index (row 0 = rank 1).
+#[inline]
+pub fn ace_pawn_cell_to_python(ace_cell: usize) -> u8 {
+    let ace_row = ace_cell / 9;
+    let col = ace_cell % 9;
+    ((8 - ace_row) * 9 + col) as u8
+}
+
+/// Packed state bytes identical to `PositionState.packed_state()` / opening DAG keys.
+/// Differs from [`pack_state`] (training round-trip) in pawn cell coordinates and STM.
+pub fn pack_state_dag(g: &GameState) -> [u8; PACKED_STATE_LEN] {
+    let mut hw_mask: u64 = 0;
+    let mut vw_mask: u64 = 0;
+    for slot in 0..64 {
+        if g.hw[slot] != 0 {
+            hw_mask |= 1u64 << slot;
+        }
+        if g.vw[slot] != 0 {
+            vw_mask |= 1u64 << slot;
+        }
+    }
+    let mut out = [0u8; PACKED_STATE_LEN];
+    out[0] = POSITION_SCHEMA_VERSION;
+    out[1] = ace_pawn_cell_to_python(g.pawn[0]);
+    out[2] = ace_pawn_cell_to_python(g.pawn[1]);
+    out[3] = g.wl[0] as u8;
+    out[4] = g.wl[1] as u8;
+    out[5] = g.turn as u8;
+    out[8..16].copy_from_slice(&hw_mask.to_le_bytes());
+    out[16..24].copy_from_slice(&vw_mask.to_le_bytes());
+    out
+}
+
 fn recompute_hash(g: &mut GameState) {
     let z = &ZOBRIST;
     let mut lo = z.pawn_lo[0][g.pawn[0]] ^ z.pawn_lo[1][g.pawn[1]];
@@ -192,6 +225,26 @@ mod tests {
         let mut bad = pack_state(&GameState::new());
         bad[0] = 2;
         assert!(decode_packed_state(&bad).is_err());
+    }
+
+    #[test]
+    fn pack_state_dag_matches_python_root() {
+        let packed = pack_state_dag(&GameState::new());
+        assert_eq!(
+            packed,
+            [
+                1, 4, 76, 10, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+    }
+
+    #[test]
+    fn pack_state_dag_matches_python_after_e2_e8() {
+        let g = game_from_moves(&["e2", "e8"]);
+        let packed = pack_state_dag(&g);
+        assert_eq!(packed[1], 13);
+        assert_eq!(packed[2], 67);
+        assert_eq!(packed[5], 0);
     }
 
     #[test]

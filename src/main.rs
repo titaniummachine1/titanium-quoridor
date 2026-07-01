@@ -563,7 +563,9 @@ fn run_eval(args: &[String]) {
     // This command's purpose is the PURE NET eval (see doc above), so disable cert
     // to keep py↔engine parity exact for training.
     let mut s = TitaniumSearch::grafted_no_raceproof(g, None);
-    if args.iter().any(|a| a == "--json") {
+    if args.iter().any(|a| a == "--parity-trace") {
+        println!("{}", s.eval_parity_trace_json());
+    } else if args.iter().any(|a| a == "--json") {
         println!("{}", s.eval_dump_json());
     } else {
         println!("eval {}", s.eval_position());
@@ -669,6 +671,7 @@ fn run_lmr(args: &[String]) {
     let mut board = Board::new();
     let mut time_ms = DEFAULT_TIME_MS;
     let mut id_depth = 8u32;
+    let mut tuning_percent = titanium::titanium::search::CAT_LMR_DEFAULT_TUNING_PERCENT;
     let mut i = 2usize;
     while i < args.len() {
         let arg = &args[i];
@@ -681,6 +684,12 @@ fn run_lmr(args: &[String]) {
         } else if arg == "--depth" {
             if let Some(d) = args.get(i + 1).and_then(|s| s.parse::<u32>().ok()) {
                 id_depth = d;
+                i += 2;
+                continue;
+            }
+        } else if arg == "--tuning" {
+            if let Some(pct) = args.get(i + 1).and_then(|s| s.parse::<i32>().ok()) {
+                tuning_percent = pct.clamp(-500, 150);
                 i += 2;
                 continue;
             }
@@ -699,7 +708,10 @@ fn run_lmr(args: &[String]) {
         }
         i += 1;
     }
-    println!("{}", lmr_snapshot_json(&mut board, time_ms, id_depth, 100));
+    println!(
+        "{}",
+        lmr_snapshot_json(&mut board, time_ms, id_depth, tuning_percent)
+    );
 }
 
 /// EXPERIMENTAL — measure how well eval-guided rollouts predict the deep
@@ -1652,6 +1664,8 @@ fn run_genmove_ace(args: &[String]) {
     let cat = mode == "ace-cat";
     let ti_movegen = mode == "ace-ti";
     let eme0 = label.contains("pmc");
+    let mut book = titanium::opening_book::OpeningBookMode::Off;
+    let mut book_db: Option<String> = None;
     let mut time_ms = 4000u64;
     let mut max_depth = 30i32;
     let mut threads = 1usize;
@@ -1702,6 +1716,25 @@ fn run_genmove_ace(args: &[String]) {
             eme = true;
             i += 1;
             continue;
+        } else if arg == "--book" {
+            if let Some(mode) = args
+                .get(i + 1)
+                .and_then(|s| titanium::opening_book::OpeningBookMode::parse(s))
+            {
+                book = mode;
+                i += 2;
+                continue;
+            }
+            eprintln!("error --book requires off|order|play");
+            std::process::exit(2);
+        } else if arg == "--book-db" {
+            if let Some(path) = args.get(i + 1) {
+                book_db = Some(path.clone());
+                i += 2;
+                continue;
+            }
+            eprintln!("error --book-db requires a path");
+            std::process::exit(2);
         } else if arg == "--engine" {
             i += 2;
             continue;
@@ -1776,7 +1809,8 @@ fn run_genmove_ace(args: &[String]) {
             threads,
             full,
             log,
-            ..Default::default()
+            book,
+            book_db,
         };
         match titanium::titanium_genmove(&moves, params, label) {
             Some((algebraic, info)) => {
@@ -1819,8 +1853,15 @@ fn run_genmove_ace(args: &[String]) {
                     .collect::<Vec<_>>()
                     .join(",");
                 let root_score_text = score_text(info.score);
+                let book_json = info
+                    .opening_book
+                    .as_ref()
+                    .map(titanium::opening_book::diagnostics_json)
+                    .unwrap_or_else(|| "null".to_string());
+                let root_defense_json =
+                    titanium::titanium::format_root_defense_diag_json(&info.root_defense_diag);
                 eprintln!(
-                    "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"rootScoreText\":\"{}\",\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"mainThreadNodes\":{},\"helperNodes\":[{}],\"totalNodes\":{},\"mainCompletedDepth\":{},\"helperCompletedDepths\":[{}],\"rootWidths\":[{}],\"depthLog\":[{}]}}",
+                    "info json {{\"engine\":\"{}\",\"stoppedBy\":\"{}\",\"searchDepth\":{},\"nodes\":{},\"rootScore\":{},\"rootScoreText\":\"{}\",\"whiteDist\":{},\"blackDist\":{},\"elapsedMs\":{},\"mainThreadNodes\":{},\"helperNodes\":[{}],\"totalNodes\":{},\"mainCompletedDepth\":{},\"helperCompletedDepths\":[{}],\"rootWidths\":[{}],\"depthLog\":[{}],\"openingBook\":{},\"rootDefense\":{}}}",
                     label, label, info.depth, info.nodes, info.score,
                     root_score_text,
                     info.white_dist, info.black_dist, info.ms,
@@ -1830,7 +1871,9 @@ fn run_genmove_ace(args: &[String]) {
                     info.main_completed_depth,
                     helper_depths,
                     root_widths,
-                    depth_json
+                    depth_json,
+                    book_json,
+                    root_defense_json
                 );
                 println!("bestmove {}", algebraic);
             }

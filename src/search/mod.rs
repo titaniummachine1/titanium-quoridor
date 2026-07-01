@@ -1,11 +1,11 @@
 //! Search — αβ negamax, TT, pipeline, genmove entry.
 
 pub mod alphabeta;
+pub mod cat_index_lmr;
 pub mod context;
 pub mod deprecated;
 pub mod genmove;
 pub mod greedy;
-pub mod cat_index_lmr;
 pub mod lmr_profile;
 pub mod lmr_viz;
 pub mod move_pack;
@@ -18,6 +18,7 @@ pub mod session;
 pub mod session_stdio;
 pub mod tt;
 pub mod uci;
+pub mod v16_lmr;
 
 pub use alphabeta::{
     run_search, search_best_move, SearchConfig, SearchReport, DEFAULT_MAX_ID_DEPTH,

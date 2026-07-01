@@ -20,44 +20,46 @@
 //!   commitment gate keeps the wall when no certifier exists).
 
 use crate::titanium::dist::{
-    fill_ace_dist_from_pawn, fill_ace_dist_to_goal_with_masks, fill_choke_points, fill_contested,
-    fill_corridor_delta, fill_distance_layers, fill_path_crossing, fill_sparse_route_masks,
-    shortest_route_bits,
+    fill_ace_dist_from_pawn, fill_ace_dist_layers_to_goal, fill_ace_dist_to_goal_with_masks,
+    fill_choke_points, fill_contested, fill_corridor_delta, fill_sparse_route_masks,
+    materialize_distance_layers, shortest_route_bits, width_in_layers,
 };
 use crate::titanium::move_id_to_board;
 use crate::util::clock::{Duration, Instant};
 
 use crate::cat::prune::{
-    cat_heat_refs_from_scores, cat_v16_lmr_fringe_pct_for_worker, cat_v16_lmr_reduction,
-    gap_play_zone_mask, get_shortest_path, move_corridor_attention_with_denial,
-    move_corridor_attention_with_path, move_impact_heat, wall_in_dead_zone, wall_should_search,
-    CatHeatRefs,
+    cat_v16_lmr_fringe_pct_for_worker, gap_play_zone_mask, get_shortest_path,
+    move_corridor_attention_with_denial, move_corridor_attention_with_path, move_impact_heat,
+    wall_in_dead_zone, wall_should_search,
 };
 use crate::cat::CorridorAttention;
 use crate::core::board::{Board, Move as BoardMove, Player, Undo, WallOrientation};
 use crate::movegen::{
-    generate_legal_moves_slice_cached, geometric_wall_len_cached, GeometricWallCache,
-    GeometricWallCacheRole, GeometricWallCacheStats, MAX_LEGAL_MOVES,
+    generate_legal_moves_slice_cached, GeometricWallCache, GeometricWallCacheStats, MAX_LEGAL_MOVES,
 };
 use crate::path::flood::expand_frontier;
 use crate::path::masks::DirMasks;
 use crate::path::BfsScratch;
+use crate::search::v16_lmr::{
+    plan_v16_pawn_lmr, plan_v16_wall_lmr, V16HardOverride, ACE_LMR_AFTER_MOVE, ACE_LMR_MIN_DEPTH,
+};
 use crate::titanium::certify::{certify, CertifyOpts};
 use crate::titanium::game::{GameState, ZOBRIST};
 use crate::titanium::net::{net, net_frozen, Net, NET_BKT, NET_H, NET_MIRC, NET_MIRS};
 use crate::titanium::packed_state::FEATURE_SCHEMA;
 use crate::titanium::race::{
-    race_outcome, solve_race_config, RaceBound, RaceScratch, RACE_MATE, RACE_STATES,
+    race_outcome_with_dist, solve_race_config, RaceBound, RaceOutcomeStats, RaceScratch, RACE_MATE,
+    RACE_STATES,
 };
 use crate::titanium::reduction_sidecar::ReductionSidecar;
-use crate::util::grid::{flood_bit_sq, flood_sq_from_bit, FLOOD_PLAYABLE};
+use crate::util::grid::{FLOOD_PLAYABLE, FLOOD_SQ_BY_BIT};
+#[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
+use std::sync::Mutex;
 #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, RwLock,
 };
-#[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
-use std::sync::Mutex;
 pub const MATE: i32 = 100_000;
 pub const MAX_PLY: usize = 64;
 const INF: i32 = 2 * MATE;
@@ -65,29 +67,24 @@ const INF: i32 = 2 * MATE;
 const CERT_WIN_SCORE: i32 = 15_000;
 const CERT_BAND: i32 = 4_000;
 
-/// Graduated LMR starts after this move index (JS acev10: `i >= 4`).
-const ACE_LMR_AFTER_MOVE: usize = 4;
-/// Both LMR and EME require at least this remaining depth.
-const ACE_LMR_MIN_DEPTH: i32 = 3;
+/// Default CAT-index LMR tuning percent:
+/// -500 = strongest CAT-shaped cuts, 100 = current/default, 150 = full depth.
+pub const CAT_LMR_DEFAULT_TUNING_PERCENT: i32 = -177;
 
-/// Default CAT-LMR aggression ∈ [0,1] (the single knob in `cat_v16_lmr_reduction`):
-/// 0 = no reduction, 1 = everything maximally reduced. The LMR-vision slider
-/// overrides this for eyeballing; once tuned, set this to the chosen value.
-pub const CAT_LMR_DEFAULT_AGGRESSION: f64 = 0.5;
-
-/// Late-move reduction plies — same formula as JS graduated LMR. Made `pub` so
-/// the LMR-vision plan (`search::lmr_viz`) uses the exact same base reduction as
-/// the live search, then layers the CAT modifier identically.
-pub fn ace_graduated_lmr_reduction(move_index: usize, depth: i32) -> i32 {
-    let mut red = 1;
-    if move_index >= 12 {
-        red += 1;
+fn cat_lmr_tuning_percent() -> i32 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Ok(raw) = std::env::var("TITANIUM_CAT_LMR_TUNING_PERCENT") {
+            if let Ok(value) = raw.parse::<i32>() {
+                return value.clamp(-500, 150);
+            }
+        }
     }
-    if depth >= 6 && move_index >= 24 {
-        red += 1;
-    }
-    red
+    CAT_LMR_DEFAULT_TUNING_PERCENT
 }
+
+/// Late-move reduction plies — re-exported for LMR vision (`search::lmr_viz`).
+pub use crate::search::v16_lmr::ace_graduated_lmr_reduction;
 
 /// EME extends only the first ordered wall moves after the TT/best move.
 /// Index 0 (TT move) already gets full depth; extending more siblings
@@ -275,6 +272,9 @@ mod lazy_smp_tests {
                 black_dist: 0,
                 depth_log: Vec::new(),
                 stop_reason: "test",
+                race_outcome_stats: RaceOutcomeStats::default(),
+                opening_book: None,
+                root_defense_diag: Vec::new(),
             }
         }
 
@@ -320,74 +320,6 @@ mod lazy_smp_tests {
             assert!(legal[..n].contains(&result.mv));
         }
     }
-}
-
-/// Count moves in `walls` that cross `route` (a flood u128 bitset, bit = flood_bit_sq(sq)).
-/// A wall crosses a route when both cells across one of its blocked edges are on the route.
-fn wall_crossing_count(walls: &[BoardMove], route: u128) -> u32 {
-    crate::bench_instr::record(
-        |b| &mut b.wall_crossing_count,
-        || wall_crossing_count_inner(walls, route),
-    )
-}
-
-fn wall_crossing_count_inner(walls: &[BoardMove], route: u128) -> u32 {
-    let mut n = 0u32;
-    for mv in walls {
-        let BoardMove::Wall {
-            row,
-            col,
-            orientation,
-        } = *mv
-        else {
-            continue;
-        };
-        let r = row as usize;
-        let c = col as usize;
-        let bit = |r: usize, c: usize| (route & flood_bit_sq((r * 9 + c) as u8)) != 0;
-        let crosses = match orientation {
-            WallOrientation::Horizontal => {
-                (bit(r, c) && bit(r + 1, c)) || (bit(r, c + 1) && bit(r + 1, c + 1))
-            }
-            WallOrientation::Vertical => {
-                (bit(r, c) && bit(r, c + 1)) || (bit(r + 1, c) && bit(r + 1, c + 1))
-            }
-        };
-        if crosses {
-            n += 1;
-        }
-    }
-    n
-}
-
-/// Same as `wall_crossing_count` but takes a `[u8;81]` route array (route[r*9+c] != 0).
-fn wall_crossing_count_arr(walls: &[BoardMove], route: &[u8; 81]) -> u32 {
-    let mut n = 0u32;
-    for mv in walls {
-        let BoardMove::Wall {
-            row,
-            col,
-            orientation,
-        } = *mv
-        else {
-            continue;
-        };
-        let r = row as usize;
-        let c = col as usize;
-        let cell = |r: usize, c: usize| route[r * 9 + c] != 0;
-        let crosses = match orientation {
-            WallOrientation::Horizontal => {
-                (cell(r, c) && cell(r + 1, c)) || (cell(r, c + 1) && cell(r + 1, c + 1))
-            }
-            WallOrientation::Vertical => {
-                (cell(r, c) && cell(r, c + 1)) || (cell(r + 1, c) && cell(r + 1, c + 1))
-            }
-        };
-        if crosses {
-            n += 1;
-        }
-    }
-    n
 }
 
 const TT_BITS: usize = 20;
@@ -617,6 +549,10 @@ pub struct ThinkResult {
     pub black_dist: u8,
     pub depth_log: Vec<AceDepthLogEntry>,
     pub stop_reason: &'static str,
+    pub race_outcome_stats: RaceOutcomeStats,
+    pub opening_book: Option<crate::titanium::opening_book::OpeningBookDiagnostics>,
+    /// Last lost-position root defense pass (one entry per legal root move searched).
+    pub root_defense_diag: Vec<RootDefenseDiag>,
 }
 
 /// One complete late-move pipeline observation. These records are emitted only
@@ -637,6 +573,12 @@ pub struct ReductionProbeEvent {
     pub base_reduction: i32,
     pub applied_extra_reduction: bool,
     pub verification_triggered: bool,
+    pub self_gain: i32,
+    pub opponent_delay: i32,
+    pub race_gain: i32,
+    pub path_adjustment: i32,
+    pub final_reduction: i32,
+    pub thread_aggression_percent: i32,
     pub score: i32,
     pub nodes: u64,
     pub hidden: [f64; NET_H],
@@ -690,6 +632,215 @@ mod score_label_tests {
         assert_eq!(score_label(-(MATE - 9)), "mated in 9");
         assert_eq!(score_label(42), "cp 42");
     }
+
+    #[test]
+    fn w23_root_defense_fully_searches_all_pawns_and_picks_longest_loss() {
+        use crate::titanium::algebraic_to_move_id;
+        use crate::titanium::game::GameState;
+        use crate::titanium::move_id_to_algebraic;
+
+        let moves = [
+            "e2", "e8", "e3", "e7", "e4", "e6", "a3h", "a6h", "e3h", "c3v", "c1h", "c6h", "e6v",
+            "e4h", "d5h", "f5h", "d4", "d6", "c5v", "e6", "d7h", "e7", "b7h", "d7", "d3", "c7",
+            "e3", "b7", "e2", "a7", "f2", "a8", "g2", "b8", "h2", "h2v", "h3h", "c8", "g2", "f2h",
+            "d2h", "d8", "g1", "e8",
+        ];
+        let mut g = GameState::new();
+        for m in moves {
+            g.make_move(algebraic_to_move_id(m));
+        }
+
+        let mut search = TitaniumSearch::grafted_v16(g, Some(18));
+        let result = search.think(60_000, 12, true, false, "titanium-v16");
+
+        assert!(
+            !result.root_defense_diag.is_empty(),
+            "expected defense pass diagnostics"
+        );
+        let pawn_entries: Vec<_> = result
+            .root_defense_diag
+            .iter()
+            .filter(|e| e.mv < 100)
+            .collect();
+        assert_eq!(pawn_entries.len(), 3, "W23 has three pawn root moves");
+
+        for entry in &pawn_entries {
+            assert!(
+                entry.full_depth_searched,
+                "{} must be fully searched",
+                move_id_to_algebraic(entry.mv)
+            );
+            assert_eq!(
+                entry.child_depth_used,
+                11,
+                "{} childDepthUsed={} expected full defense depth",
+                move_id_to_algebraic(entry.mv),
+                entry.child_depth_used
+            );
+        }
+
+        let f1 = pawn_entries
+            .iter()
+            .find(|e| move_id_to_algebraic(e.mv) == "f1")
+            .expect("f1 in defense table");
+        assert_ne!(
+            f1.child_depth_used, 1,
+            "f1 must not be LMR-reduced to depth 1"
+        );
+        assert!(
+            f1.nodes > 1000,
+            "f1 nodes={} expected full-depth search",
+            f1.nodes
+        );
+
+        let loss_dtms: Vec<i32> = pawn_entries
+            .iter()
+            .filter_map(|e| proven_score_dtm(e.search_score))
+            .collect();
+        let max_dtm = *loss_dtms.iter().max().expect("pawn loss dtms");
+        assert_eq!(
+            proven_score_dtm(result.score),
+            Some(max_dtm),
+            "selected move must maximize survival DTM"
+        );
+        assert_eq!(
+            move_id_to_algebraic(result.mv),
+            "h1",
+            "h1 is the longest proven loss among pawn moves at full depth"
+        );
+    }
+}
+
+/// Proven forced loss in the race or true-mate band.
+#[inline]
+pub fn is_proven_loss_score(score: i32) -> bool {
+    if score >= 0 {
+        return false;
+    }
+    let abs = score.abs();
+    abs >= MATE - 1_000 || (abs >= RACE_MATE - 1_000 && abs <= RACE_MATE + 500)
+}
+
+/// Proven forced win in the race or true-mate band.
+#[inline]
+pub fn is_proven_win_score(score: i32) -> bool {
+    let abs = score.abs();
+    (abs >= MATE - 1_000 || (abs >= RACE_MATE - 1_000 && abs <= RACE_MATE + 500)) && score > 0
+}
+
+/// Distance-to-mate plies encoded in a proven race/mate score.
+#[inline]
+pub fn proven_score_dtm(score: i32) -> Option<i32> {
+    let abs = score.abs();
+    if abs >= MATE - 1_000 {
+        Some(MATE - abs)
+    } else if abs >= RACE_MATE - 1_000 && abs <= RACE_MATE + 500 {
+        Some(RACE_MATE - abs)
+    } else {
+        None
+    }
+}
+
+#[inline]
+pub fn score_result_class(score: i32) -> &'static str {
+    if is_proven_win_score(score) {
+        if score.abs() >= MATE - 1_000 {
+            "mate_win"
+        } else {
+            "race_win"
+        }
+    } else if is_proven_loss_score(score) {
+        if score.abs() >= MATE - 1_000 {
+            "mate_loss"
+        } else {
+            "race_loss"
+        }
+    } else {
+        "cp"
+    }
+}
+
+/// Selection key for lost-position root defense (higher = preferred).
+#[inline]
+pub fn defense_selection_key(score: i32, static_eval: i32) -> i32 {
+    if is_proven_loss_score(score) {
+        -1_000_000 + proven_score_dtm(score).unwrap_or(0)
+    } else if is_proven_win_score(score) {
+        1_000_000 - proven_score_dtm(score).unwrap_or(0)
+    } else {
+        static_eval
+    }
+}
+
+#[inline]
+fn better_defense_candidate(
+    score: i32,
+    static_eval: i32,
+    order: usize,
+    best_score: i32,
+    best_static: i32,
+    best_order: usize,
+) -> bool {
+    if best_score == i32::MIN {
+        return true;
+    }
+    let loss = is_proven_loss_score(score);
+    let best_loss = is_proven_loss_score(best_score);
+    if loss != best_loss {
+        return !loss;
+    }
+    if loss {
+        let dtm = proven_score_dtm(score).unwrap_or(0);
+        let best_dtm = proven_score_dtm(best_score).unwrap_or(0);
+        if dtm != best_dtm {
+            return dtm > best_dtm;
+        }
+    } else if score != best_score {
+        return score > best_score;
+    }
+    if static_eval != best_static {
+        return static_eval > best_static;
+    }
+    order < best_order
+}
+
+#[derive(Debug, Clone)]
+pub struct RootDefenseDiag {
+    pub mv: i16,
+    pub full_depth_searched: bool,
+    pub child_depth_used: i32,
+    pub result_class: &'static str,
+    pub dtm: Option<i32>,
+    pub search_score: i32,
+    pub static_eval: i32,
+    pub nodes: u64,
+    pub selection_key: i32,
+}
+
+pub fn format_root_defense_diag_json(entries: &[RootDefenseDiag]) -> String {
+    let mut out = String::from("[");
+    for (i, e) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let mv = super::move_id_to_algebraic(e.mv);
+        let dtm = e
+            .dtm
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        out.push_str(&format!(
+            "{{\"move\":\"{mv}\",\"fullDepthSearched\":{},\"childDepthUsed\":{},\"resultClass\":\"{}\",\"dtm\":{dtm},\"searchScore\":{},\"staticEval\":{},\"nodes\":{},\"finalSelectionKey\":{}}}",
+            e.full_depth_searched,
+            e.child_depth_used,
+            e.result_class,
+            e.search_score,
+            e.static_eval,
+            e.nodes,
+            e.selection_key,
+        ));
+    }
+    out.push(']');
+    out
 }
 
 pub fn think_result_progress_json(engine_label: &str, result: &ThinkResult) -> String {
@@ -793,6 +944,27 @@ fn emit_ace_progress(
 /// RaceProof race-table LRU slots (keyed by wall-config zobrist).
 const RC_SLOTS: usize = 64;
 
+/// Net-eval intermediates for Python parity tests (does not alter ``evaluate()``).
+#[derive(Clone, Copy, Debug)]
+pub struct EvalParityTrace {
+    pub d_me: f64,
+    pub d_opp: f64,
+    pub w_me: f64,
+    pub w_opp: f64,
+    pub pd: f64,
+    pub wd: f64,
+    pub width_opp: f64,
+    pub scalar_out: f64,
+    pub route_out: f64,
+    pub cat_out: f64,
+    pub width_contrib: f64,
+    pub wall_acc: [f64; NET_H],
+    pub hidden_pre: [f64; NET_H],
+    pub hidden_clip: [f64; NET_H],
+    pub neural_out: f64,
+    pub eval: i32,
+}
+
 pub struct TitaniumSearch {
     pub g: GameState,
     tt_key_hi: Vec<u32>,
@@ -848,9 +1020,14 @@ pub struct TitaniumSearch {
     d1: [[u8; 81]; MAX_PLY],
     d0_layers: [[u128; 81]; MAX_PLY],
     d1_layers: [[u128; 81]; MAX_PLY],
+    d0_layer_depth: [usize; MAX_PLY],
+    d1_layer_depth: [usize; MAX_PLY],
     dist0_idx: usize, // active ply slot in d0 (JS: this.dist0 array ref)
     dist1_idx: usize,
     cached_stamp: i32,
+    dir_masks_key_lo: u32,
+    dir_masks_key_hi: u32,
+    dir_masks_cache: DirMasks,
     // HalfPW accumulator cache
     np_acc0: [f64; NET_H],
     np_acc1: [f64; NET_H],
@@ -939,7 +1116,10 @@ pub struct TitaniumSearch {
     /// -1 sentinel: cell 0 (a1) is a legal pawn-move id
     root_pawn_best: i16,
     root_pawn_score: i32,
+    /// Lost-position root defense diagnostics from the latest verification pass.
+    root_defense_diag: Vec<RootDefenseDiag>,
     race_scratch: Option<Box<RaceScratch>>,
+    race_outcome_stats: RaceOutcomeStats,
     // RaceProof(c): certificate memo (gen13 — `certify_win.js` inlined, so the
     // certifier exists in node AND browser). Key = (lo, hi, side, wl0, wl1);
     // value = 1 proven (permanent, sound) / -work for a failure (richer retries
@@ -975,6 +1155,10 @@ pub struct TitaniumSearch {
     lazy_skip_setup: bool,
     #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     lazy_root_visits: Vec<usize>,
+    opening_book: Option<std::sync::Arc<crate::titanium::opening_book::OpeningBook>>,
+    opening_book_mode: crate::titanium::opening_book::OpeningBookMode,
+    opening_book_order: Option<Vec<i16>>,
+    pending_opening_book_diag: Option<crate::titanium::opening_book::OpeningBookDiagnostics>,
     /// GitHub Pages: live `info json` payloads forwarded to the browser worker.
     #[cfg(feature = "wasm")]
     wasm_progress: Option<js_sys::Function>,
@@ -987,6 +1171,11 @@ unsafe impl Send for TitaniumSearch {}
 /// writes are expensive; spamming them steals think time from the search.
 const STREAM_EMIT_NODE_MASK: u64 = 65535;
 const STREAM_EMIT_MIN_INTERVAL_MS: u64 = 100;
+
+enum HandsEmptyPipelineOutcome {
+    Score(i32),
+    LossFloor,
+}
 
 impl TitaniumSearch {
     pub fn new(g: GameState) -> Box<Self> {
@@ -1031,9 +1220,14 @@ impl TitaniumSearch {
             d1: [[0; 81]; MAX_PLY],
             d0_layers: [[0; 81]; MAX_PLY],
             d1_layers: [[0; 81]; MAX_PLY],
+            d0_layer_depth: [0; MAX_PLY],
+            d1_layer_depth: [0; MAX_PLY],
             dist0_idx: 0,
             dist1_idx: 0,
             cached_stamp: -1,
+            dir_masks_key_lo: u32::MAX,
+            dir_masks_key_hi: u32::MAX,
+            dir_masks_cache: DirMasks::default(),
             np_acc0: [0.0; NET_H],
             np_acc1: [0.0; NET_H],
             np_hw: [0; 64],
@@ -1090,7 +1284,9 @@ impl TitaniumSearch {
             rp_root_solves: 0,
             root_pawn_best: -1,
             root_pawn_score: i32::MIN,
+            root_defense_diag: Vec::new(),
             race_scratch: None,
+            race_outcome_stats: RaceOutcomeStats::default(),
             cw_cache: std::collections::HashMap::new(),
             cw_proven: 0,
             cw_calls: 0,
@@ -1121,6 +1317,10 @@ impl TitaniumSearch {
             lazy_skip_setup: false,
             #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             lazy_root_visits: Vec::new(),
+            opening_book: None,
+            opening_book_mode: crate::titanium::opening_book::OpeningBookMode::Off,
+            opening_book_order: None,
+            pending_opening_book_diag: None,
             #[cfg(feature = "wasm")]
             wasm_progress: None,
         })
@@ -1135,6 +1335,42 @@ impl TitaniumSearch {
     /// Enable Early Move Extensions — same gates/tuning as graduated LMR, early indices.
     pub fn enable_eme(&mut self) {
         self.eme = true;
+    }
+
+    pub fn set_opening_book(
+        &mut self,
+        mode: crate::titanium::opening_book::OpeningBookMode,
+        db_path: Option<std::path::PathBuf>,
+    ) {
+        use crate::titanium::opening_book::{OpeningBook, OpeningBookMode};
+        self.opening_book_mode = mode;
+        self.opening_book_order = None;
+        self.pending_opening_book_diag = None;
+        if mode == OpeningBookMode::Off {
+            self.opening_book = None;
+            return;
+        }
+        self.opening_book = OpeningBook::open(db_path.as_deref()).ok();
+    }
+
+    fn prepare_opening_book_at_root(&mut self) -> Option<i16> {
+        use crate::titanium::opening_book::OpeningBookMode;
+        self.opening_book_order = None;
+        self.pending_opening_book_diag = None;
+        if self.opening_book_mode == OpeningBookMode::Off {
+            return None;
+        }
+        let Some(book) = self.opening_book.clone() else {
+            return None;
+        };
+        let mut legal = [0i16; 160];
+        let n = self.gen_moves(0, 1, 0, &mut legal);
+        let consult = book.consult(&self.g, self.opening_book_mode, &legal[..n]);
+        self.pending_opening_book_diag = Some(consult.diagnostics);
+        if !consult.order.is_empty() {
+            self.opening_book_order = Some(consult.order);
+        }
+        consult.direct_play
     }
 
     /// Enable offline observation of complete native LMR move pipelines.
@@ -1267,12 +1503,8 @@ impl TitaniumSearch {
         search
     }
 
-    /// **Titanium v16** — v15 graft + CAT-scaled late-move reductions.
-    ///
-    /// Main-thread cold walls (at or below 5% of the attention ceiling, default 800 cm)
-    /// are searched at child depth 1; helper workers use 10%, 20%, 30%... capped
-    /// at 70%. Corridor-hot walls keep proportional depth. Same NNUE weights as
-    /// v15 live (`net_weights.bin`) until a dedicated v16 blob ships.
+    /// **Titanium v16** — v15 graft + ACE v13 graduated LMR with two hard CAT overrides:
+    /// dead-tail walls (attention ≤ 10%) and backward moves search at child depth 1.
     pub fn grafted_v16(g: GameState, tt_bits: Option<usize>) -> Box<Self> {
         #[cfg(not(target_arch = "wasm32"))]
         let ceiling = crate::cat::cat_v16_lmr_ceiling_from_env();
@@ -1609,6 +1841,9 @@ impl TitaniumSearch {
         worker.use_partial_iter = self.use_partial_iter;
         worker.pure_mode = self.pure_mode;
         worker.race_proof = self.race_proof;
+        worker.opening_book_mode = self.opening_book_mode;
+        worker.opening_book_order = self.opening_book_order.clone();
+        worker.opening_book = self.opening_book.clone();
         worker.tt_gen = self.tt_gen;
         worker.tt_mask = self.tt_mask;
         worker.tt_bits = self.tt_bits;
@@ -1659,33 +1894,6 @@ impl TitaniumSearch {
         self.lazy_root_visits.clear();
     }
 
-    /// Path-valid wall slot count for `ws[14]` (geometric; ignores wall budget / side).
-    /// Path-valid = tentative placement keeps both players connected to goal (`pbff_wall_legal`).
-    pub fn geometric_legal_wall_count(&mut self) -> u32 {
-        if let Some(bridge) = self.bridge.as_mut() {
-            return geometric_wall_len_cached(
-                &mut bridge.geometric_walls,
-                &mut bridge.board,
-                &mut bridge.bfs,
-                GeometricWallCacheRole::Eval,
-                Some(&mut bridge.wall_cache_stats),
-            ) as u32;
-        }
-        let mut board = Board::new();
-        for i in 0..self.g.hist_len {
-            let _ = board.make_move(move_id_to_board(self.g.hist_m[i]));
-        }
-        let mut scratch = BfsScratch::new();
-        let mut cache = None;
-        geometric_wall_len_cached(
-            &mut cache,
-            &mut board,
-            &mut scratch,
-            GeometricWallCacheRole::Eval,
-            None,
-        ) as u32
-    }
-
     /// Wall-cache profiling counters (TiBridge path only).
     pub fn wall_cache_stats(&self) -> Option<GeometricWallCacheStats> {
         self.bridge.as_ref().map(|b| b.wall_cache_stats)
@@ -1712,6 +1920,7 @@ impl TitaniumSearch {
     pub fn eval_dump_json(&mut self) -> String {
         self.position_changed();
         self.refresh_dist(0);
+        let net_eval = self.compute_net_eval_trace().eval;
         let eval = self.evaluate(0);
         let d0_scalar = self.d0[self.dist0_idx][self.g.pawn[0]];
         let d1_scalar = self.d1[self.dist1_idx][self.g.pawn[1]];
@@ -1755,10 +1964,8 @@ impl TitaniumSearch {
         fill_ace_dist_from_pawn(&self.g, self.g.pawn[1], &mut p1_steps);
         fill_corridor_delta(&p0_steps, &d0f, d0_scalar, &mut delta0);
         fill_corridor_delta(&p1_steps, &d1f, d1_scalar, &mut delta1);
-        let mut cross0 = [0u8; 81];
-        let mut cross1 = [0u8; 81];
-        fill_path_crossing(&self.g, &p0_steps, &d0f, d0_scalar, &mut cross0);
-        fill_path_crossing(&self.g, &p1_steps, &d1f, d1_scalar, &mut cross1);
+        let cross0 = [0u8; 81];
+        let cross1 = [0u8; 81];
         let mut choke0 = [0u8; 81];
         let mut choke1 = [0u8; 81];
         fill_choke_points(&self.g, &p0_steps, &d0f, d0_scalar, &mut choke0);
@@ -1774,11 +1981,12 @@ impl TitaniumSearch {
         let (cat_best_p0, cat_best_p1, cat_heat) = {
             let mut bridge = TiBridge::from_game(&self.g);
             let cat = crate::cat::build::build_impact_heatmap(&bridge.board);
-            let (best0, best1) = crate::cat::best_pawn_cat_heats(&bridge.board, &cat, &mut bridge.bfs);
+            let (best0, best1) =
+                crate::cat::best_pawn_cat_heats(&bridge.board, &cat, &mut bridge.bfs);
             (best0, best1, cat.square_heat)
         };
-        let legal_walls = self.geometric_legal_wall_count();
-        let (cross_p0, cross_p1) = self.legal_path_crossing_counts_arr(&route0, &route1);
+        let legal_walls = 0;
+        let (cross_p0, cross_p1) = (0, 0);
         let width_me = self.d0[self.dist0_idx]
             .iter()
             .filter(|&&d| d as i32 == d0_scalar as i32)
@@ -1804,7 +2012,7 @@ impl TitaniumSearch {
              \"player0_field\":[{}],\"player1_field\":[{}],\
              \"delta0_field\":[{}],\"delta1_field\":[{}],\
              \"cross0_field\":[{}],\"cross1_field\":[{}],\
-             \"hw\":[{}],\"vw\":[{}],\"eval\":{}}}",
+             \"hw\":[{}],\"vw\":[{}],\"net_eval\":{},\"eval\":{}}}",
             self.g.turn,
             self.g.pawn[0],
             self.g.pawn[1],
@@ -1845,8 +2053,186 @@ impl TitaniumSearch {
             field(&cross1),
             bits(&self.g.hw),
             bits(&self.g.vw),
+            net_eval,
             eval
         )
+    }
+
+    /// Parity harness only: net eval intermediates without changing ``evaluate()``.
+    pub fn eval_parity_trace_json(&mut self) -> String {
+        self.position_changed();
+        self.refresh_dist(0);
+        let trace = self.compute_net_eval_trace();
+        let f64s = |arr: &[f64]| {
+            let mut s = String::new();
+            for (i, v) in arr.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!("{v:.17}"));
+            }
+            s
+        };
+        format!(
+            "{{\"scalar_inputs\":{{\"d_me\":{dm},\"d_opp\":{do_},\"w_me\":{wm},\"w_opp\":{wo},\"pd\":{pd},\"wd\":{wd},\"width_opp\":{wo_}}},\
+             \"scalar_out\":{so},\"route_out\":{ro},\"cat_out\":{co},\"width_contrib\":{wc},\
+             \"wall_acc\":[{wa}],\"hidden_pre\":[{hp}],\"hidden_clip\":[{hc}],\"neural_out\":{no},\"eval\":{ev}}}",
+            dm = trace.d_me,
+            do_ = trace.d_opp,
+            wm = trace.w_me,
+            wo = trace.w_opp,
+            pd = trace.pd,
+            wd = trace.wd,
+            wo_ = trace.width_opp,
+            so = trace.scalar_out,
+            ro = trace.route_out,
+            co = trace.cat_out,
+            wc = trace.width_contrib,
+            wa = f64s(&trace.wall_acc),
+            hp = f64s(&trace.hidden_pre),
+            hc = f64s(&trace.hidden_clip),
+            no = trace.neural_out,
+            ev = trace.eval,
+        )
+    }
+
+    fn compute_net_eval_trace(&mut self) -> EvalParityTrace {
+        let me = self.g.turn;
+        let opp = 1 - me;
+        let d_me_u = if me == 0 {
+            self.d0[self.dist0_idx][self.g.pawn[0]]
+        } else {
+            self.d1[self.dist1_idx][self.g.pawn[1]]
+        };
+        let d_opp_u = if opp == 0 {
+            self.d0[self.dist0_idx][self.g.pawn[0]]
+        } else {
+            self.d1[self.dist1_idx][self.g.pawn[1]]
+        };
+        let w_me_i = self.g.wl[me];
+        let w_opp_i = self.g.wl[opp];
+        let d_me_i = d_me_u as i32;
+        let d_opp_i = d_opp_u as i32;
+        let d_me = d_me_i as f64;
+        let d_opp = d_opp_i as f64;
+        let w_me = w_me_i as f64;
+        let w_opp = w_opp_i as f64;
+        let nw = self.net;
+        let ws = &nw.ws;
+        let pd = d_opp - d_me;
+        let wd = w_me - w_opp;
+        let mut scalar_out = ws[0]
+            + ws[1] * pd
+            + ws[2] * wd
+            + ws[3] * d_me
+            + ws[4] * d_opp
+            + ws[9] * pd * (w_me + w_opp) / 20.0
+            + ws[10] * wd * (d_me + d_opp) / 16.0;
+        if w_opp_i == 0 {
+            scalar_out += ws[6];
+            if d_me <= d_opp {
+                scalar_out += ws[5];
+            }
+        } else if w_me_i == 0 {
+            scalar_out += ws[8];
+            if d_opp <= d_me - 1.0 {
+                scalar_out += ws[7];
+            }
+        }
+        if d_opp <= 4.0 {
+            scalar_out += ws[11] * if w_me < 3.0 { w_me } else { 3.0 };
+        }
+        if d_me <= 4.0 {
+            scalar_out += ws[12] * if w_opp < 3.0 { w_opp } else { 3.0 };
+        }
+        scalar_out += ws[13] * pd * w_opp / 10.0;
+        let (route_out, _, _) = self.route_feature_score(nw);
+        let mut cat_out = 0.0;
+        if nw.cat_active {
+            if let Some(bridge) = self.bridge.as_ref() {
+                let cat = crate::cat::build::build_impact_heatmap(&bridge.board);
+                let canonical = |sq: usize| if me == 0 { sq } else { NET_MIRC[sq] };
+                for sq in 0..81usize {
+                    let h = cat[sq];
+                    if h != 0 {
+                        cat_out += nw.cat_heat[canonical(sq)] * (f64::from(h) / 256.0);
+                    }
+                }
+            }
+        }
+        let width_opp = if self.net.route_active {
+            (if me == 0 {
+                width_in_layers(
+                    &self.d1_layers[self.dist1_idx],
+                    self.d1_layer_depth[self.dist1_idx],
+                    d_opp_u,
+                )
+            } else {
+                width_in_layers(
+                    &self.d0_layers[self.dist0_idx],
+                    self.d0_layer_depth[self.dist0_idx],
+                    d_opp_u,
+                )
+            }) as f64
+        } else if me == 0 {
+            self.d1[self.dist1_idx]
+                .iter()
+                .filter(|&&d| d as i32 == d_opp_i)
+                .count() as f64
+        } else {
+            self.d0[self.dist0_idx]
+                .iter()
+                .filter(|&&d| d as i32 == d_opp_i)
+                .count() as f64
+        };
+        let width_contrib = ws[15] * width_opp;
+        let b0 = NET_BKT[self.g.pawn[0]] as i32;
+        let b1 = NET_BKT[NET_MIRC[self.g.pawn[1]]] as i32;
+        self.ensure_nnue_wall_accumulators(nw, b0, b1);
+        let mut wall_acc = [0.0f64; NET_H];
+        let mut hidden_pre = [0.0f64; NET_H];
+        let mut hidden_clip = [0.0f64; NET_H];
+        let mut neural_out = 0.0f64;
+        if me == 0 {
+            wall_acc = self.np_acc0;
+            let po = self.g.pawn[0] * NET_H;
+            let px = self.g.pawn[1] * NET_H;
+            for j in 0..NET_H {
+                let h = nw.b1[j] + self.np_acc0[j] + nw.po[po + j] + nw.px[px + j];
+                hidden_pre[j] = h;
+                hidden_clip[j] = h.clamp(0.0, 1.0);
+                neural_out += nw.w2[j] * hidden_clip[j] * 200.0;
+            }
+        } else {
+            wall_acc = self.np_acc1;
+            let po = NET_MIRC[self.g.pawn[1]] * NET_H;
+            let px = NET_MIRC[self.g.pawn[0]] * NET_H;
+            for j in 0..NET_H {
+                let h = nw.b1[j] + self.np_acc1[j] + nw.po[po + j] + nw.px[px + j];
+                hidden_pre[j] = h;
+                hidden_clip[j] = h.clamp(0.0, 1.0);
+                neural_out += nw.w2[j] * hidden_clip[j] * 200.0;
+            }
+        }
+        let total = scalar_out + route_out + cat_out + width_contrib + neural_out;
+        EvalParityTrace {
+            d_me,
+            d_opp,
+            w_me,
+            w_opp,
+            pd,
+            wd,
+            width_opp,
+            scalar_out,
+            route_out,
+            cat_out,
+            width_contrib,
+            wall_acc,
+            hidden_pre,
+            hidden_clip,
+            neural_out,
+            eval: total as i32,
+        }
     }
 
     fn position_changed(&mut self) {
@@ -1854,6 +2240,8 @@ impl TitaniumSearch {
             self.bridge = Some(TiBridge::from_game(&self.g));
         }
         self.cached_stamp = -1;
+        self.dir_masks_key_lo = u32::MAX;
+        self.dir_masks_key_hi = u32::MAX;
         self.np_b0 = -1; // force full accumulator rebuild (v10: no stamp gate)
         self.np_b1v = -1;
     }
@@ -1945,20 +2333,20 @@ impl TitaniumSearch {
     }
 
     /// Returns (score, route0_bits, route1_bits) so callers can reuse the route bitsets.
-    fn route_feature_score(&self, nw: &Net) -> (f64, u128, u128) {
+    fn route_feature_score(&mut self, nw: &Net) -> (f64, u128, u128) {
         crate::bench_instr::record(
             |b| &mut b.eval_route_features,
             || self.route_feature_score_inner(nw),
         )
     }
 
-    fn route_feature_score_inner(&self, nw: &Net) -> (f64, u128, u128) {
+    fn route_feature_score_inner(&mut self, nw: &Net) -> (f64, u128, u128) {
         if !nw.route_active {
             return (0.0, 0, 0);
         }
+        let masks = self.current_dir_masks();
         let d0f = &self.d0[self.dist0_idx];
         let d1f = &self.d1[self.dist1_idx];
-        let masks = DirMasks::from_ace_game(&self.g);
         let route0 = shortest_route_bits(
             self.g.pawn[0],
             d0f[self.g.pawn[0]],
@@ -1985,7 +2373,8 @@ impl TitaniumSearch {
             while bits != 0 {
                 let bit = bits.trailing_zeros();
                 bits &= bits - 1;
-                if let Some(sq) = flood_sq_from_bit(bit) {
+                let sq = FLOOD_SQ_BY_BIT[bit as usize];
+                if sq != u8::MAX {
                     sum += weights[canonical(sq as usize)];
                 }
             }
@@ -1999,93 +2388,43 @@ impl TitaniumSearch {
         (score, route0, route1)
     }
 
-    /// Count legal walls from cache that cross the given route u128 bitset (flood-indexed).
-    fn legal_path_crossing_counts_bits(&mut self, route0: u128, route1: u128) -> (u32, u32) {
-        crate::bench_instr::record(
-            |b| &mut b.eval_legal_wall_count,
-            || self.legal_path_crossing_counts_bits_inner(route0, route1),
-        )
+    fn wall_topology_key(&self) -> (u32, u32) {
+        let z = &ZOBRIST;
+        let mut k_lo = self.g.hash_lo ^ z.pawn_lo[0][self.g.pawn[0]] ^ z.pawn_lo[1][self.g.pawn[1]];
+        let mut k_hi = self.g.hash_hi ^ z.pawn_hi[0][self.g.pawn[0]] ^ z.pawn_hi[1][self.g.pawn[1]];
+        if self.g.turn == 1 {
+            k_lo ^= z.turn_lo;
+            k_hi ^= z.turn_hi;
+        }
+        (k_lo, k_hi)
     }
 
-    fn legal_path_crossing_counts_bits_inner(&mut self, route0: u128, route1: u128) -> (u32, u32) {
-        if let Some(bridge) = self.bridge.as_mut() {
-            let _ = geometric_wall_len_cached(
-                &mut bridge.geometric_walls,
-                &mut bridge.board,
-                &mut bridge.bfs,
-                GeometricWallCacheRole::Eval,
-                Some(&mut bridge.wall_cache_stats),
-            );
-            let cache = bridge.geometric_walls.as_ref().unwrap();
-            return (
-                wall_crossing_count(cache.wall_slice(), route0),
-                wall_crossing_count(cache.wall_slice(), route1),
-            );
+    fn current_dir_masks(&mut self) -> DirMasks {
+        let (k_lo, k_hi) = self.wall_topology_key();
+        if self.dir_masks_key_lo != k_lo || self.dir_masks_key_hi != k_hi {
+            if self.cached_stamp == self.g.wall_stamp - 1 && self.g.hist_len > 0 {
+                let m = self.g.hist_m[self.g.hist_len - 1];
+                if m >= 100 {
+                    let slot = (m % 100) as usize;
+                    let z = &ZOBRIST;
+                    let (parent_lo, parent_hi, wall_type) = if m < 200 {
+                        (k_lo ^ z.hw_lo[slot], k_hi ^ z.hw_hi[slot], 0)
+                    } else {
+                        (k_lo ^ z.vw_lo[slot], k_hi ^ z.vw_hi[slot], 1)
+                    };
+                    if self.dir_masks_key_lo == parent_lo && self.dir_masks_key_hi == parent_hi {
+                        self.dir_masks_cache = self.dir_masks_cache.with_ace_wall(wall_type, slot);
+                        self.dir_masks_key_lo = k_lo;
+                        self.dir_masks_key_hi = k_hi;
+                        return self.dir_masks_cache;
+                    }
+                }
+            }
+            self.dir_masks_cache = DirMasks::from_ace_game(&self.g);
+            self.dir_masks_key_lo = k_lo;
+            self.dir_masks_key_hi = k_hi;
         }
-        let mut board = Board::new();
-        for i in 0..self.g.hist_len {
-            let _ = board.make_move(move_id_to_board(self.g.hist_m[i]));
-        }
-        let mut scratch = BfsScratch::new();
-        let mut cache_opt: Option<GeometricWallCache> = None;
-        geometric_wall_len_cached(
-            &mut cache_opt,
-            &mut board,
-            &mut scratch,
-            GeometricWallCacheRole::Eval,
-            None,
-        );
-        if let Some(ref cache) = cache_opt {
-            (
-                wall_crossing_count(cache.wall_slice(), route0),
-                wall_crossing_count(cache.wall_slice(), route1),
-            )
-        } else {
-            (0, 0)
-        }
-    }
-
-    /// Count legal walls crossing each player's path (for eval JSON). Uses [u8;81] route arrays.
-    fn legal_path_crossing_counts_arr(
-        &mut self,
-        route0: &[u8; 81],
-        route1: &[u8; 81],
-    ) -> (u32, u32) {
-        if let Some(bridge) = self.bridge.as_mut() {
-            let _ = geometric_wall_len_cached(
-                &mut bridge.geometric_walls,
-                &mut bridge.board,
-                &mut bridge.bfs,
-                GeometricWallCacheRole::Eval,
-                Some(&mut bridge.wall_cache_stats),
-            );
-            let cache = bridge.geometric_walls.as_ref().unwrap();
-            return (
-                wall_crossing_count_arr(cache.wall_slice(), route0),
-                wall_crossing_count_arr(cache.wall_slice(), route1),
-            );
-        }
-        let mut board = Board::new();
-        for i in 0..self.g.hist_len {
-            let _ = board.make_move(move_id_to_board(self.g.hist_m[i]));
-        }
-        let mut scratch = BfsScratch::new();
-        let mut cache_opt: Option<GeometricWallCache> = None;
-        geometric_wall_len_cached(
-            &mut cache_opt,
-            &mut board,
-            &mut scratch,
-            GeometricWallCacheRole::Eval,
-            None,
-        );
-        if let Some(ref cache) = cache_opt {
-            (
-                wall_crossing_count_arr(cache.wall_slice(), route0),
-                wall_crossing_count_arr(cache.wall_slice(), route1),
-            )
-        } else {
-            (0, 0)
-        }
+        self.dir_masks_cache
     }
 
     fn refresh_dist(&mut self, ply: usize) {
@@ -2119,30 +2458,50 @@ impl TitaniumSearch {
                     d1[a] != d1[b2] || d1[c2] != d1[e2]
                 };
                 let masks = if refresh0 || refresh1 {
-                    Some(DirMasks::from_ace_game(&self.g))
+                    Some(self.current_dir_masks())
                 } else {
                     None
                 };
                 if refresh0 {
                     self.dist0_idx = ply; // redirect first: never write an ancestor's array
-                    fill_ace_dist_to_goal_with_masks(
-                        0,
-                        masks.expect("refresh masks"),
-                        &mut self.d0[ply],
-                    );
                     if self.net.route_active {
-                        fill_distance_layers(&self.d0[ply], &mut self.d0_layers[ply]);
+                        self.d0_layer_depth[ply] = fill_ace_dist_layers_to_goal(
+                            0,
+                            masks.expect("refresh masks"),
+                            &mut self.d0_layers[ply],
+                        );
+                        materialize_distance_layers(
+                            &self.d0_layers[ply],
+                            self.d0_layer_depth[ply],
+                            &mut self.d0[ply],
+                        );
+                    } else {
+                        fill_ace_dist_to_goal_with_masks(
+                            0,
+                            masks.expect("refresh masks"),
+                            &mut self.d0[ply],
+                        );
                     }
                 }
                 if refresh1 {
                     self.dist1_idx = ply;
-                    fill_ace_dist_to_goal_with_masks(
-                        1,
-                        masks.expect("refresh masks"),
-                        &mut self.d1[ply],
-                    );
                     if self.net.route_active {
-                        fill_distance_layers(&self.d1[ply], &mut self.d1_layers[ply]);
+                        self.d1_layer_depth[ply] = fill_ace_dist_layers_to_goal(
+                            1,
+                            masks.expect("refresh masks"),
+                            &mut self.d1_layers[ply],
+                        );
+                        materialize_distance_layers(
+                            &self.d1_layers[ply],
+                            self.d1_layer_depth[ply],
+                            &mut self.d1[ply],
+                        );
+                    } else {
+                        fill_ace_dist_to_goal_with_masks(
+                            1,
+                            masks.expect("refresh masks"),
+                            &mut self.d1[ply],
+                        );
                     }
                 }
                 self.cached_stamp = stamp;
@@ -2151,25 +2510,36 @@ impl TitaniumSearch {
         }
         self.dist0_idx = ply; // own arrays: ancestors stay intact
         self.dist1_idx = ply;
-        let masks = DirMasks::from_ace_game(&self.g);
+        let masks = self.current_dir_masks();
         crate::bench_instr::record(
             |b| &mut b.shortest_path,
             || {
-                fill_ace_dist_to_goal_with_masks(0, masks, &mut self.d0[ply]);
-                fill_ace_dist_to_goal_with_masks(1, masks, &mut self.d1[ply]);
                 if self.net.route_active {
-                    fill_distance_layers(&self.d0[ply], &mut self.d0_layers[ply]);
-                    fill_distance_layers(&self.d1[ply], &mut self.d1_layers[ply]);
+                    self.d0_layer_depth[ply] =
+                        fill_ace_dist_layers_to_goal(0, masks, &mut self.d0_layers[ply]);
+                    self.d1_layer_depth[ply] =
+                        fill_ace_dist_layers_to_goal(1, masks, &mut self.d1_layers[ply]);
+                    materialize_distance_layers(
+                        &self.d0_layers[ply],
+                        self.d0_layer_depth[ply],
+                        &mut self.d0[ply],
+                    );
+                    materialize_distance_layers(
+                        &self.d1_layers[ply],
+                        self.d1_layer_depth[ply],
+                        &mut self.d1[ply],
+                    );
+                } else {
+                    fill_ace_dist_to_goal_with_masks(0, masks, &mut self.d0[ply]);
+                    fill_ace_dist_to_goal_with_masks(1, masks, &mut self.d1[ply]);
                 }
             },
         );
         self.cached_stamp = stamp;
     }
 
-    /// RaceProof: race table for the CURRENT wall config — LRU slot index, or
-    /// `None` when the in-tree solve budget gates the build (JS `raceTbl`).
-    /// Key = position hash with pawns and turn XORed out (wall config only).
-    fn race_tbl(&mut self, force: bool) -> Option<usize> {
+    /// Wall-topology key for `race_tbl` (pawns and turn XORed out).
+    fn race_topology_key(&self) -> (u32, u32) {
         let z = &ZOBRIST;
         let mut k_lo = self.g.hash_lo ^ z.pawn_lo[0][self.g.pawn[0]] ^ z.pawn_lo[1][self.g.pawn[1]];
         let mut k_hi = self.g.hash_hi ^ z.pawn_hi[0][self.g.pawn[0]] ^ z.pawn_hi[1][self.g.pawn[1]];
@@ -2177,14 +2547,15 @@ impl TitaniumSearch {
             k_lo ^= z.turn_lo;
             k_hi ^= z.turn_hi;
         }
+        (k_lo, k_hi)
+    }
+
+    /// Stage 1: LRU probe only — never builds or budget-gates.
+    fn race_tbl_lru_probe(&mut self, k_lo: u32, k_hi: u32) -> Option<usize> {
         let li = self.rc_last;
         if li >= 0 && self.rc_key_lo[li as usize] == k_lo && self.rc_key_hi[li as usize] == k_hi {
             self.rc_hits += 1;
             return Some(li as usize);
-        }
-        if !force && self.rc_blocked && k_lo == self.rc_miss_lo && k_hi == self.rc_miss_hi {
-            self.rc_budget_miss += 1;
-            return None;
         }
         for i in 0..RC_SLOTS {
             if self.rc_tbl[i].is_some() && self.rc_key_lo[i] == k_lo && self.rc_key_hi[i] == k_hi {
@@ -2194,6 +2565,39 @@ impl TitaniumSearch {
                 self.rc_hits += 1;
                 return Some(i);
             }
+        }
+        None
+    }
+
+    #[inline]
+    fn score_from_race_slot(&self, slot: usize) -> Option<i32> {
+        let rv = self.race_value(slot) as i32;
+        if rv > 0 {
+            Some(RACE_MATE - rv)
+        } else if rv < 0 {
+            Some(-(RACE_MATE + rv))
+        } else {
+            None
+        }
+    }
+
+    /// RaceProof: race table for the CURRENT wall config — LRU slot index, or
+    /// `None` when the in-tree solve budget gates the build (JS `raceTbl`).
+    /// Key = position hash with pawns and turn XORed out (wall config only).
+    ///
+    /// Only valid when both players have 0 walls in hand — the table indexes
+    /// pawn pairs on a fixed wall topology, not wall-placement races.
+    fn race_tbl(&mut self, force: bool) -> Option<usize> {
+        if self.g.wl[0] != 0 || self.g.wl[1] != 0 {
+            return None;
+        }
+        let (k_lo, k_hi) = self.race_topology_key();
+        if let Some(slot) = self.race_tbl_lru_probe(k_lo, k_hi) {
+            return Some(slot);
+        }
+        if !force && self.rc_blocked && k_lo == self.rc_miss_lo && k_hi == self.rc_miss_hi {
+            self.rc_budget_miss += 1;
+            return None;
         }
         if !force {
             // in-tree miss: build only when cheap to amortize (ticket16 SPRT-kill lesson)
@@ -2229,10 +2633,15 @@ impl TitaniumSearch {
             self.race_scratch = Some(Box::new(RaceScratch::new()));
         }
         let t0 = Instant::now();
-        solve_race_config(
-            &mut self.g,
-            self.race_scratch.as_mut().expect("race scratch"),
-            &mut tbl,
+        crate::bench_instr::record(
+            |b| &mut b.race_winner_table,
+            || {
+                solve_race_config(
+                    &mut self.g,
+                    self.race_scratch.as_mut().expect("race scratch"),
+                    &mut tbl,
+                );
+            },
         );
         let dt0 = t0.elapsed().as_millis() as u64;
         self.rc_solve_ms += dt0;
@@ -2256,6 +2665,139 @@ impl TitaniumSearch {
     fn race_value(&self, slot: usize) -> i16 {
         let idx = (self.g.pawn[0] * 81 + self.g.pawn[1]) * 2 + self.g.turn;
         self.rc_tbl[slot].as_ref().expect("race slot")[idx]
+    }
+
+    fn exact_hands_empty_score(&mut self, force: bool) -> Option<i32> {
+        if !self.race_proof || self.g.wl[0] != 0 || self.g.wl[1] != 0 {
+            return None;
+        }
+        let slot = self.race_tbl(force)?;
+        self.score_from_race_slot(slot)
+    }
+
+    /// Hands-empty endgame pipeline (cheap → heavy). Caller must ensure
+    /// `wl[0] == 0 && wl[1] == 0` and leaf eligibility.
+    ///
+    /// 1. `race_tbl` LRU probe (memo hit with decisive retrograde value)
+    /// 2. Cached `d0`/`d1` Gate 1 (`cheap_cert` only)
+    /// 3. `race_tbl(false)` on Gate 1 `Unknown` (LRU probe → budget-gated build)
+    /// 4. Distance heuristic (unproven)
+    ///
+    /// Stage 4 (`cert_win`) and stage 5 (NNUE / alpha-beta) run in `evaluate()`
+    /// after this returns `LossFloor` or when walls remain.
+    fn try_hands_empty_endgame(&mut self, d_me_i: i32, d_opp_i: i32) -> HandsEmptyPipelineOutcome {
+        // Stage 1: existing `race_tbl` LRU memo (probe only, no build).
+        if self.race_proof {
+            let (k_lo, k_hi) = self.race_topology_key();
+            if let Some(slot) = self.race_tbl_lru_probe(k_lo, k_hi) {
+                if let Some(score) = self.score_from_race_slot(slot) {
+                    self.race_outcome_stats.resolved_memo += 1;
+                    return HandsEmptyPipelineOutcome::Score(score);
+                }
+            }
+        }
+
+        // Stage 2: cached-distance Gate 1 (Service A).
+        if self.cheap_cert {
+            let d0 = &self.d0[self.dist0_idx];
+            let d1 = &self.d1[self.dist1_idx];
+            let bound = crate::bench_instr::record(
+                |b| &mut b.eval_race_bound,
+                || race_outcome_with_dist(&self.g, d0, d1, &mut self.race_outcome_stats),
+            );
+            match bound {
+                RaceBound::Lower(_) => {
+                    self.race_outcome_stats.resolved_gate1 += 1;
+                    return HandsEmptyPipelineOutcome::Score(RACE_MATE - d_me_i.max(1));
+                }
+                RaceBound::Upper(_) => {
+                    self.race_outcome_stats.resolved_gate1_loss += 1;
+                    return HandsEmptyPipelineOutcome::LossFloor;
+                }
+                RaceBound::Exact(_) | RaceBound::Unknown => {}
+            }
+        }
+
+        // Stage 3: `race_tbl(false)` — LRU probe then budget-gated build.
+        if self.race_proof {
+            if let Some(slot) = self.race_tbl(false) {
+                if let Some(score) = self.score_from_race_slot(slot) {
+                    self.race_outcome_stats.resolved_race_tbl += 1;
+                    return HandsEmptyPipelineOutcome::Score(score);
+                }
+            }
+        }
+
+        // Distance heuristic fallback (unproven).
+        self.race_outcome_stats.resolved_race_heuristic += 1;
+        if d_me_i <= d_opp_i {
+            HandsEmptyPipelineOutcome::Score(3000 + (d_opp_i - d_me_i) * 50 - d_me_i)
+        } else {
+            HandsEmptyPipelineOutcome::Score(-3000 - (d_me_i - d_opp_i) * 50 + d_opp_i)
+        }
+    }
+
+    #[inline(always)]
+    fn ensure_nnue_wall_accumulators(&mut self, nw: &Net, b0: i32, b1: i32) {
+        if b0 != self.np_b0 || b1 != self.np_b1v {
+            crate::bench_instr::record(
+                |b| &mut b.nnue_full_refresh,
+                || {
+                    self.np_acc0.fill(0.0);
+                    self.np_acc1.fill(0.0);
+                    for s in 0..64 {
+                        if self.g.hw[s] != 0 {
+                            let o0 = (b0 as usize * 128 + s) * NET_H;
+                            let o1 = (b1 as usize * 128 + NET_MIRS[s]) * NET_H;
+                            for j in 0..NET_H {
+                                self.np_acc0[j] += nw.w1c[o0 + j];
+                                self.np_acc1[j] += nw.w1c[o1 + j];
+                            }
+                        }
+                        if self.g.vw[s] != 0 {
+                            let o0 = (b0 as usize * 128 + 64 + s) * NET_H;
+                            let o1 = (b1 as usize * 128 + 64 + NET_MIRS[s]) * NET_H;
+                            for j in 0..NET_H {
+                                self.np_acc0[j] += nw.w1c[o0 + j];
+                                self.np_acc1[j] += nw.w1c[o1 + j];
+                            }
+                        }
+                        self.np_hw[s] = self.g.hw[s];
+                        self.np_vw[s] = self.g.vw[s];
+                    }
+                    self.np_b0 = b0;
+                    self.np_b1v = b1;
+                },
+            );
+        } else {
+            crate::bench_instr::record(
+                |b| &mut b.nnue_incr_update,
+                || {
+                    for s in 0..64 {
+                        if self.g.hw[s] != self.np_hw[s] {
+                            let sg = if self.g.hw[s] != 0 { 1.0 } else { -1.0 };
+                            let o0 = (b0 as usize * 128 + s) * NET_H;
+                            let o1 = (b1 as usize * 128 + NET_MIRS[s]) * NET_H;
+                            for j in 0..NET_H {
+                                self.np_acc0[j] += sg * nw.w1c[o0 + j];
+                                self.np_acc1[j] += sg * nw.w1c[o1 + j];
+                            }
+                            self.np_hw[s] = self.g.hw[s];
+                        }
+                        if self.g.vw[s] != self.np_vw[s] {
+                            let sg = if self.g.vw[s] != 0 { 1.0 } else { -1.0 };
+                            let o0 = (b0 as usize * 128 + 64 + s) * NET_H;
+                            let o1 = (b1 as usize * 128 + 64 + NET_MIRS[s]) * NET_H;
+                            for j in 0..NET_H {
+                                self.np_acc0[j] += sg * nw.w1c[o0 + j];
+                                self.np_acc1[j] += sg * nw.w1c[o1 + j];
+                            }
+                            self.np_vw[s] = self.g.vw[s];
+                        }
+                    }
+                },
+            );
+        }
     }
 
     /// RaceProof(c): budget-capped static win certificate for side `s` at the
@@ -2293,6 +2835,7 @@ impl TitaniumSearch {
         let prior = self.cw_cache.get(&key).copied();
         if let Some(c) = prior {
             if c == 1 {
+                self.race_outcome_stats.resolved_cert_memo += 1;
                 return true; // proven: permanent (sound)
             }
             if bud <= -(c as i64) {
@@ -2325,6 +2868,7 @@ impl TitaniumSearch {
         }
         if res {
             self.cw_proven += 1;
+            self.race_outcome_stats.resolved_cert_win += 1;
         }
         if self.cw_cache.len() > 16384 {
             self.cw_cache.clear();
@@ -2347,55 +2891,7 @@ impl TitaniumSearch {
         let nw = self.net;
         let b0 = NET_BKT[self.g.pawn[0]] as i32;
         let b1 = NET_BKT[NET_MIRC[self.g.pawn[1]]] as i32;
-        if b0 != self.np_b0 || b1 != self.np_b1v {
-            self.np_acc0.fill(0.0);
-            self.np_acc1.fill(0.0);
-            for s in 0..64 {
-                if self.g.hw[s] != 0 {
-                    let o0 = (b0 as usize * 128 + s) * NET_H;
-                    let o1 = (b1 as usize * 128 + NET_MIRS[s]) * NET_H;
-                    for j in 0..NET_H {
-                        self.np_acc0[j] += nw.w1c[o0 + j];
-                        self.np_acc1[j] += nw.w1c[o1 + j];
-                    }
-                }
-                if self.g.vw[s] != 0 {
-                    let o0 = (b0 as usize * 128 + 64 + s) * NET_H;
-                    let o1 = (b1 as usize * 128 + 64 + NET_MIRS[s]) * NET_H;
-                    for j in 0..NET_H {
-                        self.np_acc0[j] += nw.w1c[o0 + j];
-                        self.np_acc1[j] += nw.w1c[o1 + j];
-                    }
-                }
-                self.np_hw[s] = self.g.hw[s];
-                self.np_vw[s] = self.g.vw[s];
-            }
-            self.np_b0 = b0;
-            self.np_b1v = b1;
-        } else {
-            for s in 0..64 {
-                if self.g.hw[s] != self.np_hw[s] {
-                    let sign = if self.g.hw[s] != 0 { 1.0 } else { -1.0 };
-                    let o0 = (b0 as usize * 128 + s) * NET_H;
-                    let o1 = (b1 as usize * 128 + NET_MIRS[s]) * NET_H;
-                    for j in 0..NET_H {
-                        self.np_acc0[j] += sign * nw.w1c[o0 + j];
-                        self.np_acc1[j] += sign * nw.w1c[o1 + j];
-                    }
-                    self.np_hw[s] = self.g.hw[s];
-                }
-                if self.g.vw[s] != self.np_vw[s] {
-                    let sign = if self.g.vw[s] != 0 { 1.0 } else { -1.0 };
-                    let o0 = (b0 as usize * 128 + 64 + s) * NET_H;
-                    let o1 = (b1 as usize * 128 + 64 + NET_MIRS[s]) * NET_H;
-                    for j in 0..NET_H {
-                        self.np_acc0[j] += sign * nw.w1c[o0 + j];
-                        self.np_acc1[j] += sign * nw.w1c[o1 + j];
-                    }
-                    self.np_vw[s] = self.g.vw[s];
-                }
-            }
-        }
+        self.ensure_nnue_wall_accumulators(nw, b0, b1);
 
         let mut hidden = [0.0; NET_H];
         if self.g.turn == 0 {
@@ -2437,56 +2933,9 @@ impl TitaniumSearch {
         let d_opp_i = d_opp_u as i32;
         let mut hands_empty_loss_floor = false;
         if w_me_i == 0 && w_opp_i == 0 && (!self.cert_eval_leaves_only || depth <= 0) {
-            // Service A (cheap_cert): SOUND fast race bound first. When the pawns'
-            // shortest-path sets are separated the race is a pure tempo race and
-            // the outcome is decided WITHOUT building the exact graph — the common
-            // case. (The old `hands_empty_race` classifier here was unsound on
-            // walled boards: it could false-certify an overlapping race; see
-            // race.rs notes.) Only the overlapping minority (`Unknown`) falls
-            // through to the exact retrograde table below.
-            if self.cheap_cert {
-                if self.race_scratch.is_none() {
-                    self.race_scratch = Some(Box::new(RaceScratch::new()));
-                }
-                let bound = crate::bench_instr::record(
-                    |b| &mut b.eval_race_bound,
-                    || {
-                        let scratch = self.race_scratch.as_mut().expect("race scratch");
-                        race_outcome(&mut self.g, scratch)
-                    },
-                );
-                match bound {
-                    // Proven win: graded by own distance (faster = higher). The
-                    // GUARANTEE is the bound; the magnitude is an ordering hint.
-                    RaceBound::Lower(_) => return RACE_MATE - d_me_i.max(1),
-                    // Proven loss: sign-correct loss floor (net eval grades it).
-                    RaceBound::Upper(_) => hands_empty_loss_floor = true,
-                    RaceBound::Exact(_) | RaceBound::Unknown => {}
-                }
-            }
-            // Exact retrograde table (Service B) — for the overlapping minority and
-            // for faithful (non-cheap_cert) race_proof engines. Never substitutes
-            // BFS distance for loss depth (that mis-counts jump races and collapses
-            // stubborn-loser plies). Budget-gated; built at most a few times/think.
-            if !hands_empty_loss_floor && self.race_proof {
-                if let Some(slot) = self.race_tbl(false) {
-                    let rv = self.race_value(slot) as i32;
-                    if rv > 0 {
-                        return RACE_MATE - rv; // proven win in rv plies (faster = higher)
-                    }
-                    if rv < 0 {
-                        return -(RACE_MATE + rv); // proven loss in -rv plies (slower = higher)
-                    }
-                    // rv==0 is unresolved by this table pass. Quoridor has no
-                    // draws in our ruleset, so never score it as 0; fall through.
-                }
-            }
-            if !hands_empty_loss_floor {
-                // no table / unresolved: naive heuristic race
-                if d_me_i <= d_opp_i {
-                    return 3000 + (d_opp_i - d_me_i) * 50 - d_me_i;
-                }
-                return -3000 - (d_me_i - d_opp_i) * 50 + d_opp_i;
+            match self.try_hands_empty_endgame(d_me_i, d_opp_i) {
+                HandsEmptyPipelineOutcome::Score(s) => return s,
+                HandsEmptyPipelineOutcome::LossFloor => hands_empty_loss_floor = true,
             }
         }
 
@@ -2530,7 +2979,7 @@ impl TitaniumSearch {
                 out
             },
         );
-        let (route_score, route0_bits, route1_bits) = self.route_feature_score(nw);
+        let (route_score, _, _) = self.route_feature_score(nw);
         out += route_score;
         // CAT impact heatmap as a direct net input plane. Zeroed in legacy weights
         // (loader zero-pads) → `cat_active` false → NOT computed, so the live net is
@@ -2551,10 +3000,24 @@ impl TitaniumSearch {
                 out += cat_score;
             }
         }
-        // ws[14]: unrealized wall action capacity (path-valid slots / 128). NOT corridor width.
-        let legal_wall_norm = self.geometric_legal_wall_count() as f64 / 128.0;
+        // ws[14] legal-wall-count input is retired from live search. The cheap
+        // remaining-wall counts are already present as scalar features.
         // ws[15]: opponent corridor width on their goal field (matches halfpw.py).
-        let width_opp = if me == 0 {
+        let width_opp = if self.net.route_active {
+            (if me == 0 {
+                width_in_layers(
+                    &self.d1_layers[self.dist1_idx],
+                    self.d1_layer_depth[self.dist1_idx],
+                    d_opp_u,
+                )
+            } else {
+                width_in_layers(
+                    &self.d0_layers[self.dist0_idx],
+                    self.d0_layer_depth[self.dist0_idx],
+                    d_opp_u,
+                )
+            }) as usize
+        } else if me == 0 {
             self.d1[self.dist1_idx]
                 .iter()
                 .filter(|&&d| d as i32 == d_opp_i)
@@ -2565,18 +3028,10 @@ impl TitaniumSearch {
                 .filter(|&&d| d as i32 == d_opp_i)
                 .count()
         } as f64;
-        out += ws[14] * legal_wall_norm + ws[15] * width_opp;
-        // ws[16]: legal walls crossing my path / 128; ws[17]: crossing opp path / 128
-        let (route_me_bits, route_opp_bits) = if me == 0 {
-            (route0_bits, route1_bits)
-        } else {
-            (route1_bits, route0_bits)
-        };
-        let (cross_me, cross_opp) = crate::bench_instr::record(
-            |b| &mut b.eval_wall_cross,
-            || self.legal_path_crossing_counts_bits(route_me_bits, route_opp_bits),
-        );
-        out += ws[16] * cross_me as f64 / 128.0 + ws[17] * cross_opp as f64 / 128.0;
+        out += ws[15] * width_opp;
+        // ws[16]/ws[17] path-cross inputs are retired from live search. They
+        // cost a second legal-wall pass per eval and NNUE retraining is planned
+        // to absorb/remap the feature slots.
         // CAT eval features (ws[18]/ws[19]) are DECOUPLED: computing them per leaf
         // (a full corridor-attention build + two legal-movegen passes in
         // best_pawn_cat_heats) was ~⅔ of total search time. CAT is being rebuilt
@@ -2588,113 +3043,35 @@ impl TitaniumSearch {
 
         let b0 = NET_BKT[self.g.pawn[0]] as i32;
         let b1 = NET_BKT[NET_MIRC[self.g.pawn[1]]] as i32;
-        let _nnue_prep = crate::bench_instr::OpTimer::start(|b| &mut b.eval_nnue_prep);
-        if b0 != self.np_b0 || b1 != self.np_b1v {
-            crate::bench_instr::record(
-                |b| &mut b.nnue_full_refresh,
-                || {
-                    self.np_acc0.fill(0.0);
-                    self.np_acc1.fill(0.0);
-                    for s in 0..64 {
-                        if self.g.hw[s] != 0 {
-                            let o = (b0 as usize * 128 + s) * NET_H;
-                            for j in 0..NET_H {
-                                self.np_acc0[j] += nw.w1c[o + j];
-                            }
-                            let o = (b1 as usize * 128 + NET_MIRS[s]) * NET_H;
-                            for j in 0..NET_H {
-                                self.np_acc1[j] += nw.w1c[o + j];
-                            }
-                        }
-                        if self.g.vw[s] != 0 {
-                            let o = (b0 as usize * 128 + 64 + s) * NET_H;
-                            for j in 0..NET_H {
-                                self.np_acc0[j] += nw.w1c[o + j];
-                            }
-                            let o = (b1 as usize * 128 + 64 + NET_MIRS[s]) * NET_H;
-                            for j in 0..NET_H {
-                                self.np_acc1[j] += nw.w1c[o + j];
-                            }
-                        }
-                        self.np_hw[s] = self.g.hw[s];
-                        self.np_vw[s] = self.g.vw[s];
-                    }
-                    self.np_b0 = b0;
-                    self.np_b1v = b1;
-                },
-            );
-        } else {
-            crate::bench_instr::record(
-                |b| &mut b.nnue_incr_update,
-                || {
-                    for s in 0..64 {
-                        if self.g.hw[s] != self.np_hw[s] {
-                            let sg = if self.g.hw[s] != 0 { 1.0 } else { -1.0 };
-                            let o0 = (b0 as usize * 128 + s) * NET_H;
-                            let o1 = (b1 as usize * 128 + NET_MIRS[s]) * NET_H;
-                            for j in 0..NET_H {
-                                self.np_acc0[j] += sg * nw.w1c[o0 + j];
-                                self.np_acc1[j] += sg * nw.w1c[o1 + j];
-                            }
-                            self.np_hw[s] = self.g.hw[s];
-                        }
-                        if self.g.vw[s] != self.np_vw[s] {
-                            let sg = if self.g.vw[s] != 0 { 1.0 } else { -1.0 };
-                            let o0 = (b0 as usize * 128 + 64 + s) * NET_H;
-                            let o1 = (b1 as usize * 128 + 64 + NET_MIRS[s]) * NET_H;
-                            for j in 0..NET_H {
-                                self.np_acc0[j] += sg * nw.w1c[o0 + j];
-                                self.np_acc1[j] += sg * nw.w1c[o1 + j];
-                            }
-                            self.np_vw[s] = self.g.vw[s];
-                        }
-                    }
-                },
-            );
-        }
-
-        let mut hid = [0.0f64; NET_H];
-        if me == 0 {
-            for j in 0..NET_H {
-                hid[j] = nw.b1[j] + self.np_acc0[j];
-            }
-            let o0 = self.g.pawn[0] * NET_H;
-            for j in 0..NET_H {
-                hid[j] += nw.po[o0 + j];
-            }
-            let o1 = self.g.pawn[1] * NET_H;
-            for j in 0..NET_H {
-                hid[j] += nw.px[o1 + j];
-            }
-        } else {
-            for j in 0..NET_H {
-                hid[j] = nw.b1[j] + self.np_acc1[j];
-            }
-            let o0 = NET_MIRC[self.g.pawn[1]] * NET_H;
-            for j in 0..NET_H {
-                hid[j] += nw.po[o0 + j];
-            }
-            let o1 = NET_MIRC[self.g.pawn[0]] * NET_H;
-            for j in 0..NET_H {
-                hid[j] += nw.px[o1 + j];
-            }
+        {
+            let _nnue_prep = crate::bench_instr::OpTimer::start(|b| &mut b.eval_nnue_prep);
+            self.ensure_nnue_wall_accumulators(nw, b0, b1);
         }
         crate::bench_instr::record(
             |b| &mut b.eval_nnue_infer,
             || {
-                for j in 0..NET_H {
-                    let a2 = hid[j].clamp(0.0, 1.0);
-                    out += nw.w2[j] * a2 * 200.0;
+                if me == 0 {
+                    let po = self.g.pawn[0] * NET_H;
+                    let px = self.g.pawn[1] * NET_H;
+                    for j in 0..NET_H {
+                        let h = nw.b1[j] + self.np_acc0[j] + nw.po[po + j] + nw.px[px + j];
+                        out += nw.w2[j] * h.clamp(0.0, 1.0) * 200.0;
+                    }
+                } else {
+                    let po = NET_MIRC[self.g.pawn[1]] * NET_H;
+                    let px = NET_MIRC[self.g.pawn[0]] * NET_H;
+                    for j in 0..NET_H {
+                        let h = nw.b1[j] + self.np_acc1[j] + nw.po[po + j] + nw.px[px + j];
+                        out += nw.w2[j] * h.clamp(0.0, 1.0) * 200.0;
+                    }
                 }
             },
         );
         // Integer centipawns (JS `out | 0` / halfpw `int(out)`).
         let mut ret = out as i32;
         // pathfix/RaceProof(c): certified-win floor (sound; lazy; memoized;
-        // capped per think; plausibility filter dMe <= dOpp+1 — certificates
-        // prove race-lead survival). gen13: RP_CERT always exists (certify_win.js
-        // inlined), so unlike the v11 browser-parity port this floor is LIVE.
-        // Grafted: leaf + both hands empty only (skip 1–2 wall cert in eval).
+        // capped per think; plausibility filter dMe <= dOpp+1). Stage 4 of the
+        // endgame pipeline — only when walls remain (or legacy non-leaf cert).
         if self.race_proof && w_me_i + w_opp_i > 0 {
             use crate::titanium::wall_ignore_cert::{
                 cert_score_from_stm, try_wall_ignorance_loss_cert, wall_ignore_loss_cert_enabled,
@@ -3026,6 +3403,15 @@ impl TitaniumSearch {
                 self.history_tbl[m as usize]
             };
         }
+        if ply == 0 {
+            if let Some(order) = &self.opening_book_order {
+                for (rank, &bmv) in order.iter().enumerate() {
+                    if let Some(pos) = moves.iter().position(|&m| m == bmv) {
+                        sc[pos] = sc[pos].max(2_100_000_000 - rank as i32);
+                    }
+                }
+            }
+        }
         // stable insertion sort, descending — must match JS tie order exactly
         for a in 1..n {
             let mv = moves[a];
@@ -3062,6 +3448,17 @@ impl TitaniumSearch {
         let rep = self.repeats_game_history();
         self.g.unmake_move();
         rep
+    }
+
+    fn lmr_thread_id(&self) -> usize {
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+        {
+            self.lazy_worker_id
+        }
+        #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
+        {
+            0
+        }
     }
 
     fn ab(
@@ -3125,6 +3522,12 @@ impl TitaniumSearch {
         let nd0 = self.dist0_idx; // restored on every unmake
         let nd1 = self.dist1_idx;
         let nst = self.cached_stamp;
+        let ndm_lo = self.dir_masks_key_lo;
+        let ndm_hi = self.dir_masks_key_hi;
+        let ndm_cache = self.dir_masks_cache;
+        if let Some(score) = self.exact_hands_empty_score(false) {
+            return Ok(score);
+        }
         if depth <= 0 {
             return Ok(self.evaluate(depth));
         }
@@ -3231,6 +3634,9 @@ impl TitaniumSearch {
                 self.dist0_idx = nd0;
                 self.dist1_idx = nd1;
                 self.cached_stamp = nst;
+                self.dir_masks_key_lo = ndm_lo;
+                self.dir_masks_key_hi = ndm_hi;
+                self.dir_masks_cache = ndm_cache;
                 if self.sub_min[ply + 1] < self.sub_min[ply] {
                     self.sub_min[ply] = self.sub_min[ply + 1];
                     self.sub_anc_lo[ply] = self.sub_anc_lo[ply + 1];
@@ -3269,7 +3675,7 @@ impl TitaniumSearch {
         }
 
         let mut cat_heats = [0i32; 160];
-        let mut cat_refs = CatHeatRefs::default();
+        let mut max_move_impact = 0u32;
         let cat_lmr_active = self.cat_lmr_v16 && depth >= 2 && n > 0;
         if cat_lmr_active {
             if let Some(bridge) = self.bridge.as_mut() {
@@ -3283,8 +3689,8 @@ impl TitaniumSearch {
                     buf[i] = move_id_to_board(moves[i]);
                     // Wall inherits the hottest square it touches; pawn its destination.
                     cat_heats[i] = move_impact_heat(buf[i], &cat);
+                    max_move_impact = max_move_impact.max(cat_heats[i].max(0) as u32);
                 }
-                cat_refs = cat_heat_refs_from_scores(&buf[..n], n, &cat_heats[..n]);
             }
         }
 
@@ -3337,6 +3743,9 @@ impl TitaniumSearch {
             } else {
                 None
             };
+            let mover = self.g.turn;
+            let pre_d0 = self.d0[self.dist0_idx][self.g.pawn[0]];
+            let pre_d1 = self.d1[self.dist1_idx][self.g.pawn[1]];
             crate::bench_instr::record(
                 |b| &mut b.make_move,
                 || {
@@ -3363,24 +3772,34 @@ impl TitaniumSearch {
                 && m >= 100
                 && m != tt_move
             {
-                // graduated LMR — v16 stacks CAT-scaled depth on top of ACE baseline
-                let red = if cat_lmr_active {
-                    let mv = move_id_to_board(m);
-                    // Connected CAT-LMR: one model over move index + impact, scaled
-                    // by a single aggression knob. Subsumes the base index-LMR. The
-                    // reduced search re-searches at full depth on a raised alpha
-                    // (below), so underestimated moves recover.
-                    cat_v16_lmr_reduction(
-                        mv,
-                        cat_heats[i],
-                        cat_refs,
-                        i,
-                        new_depth as u32,
-                        CAT_LMR_DEFAULT_AGGRESSION,
-                    ) as i32
+                self.refresh_dist(ply + 1);
+                let attention_ratio = if cat_lmr_active && max_move_impact > 0 {
+                    cat_heats[i].max(0) as f64 / max_move_impact as f64
                 } else {
-                    ace_graduated_lmr_reduction(i, depth)
+                    1.0
                 };
+                let mut wall_opponent_delay = 0;
+                let v16_plan = if cat_lmr_active {
+                    let post_d0 = self.d0[self.dist0_idx][self.g.pawn[0]];
+                    let post_d1 = self.d1[self.dist1_idx][self.g.pawn[1]];
+                    let (pre_opp, post_opp) = if mover == 0 {
+                        (pre_d1, post_d1)
+                    } else {
+                        (pre_d0, post_d0)
+                    };
+                    wall_opponent_delay = i32::from(post_opp) - i32::from(pre_opp);
+                    plan_v16_wall_lmr(i, depth, new_depth, attention_ratio, wall_opponent_delay)
+                } else {
+                    let ace_base = ace_graduated_lmr_reduction(i, depth);
+                    let final_reduction = ace_base.min((new_depth - 1).max(0));
+                    crate::search::v16_lmr::V16LmrPlan {
+                        ace_base_reduction: ace_base,
+                        hard_override: V16HardOverride::None,
+                        final_reduction,
+                        child_depth_used: (new_depth - final_reduction).max(0),
+                    }
+                };
+                let red = v16_plan.final_reduction;
                 if self.reduction_sidecar.is_some() {
                     let started = Instant::now();
                     let hidden = self.current_hidden_features();
@@ -3409,7 +3828,7 @@ impl TitaniumSearch {
                     };
                 let extra_reduction = probe_ordinal
                     .is_some_and(|ordinal| self.reduction_probe_target == Some(ordinal));
-                let rd = (new_depth - red - i32::from(extra_reduction)).max(0);
+                let rd = (v16_plan.child_depth_used - i32::from(extra_reduction)).max(0);
                 let nodes_before = self.nodes;
                 let mut verification_triggered = false;
                 let pipeline_result = match self.ab(rd, -alpha - 1, -alpha, ply + 1, true, m) {
@@ -3420,7 +3839,7 @@ impl TitaniumSearch {
                             match self.ab(new_depth, -beta, -alpha, ply + 1, true, m) {
                                 Ok(s2) => score = -s2,
                                 Err(e) => {
-                                    self.unwind_move(nd0, nd1, nst);
+                                    self.unwind_move(nd0, nd1, nst, ndm_lo, ndm_hi, ndm_cache);
                                     return Err(e);
                                 }
                             }
@@ -3450,9 +3869,15 @@ impl TitaniumSearch {
                             alpha,
                             beta,
                             move_index: i,
-                            base_reduction: red,
+                            base_reduction: v16_plan.ace_base_reduction,
                             applied_extra_reduction: extra_reduction,
                             verification_triggered,
+                            self_gain: 0,
+                            opponent_delay: wall_opponent_delay,
+                            race_gain: 0,
+                            path_adjustment: v16_plan.final_reduction - v16_plan.ace_base_reduction,
+                            final_reduction: red,
+                            thread_aggression_percent: cat_lmr_tuning_percent(),
                             score: *score,
                             nodes: self.nodes.saturating_sub(nodes_before),
                             hidden,
@@ -3462,6 +3887,57 @@ impl TitaniumSearch {
                     }
                 }
                 pipeline_result
+            } else if self.cat_lmr_v16
+                && m < 100
+                && i > 0
+                && depth >= ACE_LMR_MIN_DEPTH
+                && m != tt_move
+            {
+                self.refresh_dist(ply + 1);
+                let post_d0 = self.d0[self.dist0_idx][self.g.pawn[0]];
+                let post_d1 = self.d1[self.dist1_idx][self.g.pawn[1]];
+                let (pre_our, post_our) = if mover == 0 {
+                    (pre_d0, post_d0)
+                } else {
+                    (pre_d1, post_d1)
+                };
+                let self_gain = i32::from(pre_our) - i32::from(post_our);
+                if let Some(v16_plan) = plan_v16_pawn_lmr(i, depth, new_depth, self_gain) {
+                    let rd = v16_plan.child_depth_used;
+                    match self.ab(rd, -alpha - 1, -alpha, ply + 1, true, m) {
+                        Ok(s) => {
+                            let mut score = -s;
+                            if score > alpha {
+                                match self.ab(new_depth, -beta, -alpha, ply + 1, true, m) {
+                                    Ok(s2) => score = -s2,
+                                    Err(e) => {
+                                        self.unwind_move(nd0, nd1, nst, ndm_lo, ndm_hi, ndm_cache);
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            Ok(score)
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    match self.ab(new_depth, -alpha - 1, -alpha, ply + 1, true, m) {
+                        Ok(s) => {
+                            let mut score = -s;
+                            if score > alpha && score < beta {
+                                match self.ab(new_depth, -beta, -alpha, ply + 1, true, m) {
+                                    Ok(s2) => score = -s2,
+                                    Err(e) => {
+                                        self.unwind_move(nd0, nd1, nst, ndm_lo, ndm_hi, ndm_cache);
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            Ok(score)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
             } else if i > 0 {
                 match self.ab(new_depth, -alpha - 1, -alpha, ply + 1, true, m) {
                     Ok(s) => {
@@ -3470,7 +3946,7 @@ impl TitaniumSearch {
                             match self.ab(new_depth, -beta, -alpha, ply + 1, true, m) {
                                 Ok(s2) => score = -s2,
                                 Err(e) => {
-                                    self.unwind_move(nd0, nd1, nst);
+                                    self.unwind_move(nd0, nd1, nst, ndm_lo, ndm_hi, ndm_cache);
                                     return Err(e);
                                 }
                             }
@@ -3483,7 +3959,7 @@ impl TitaniumSearch {
                 self.ab(new_depth, -beta, -alpha, ply + 1, true, m)
                     .map(|s| -s)
             };
-            self.unwind_move(nd0, nd1, nst);
+            self.unwind_move(nd0, nd1, nst, ndm_lo, ndm_hi, ndm_cache);
             if self.sub_min[ply + 1] < self.sub_min[ply] {
                 self.sub_min[ply] = self.sub_min[ply + 1];
                 self.sub_anc_lo[ply] = self.sub_anc_lo[ply + 1];
@@ -3659,7 +4135,15 @@ impl TitaniumSearch {
     }
 
     /// Restore after a time abort mid-move (JS `finally` semantics).
-    fn unwind_move(&mut self, nd0: usize, nd1: usize, nst: i32) {
+    fn unwind_move(
+        &mut self,
+        nd0: usize,
+        nd1: usize,
+        nst: i32,
+        ndm_lo: u32,
+        ndm_hi: u32,
+        ndm_cache: DirMasks,
+    ) {
         crate::bench_instr::record(
             |b| &mut b.unmake_move,
             || {
@@ -3672,6 +4156,116 @@ impl TitaniumSearch {
         self.dist0_idx = nd0;
         self.dist1_idx = nd1;
         self.cached_stamp = nst;
+        self.dir_masks_key_lo = ndm_lo;
+        self.dir_masks_key_hi = ndm_hi;
+        self.dir_masks_cache = ndm_cache;
+    }
+
+    /// Lost-position root defense: full-depth search of every legal root move with
+    /// stubborn-loser move selection (slowest proven loss, static-eval tie-break).
+    fn root_defense_verify(&mut self, depth: i32) -> Result<i32, TimeUp> {
+        // Invalidate shallow LMR-reduced root-move TT entries from the iteration
+        // that just completed so every candidate is searched at full depth.
+        if !self.pure_mode && !self.is_pondering {
+            self.tt_gen = self.tt_gen.wrapping_add(1);
+        }
+        self.root_defense_diag.clear();
+        let root_side = self.g.turn;
+        let mut moves = [0i16; 160];
+        let tt_hint = if self.root_best >= 0 {
+            self.root_best
+        } else {
+            0
+        };
+        let n = self.gen_moves(0, depth, tt_hint, &mut moves);
+        if n == 0 {
+            return Ok(self.root_score);
+        }
+        self.order_moves(0, &mut moves[..n], tt_hint, 0);
+
+        let child_depth = depth - 1;
+        let mut best_move = moves[0];
+        let mut best_score = i32::MIN;
+        let mut best_static = i32::MIN;
+        let mut best_order = 0usize;
+
+        for i in 0..n {
+            if Instant::now() >= self.deadline {
+                return Err(TimeUp);
+            }
+            let m = moves[i];
+            let nodes_before = self.nodes;
+
+            self.refresh_dist(0);
+            let nd0 = self.dist0_idx;
+            let nd1 = self.dist1_idx;
+            let nst = self.cached_stamp;
+            let ndm_lo = self.dir_masks_key_lo;
+            let ndm_hi = self.dir_masks_key_hi;
+            let ndm_cache = self.dir_masks_cache;
+
+            crate::bench_instr::record(
+                |b| &mut b.make_move,
+                || {
+                    self.g.make_move(m);
+                    if let Some(bridge) = self.bridge.as_mut() {
+                        bridge.push(m);
+                    }
+                },
+            );
+            self.refresh_dist(1);
+            let static_eval = {
+                let ev = self.evaluate(0);
+                if self.g.turn == root_side {
+                    ev
+                } else {
+                    -ev
+                }
+            };
+            let search_score = match self.ab(child_depth, -INF, INF, 1, true, m) {
+                Ok(s) => -s,
+                Err(e) => {
+                    self.unwind_move(nd0, nd1, nst, ndm_lo, ndm_hi, ndm_cache);
+                    return Err(e);
+                }
+            };
+            self.unwind_move(nd0, nd1, nst, ndm_lo, ndm_hi, ndm_cache);
+
+            let move_nodes = self.nodes.saturating_sub(nodes_before);
+            self.root_defense_diag.push(RootDefenseDiag {
+                mv: m,
+                full_depth_searched: true,
+                child_depth_used: child_depth,
+                result_class: score_result_class(search_score),
+                dtm: proven_score_dtm(search_score),
+                search_score,
+                static_eval,
+                nodes: move_nodes,
+                selection_key: defense_selection_key(search_score, static_eval),
+            });
+
+            if better_defense_candidate(
+                search_score,
+                static_eval,
+                i,
+                best_score,
+                best_static,
+                best_order,
+            ) {
+                best_move = m;
+                best_score = search_score;
+                best_static = static_eval;
+                best_order = i;
+            }
+        }
+
+        self.root_best = best_move;
+        self.root_score = best_score;
+        if best_move < 100 {
+            self.root_pawn_best = best_move;
+            self.root_pawn_score = best_score;
+        }
+        Ok(best_score)
     }
 
     /// Entry: pathfix/RaceProof(a) — exact race endgame at ROOT. Cheap-cert
@@ -3687,6 +4281,31 @@ impl TitaniumSearch {
         engine_label: &str,
     ) -> ThinkResult {
         let mut stop_reason: &'static str = "unknown";
+        if let Some(direct_mv) = self.prepare_opening_book_at_root() {
+            let t0 = Instant::now();
+            self.refresh_dist(0);
+            return ThinkResult {
+                mv: direct_mv,
+                score: 0,
+                depth: 0,
+                nodes: 0,
+                main_thread_nodes: 0,
+                helper_nodes: Vec::new(),
+                total_nodes: 0,
+                main_completed_depth: 0,
+                helper_completed_depths: Vec::new(),
+                root_widths: Vec::new(),
+                root_visits: Vec::new(),
+                ms: t0.elapsed().as_millis() as u64,
+                white_dist: self.d0[self.dist0_idx][self.g.pawn[0]],
+                black_dist: self.d1[self.dist1_idx][self.g.pawn[1]],
+                depth_log: Vec::new(),
+                stop_reason: "opening-book",
+                race_outcome_stats: self.race_outcome_stats,
+                opening_book: self.pending_opening_book_diag.take(),
+                root_defense_diag: Vec::new(),
+            };
+        }
         if self.cheap_cert
             && !self.race_proof
             && self.g.wl[0] == 0
@@ -3701,6 +4320,7 @@ impl TitaniumSearch {
             let mut best_m: i16 = -1;
             let mut best_v: i32 = i32::MIN;
             let mut best_key = i32::MIN;
+            let mut best_eval = i32::MIN;
 
             for &m in &buf[..nm] {
                 self.g.make_move(m);
@@ -3723,7 +4343,20 @@ impl TitaniumSearch {
                         1 + d_me[self.g.pawn[me]] as i32
                     }
                 };
+                self.refresh_dist(0);
+                let d_me_i = if me == 0 {
+                    self.d0[self.dist0_idx][self.g.pawn[0]] as i32
+                } else {
+                    self.d1[self.dist1_idx][self.g.pawn[1]] as i32
+                };
+                let d_opp_i = if me == 0 {
+                    self.d1[self.dist1_idx][self.g.pawn[1]] as i32
+                } else {
+                    self.d0[self.dist0_idx][self.g.pawn[0]] as i32
+                };
+                let tie_eval = d_opp_i - d_me_i;
                 self.g.unmake_move();
+                self.cached_stamp = -1;
 
                 // Prefer any forced win over any forced loss; among wins, take
                 // the fastest race. Among losses, delay as long as possible.
@@ -3732,8 +4365,9 @@ impl TitaniumSearch {
                 } else {
                     -1_000_000 - my_v
                 };
-                if key > best_key {
+                if key > best_key || (key == best_key && tie_eval > best_eval) {
                     best_key = key;
+                    best_eval = tie_eval;
                     best_m = m;
                     best_v = my_v;
                 }
@@ -3779,6 +4413,9 @@ impl TitaniumSearch {
                     black_dist: self.d1[self.dist1_idx][self.g.pawn[1]],
                     depth_log: Vec::new(),
                     stop_reason: "cheap_cert_root_race",
+                    race_outcome_stats: self.race_outcome_stats,
+                    opening_book: None,
+                    root_defense_diag: Vec::new(),
                 };
             }
         }
@@ -3820,6 +4457,9 @@ impl TitaniumSearch {
                         black_dist: self.d1[self.dist1_idx][self.g.pawn[1]],
                         depth_log: Vec::new(),
                         stop_reason: "race_proof_root_table",
+                        race_outcome_stats: self.race_outcome_stats,
+                        opening_book: None,
+                        root_defense_diag: Vec::new(),
                     };
                 }
             }
@@ -3887,6 +4527,32 @@ impl TitaniumSearch {
     ) -> ThinkResult {
         if self.g.winner() >= 0 {
             return self.think(time_ms, max_depth, full, log, engine_label);
+        }
+
+        if let Some(direct_mv) = self.prepare_opening_book_at_root() {
+            let t0 = Instant::now();
+            self.refresh_dist(0);
+            return ThinkResult {
+                mv: direct_mv,
+                score: 0,
+                depth: 0,
+                nodes: 0,
+                main_thread_nodes: 0,
+                helper_nodes: Vec::new(),
+                total_nodes: 0,
+                main_completed_depth: 0,
+                helper_completed_depths: Vec::new(),
+                root_widths: Vec::new(),
+                root_visits: Vec::new(),
+                ms: t0.elapsed().as_millis() as u64,
+                white_dist: self.d0[self.dist0_idx][self.g.pawn[0]],
+                black_dist: self.d1[self.dist1_idx][self.g.pawn[1]],
+                depth_log: Vec::new(),
+                stop_reason: "opening-book",
+                race_outcome_stats: self.race_outcome_stats,
+                opening_book: self.pending_opening_book_diag.take(),
+                root_defense_diag: Vec::new(),
+            };
         }
 
         // Parallel search uses a fixed shared allocation. Live adaptive growth is
@@ -4108,6 +4774,8 @@ impl TitaniumSearch {
     ) -> ThinkResult {
         let t0 = Instant::now();
         crate::bench_instr::begin_search();
+        let rc_hits_at_start = self.rc_hits;
+        let rc_solves_at_start = self.rc_solves;
         // pathfix/RaceProof(b): reserve the commitment gate's worst-case cost
         // out of the search deadline when the gate can fire — it runs after
         // the search loop and its raceTbl(force=true) call ignores deadline.
@@ -4129,6 +4797,7 @@ impl TitaniumSearch {
         // cross-thread comparable, so per-thread t0 is equivalent there ±µs.)
         self.deadline = t0 + Duration::from_millis(time_ms.saturating_sub(gate_reserve_ms));
         self.nodes = 0;
+        self.race_outcome_stats = RaceOutcomeStats::default();
         self.root_best = super::TITANIUM_NO_MOVE;
         self.root_score = 0;
         #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
@@ -4315,7 +4984,41 @@ impl TitaniumSearch {
                         self.sync_stream_meta(&depth_log, d, last_score);
                         self.emit_stream_progress(true);
                     }
-                    if sc > MATE - 200 || sc < -(MATE - 200) {
+                    if is_proven_loss_score(sc) {
+                        match self.root_defense_verify(d) {
+                            Ok(defense_score) => {
+                                last_best = self.root_best;
+                                last_score = defense_score;
+                                if self.root_pawn_best >= 0 {
+                                    last_pawn_best = self.root_pawn_best;
+                                    last_pawn_score = self.root_pawn_score;
+                                }
+                                if let Some(entry) = depth_log.last_mut() {
+                                    if entry.depth == d {
+                                        entry.score = last_score;
+                                        entry.pv = if last_best >= 0 {
+                                            super::move_id_to_algebraic(last_best)
+                                        } else {
+                                            String::new()
+                                        };
+                                    }
+                                }
+                                if log {
+                                    self.sync_stream_meta(&depth_log, d, last_score);
+                                    self.emit_stream_progress(true);
+                                }
+                            }
+                            Err(TimeUp) => {
+                                if self.use_partial_iter && self.root_best >= 0 {
+                                    last_best = self.root_best;
+                                    last_score = self.root_score;
+                                }
+                                *stop_reason = "time_up";
+                                break;
+                            }
+                        }
+                    }
+                    if last_score > MATE - 200 || last_score < -(MATE - 200) {
                         *stop_reason = "forced_mate_or_loss";
                         break; // forced result
                     }
@@ -4465,6 +5168,9 @@ impl TitaniumSearch {
 
         crate::bench_instr::set_stop_reason(stop_reason);
         crate::bench_instr::end_search(self.nodes);
+        self.race_outcome_stats.race_tbl_lru_hits = self.rc_hits.saturating_sub(rc_hits_at_start);
+        self.race_outcome_stats.race_tbl_lru_rebuilds =
+            self.rc_solves.saturating_sub(rc_solves_at_start);
 
         ThinkResult {
             mv: last_best,
@@ -4483,6 +5189,9 @@ impl TitaniumSearch {
             black_dist,
             depth_log,
             stop_reason: *stop_reason,
+            race_outcome_stats: self.race_outcome_stats,
+            opening_book: self.pending_opening_book_diag.take(),
+            root_defense_diag: self.root_defense_diag.clone(),
         }
     }
 }

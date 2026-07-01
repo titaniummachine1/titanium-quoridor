@@ -7,7 +7,7 @@
 use crate::path::flood::expand_frontier;
 use crate::path::masks::DirMasks;
 use crate::titanium::game::GameState;
-use crate::util::grid::{flood_bit_sq, flood_sq_from_bit, square_index, FLOOD_PLAYABLE};
+use crate::util::grid::{flood_bit_sq, square_index, FLOOD_PLAYABLE, FLOOD_SQ_BY_BIT};
 
 /// Corridor cells considered for choke detection (matches CAT bottleneck band).
 pub const CHOKE_DELTA_MAX: u8 = 2;
@@ -38,7 +38,8 @@ fn flood_scatter_inner(seed: u128, masks: DirMasks, out: &mut [u8; 81]) {
     while bits != 0 {
         let fb = bits.trailing_zeros();
         bits &= bits - 1;
-        if let Some(sq) = flood_sq_from_bit(fb) {
+        let sq = FLOOD_SQ_BY_BIT[fb as usize];
+        if sq != u8::MAX {
             out[sq as usize] = layer;
         }
     }
@@ -52,7 +53,8 @@ fn flood_scatter_inner(seed: u128, masks: DirMasks, out: &mut [u8; 81]) {
         while bits != 0 {
             let fb = bits.trailing_zeros();
             bits &= bits - 1;
-            if let Some(sq) = flood_sq_from_bit(fb) {
+            let sq = FLOOD_SQ_BY_BIT[fb as usize];
+            if sq != u8::MAX {
                 out[sq as usize] = layer;
             }
         }
@@ -91,13 +93,31 @@ pub fn flood_into_layers(seed: u128, masks: DirMasks, layers: &mut [u128; 81]) -
 
 /// Inverse layer flood: distance-to-goal-row layer masks for `player` (ACE index).
 /// `layers[d]` = cells `d` steps from the goal row. No dense scatter.
-pub fn fill_ace_dist_layers_to_goal(player: usize, masks: DirMasks, layers: &mut [u128; 81]) -> usize {
+pub fn fill_ace_dist_layers_to_goal(
+    player: usize,
+    masks: DirMasks,
+    layers: &mut [u128; 81],
+) -> usize {
     let grow = ace_goal_row(player);
     let mut seed = 0u128;
     for c in 0..9u8 {
         seed |= flood_bit_sq(square_index(grow, c));
     }
     flood_into_layers(seed, masks, layers)
+}
+
+pub fn materialize_distance_layers(layers: &[u128; 81], depth: usize, out: &mut [u8; 81]) {
+    out.fill(255);
+    for (d, mut bits) in layers.iter().copied().take(depth).enumerate() {
+        while bits != 0 {
+            let fb = bits.trailing_zeros();
+            bits &= bits - 1;
+            let sq = FLOOD_SQ_BY_BIT[fb as usize];
+            if sq != u8::MAX {
+                out[sq as usize] = d as u8;
+            }
+        }
+    }
 }
 
 /// BFS distance of square `sq` from the layer masks (255 = unreachable). O(depth)
