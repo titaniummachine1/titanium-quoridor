@@ -62,6 +62,7 @@ fn plan_v16_root_move(
     child_depth_full: u32,
     attention_ratio: f64,
     wall_opponent_delay: Option<i32>,
+    wall_self_delay: Option<i32>,
     pawn_self_gain: Option<i32>,
     is_wall: bool,
 ) -> (u32, &'static str, u32, u32) {
@@ -76,6 +77,7 @@ fn plan_v16_root_move(
             child_depth_full as i32,
             attention_ratio,
             wall_opponent_delay.unwrap_or(1),
+            wall_self_delay.unwrap_or(0),
         );
         return (
             p.ace_base_reduction as u32,
@@ -250,15 +252,21 @@ pub fn plan_root_lmr(
             0.0
         };
 
-        let wall_opponent_delay = if is_wall && i >= ACE_LMR_AFTER_MOVE {
+        let (wall_opponent_delay, wall_self_delay) = if is_wall && i >= ACE_LMR_AFTER_MOVE {
             let mut trial = board.clone();
             trial.apply_move(mv);
-            let after = bfs
+            let opp_after = bfs
                 .shortest_distance(&trial, opp_side)
                 .unwrap_or(DIST_PENALTY);
-            Some(i32::from(after) - i32::from(opp_dist_path))
+            let our_after = bfs
+                .shortest_distance(&trial, root_side)
+                .unwrap_or(DIST_PENALTY);
+            (
+                Some(i32::from(opp_after) - i32::from(opp_dist_path)),
+                Some(i32::from(our_after) - i32::from(our_dist)),
+            )
         } else {
-            None
+            (None, None)
         };
 
         let pawn_self_gain = if !is_wall && i > 0 {
@@ -278,6 +286,7 @@ pub fn plan_root_lmr(
             child_depth_full,
             attention,
             wall_opponent_delay,
+            wall_self_delay,
             pawn_self_gain,
             is_wall,
         );
@@ -379,7 +388,36 @@ pub fn format_lmr_plans_json(plans: &[RootLmrPlan]) -> String {
     )
 }
 
-/// Pre-search LMR plan — static profile at pierce peak.
+/// Merge the opponent's plan into the side-to-move plan so the display shows
+/// BOTH players' perspectives: a move keeps the deeper of the two plans
+/// (a wall matters if it matters for either side); opponent-only moves
+/// (their pawn steps, walls the mover can't place) are appended.
+fn merge_combined_plans(plans: &mut Vec<RootLmrPlan>, opp_plans: Vec<RootLmrPlan>) {
+    use std::collections::HashMap;
+    let idx: HashMap<String, usize> = plans
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.mv.clone(), i))
+        .collect();
+    for op in opp_plans {
+        if let Some(&i) = idx.get(&op.mv) {
+            let p = &mut plans[i];
+            p.cat_cm = p.cat_cm.max(op.cat_cm);
+            p.hot |= op.hot;
+            if op.child_depth_used > p.child_depth_used {
+                let order = p.order;
+                *p = op;
+                p.order = order;
+            }
+        } else {
+            let mut op = op;
+            op.order = plans.len();
+            plans.push(op);
+        }
+    }
+}
+
+/// Pre-search LMR plan — static profile at pierce peak, combined for both players.
 pub fn lmr_snapshot_json(
     board: &mut Board,
     time_ms: u64,
@@ -388,7 +426,15 @@ pub fn lmr_snapshot_json(
 ) -> String {
     let mut bfs = BfsScratch::new();
     let depth = id_depth.clamp(4, 32);
-    let (profile, plans) = plan_root_lmr(board, &mut bfs, depth, time_ms, 0.0, depth_kept_percent);
+    let (profile, mut plans) =
+        plan_root_lmr(board, &mut bfs, depth, time_ms, 0.0, depth_kept_percent);
+    // Display is not turn-based: plan the opponent's move set too and merge.
+    // The search itself stays per-mover — this only widens the visualization.
+    board.side_to_move = board.side_to_move.opposite();
+    let (_, opp_plans) = plan_root_lmr(board, &mut bfs, depth, time_ms, 0.0, depth_kept_percent);
+    board.side_to_move = board.side_to_move.opposite();
+    merge_combined_plans(&mut plans, opp_plans);
+    let plans = plans;
     format!(
         "{{\"source\":\"shallow\",\"idDepth\":{},\"timeMs\":{},\"lmrAggressionPercent\":{},\"lmrTuningPercent\":{},\"lmrProfile\":{},{}}}",
         depth,
@@ -458,9 +504,9 @@ mod tests {
     #[test]
     fn dead_tail_forces_depth_one_at_ten_percent() {
         let child_full = 7i32;
-        let dead = plan_v16_wall_lmr(8, 8, child_full, 0.05, 1);
-        let fringe = plan_v16_wall_lmr(8, 8, child_full, 0.12, 1);
-        let side = plan_v16_wall_lmr(8, 8, child_full, 0.65, 1);
+        let dead = plan_v16_wall_lmr(8, 8, child_full, 0.05, 1, 0);
+        let fringe = plan_v16_wall_lmr(8, 8, child_full, 0.12, 1, 0);
+        let side = plan_v16_wall_lmr(8, 8, child_full, 0.65, 1, 0);
         assert_eq!(dead.child_depth_used, 1);
         assert_eq!(dead.hard_override, V16HardOverride::DeadTail);
         assert!(fringe.child_depth_used > dead.child_depth_used);
@@ -470,8 +516,8 @@ mod tests {
     #[test]
     fn ace_baseline_ignores_cat_ratio_above_tail() {
         let child_full = 7i32;
-        let mid = plan_v16_wall_lmr(12, 8, child_full, 0.50, 1);
-        let hot = plan_v16_wall_lmr(12, 8, child_full, 1.0, 1);
+        let mid = plan_v16_wall_lmr(12, 8, child_full, 0.50, 1, 0);
+        let hot = plan_v16_wall_lmr(12, 8, child_full, 1.0, 1, 0);
         assert_eq!(mid.ace_base_reduction, hot.ace_base_reduction);
         assert_eq!(mid.final_reduction, hot.final_reduction);
         assert_eq!(mid.child_depth_used, hot.child_depth_used);
@@ -480,7 +526,7 @@ mod tests {
 
     #[test]
     fn backward_move_override_forces_depth_one() {
-        let p = plan_v16_pawn_lmr(3, 8, 7, 0).expect("non-progress");
+        let p = plan_v16_pawn_lmr(3, 8, 7, -1).expect("backwards");
         assert_eq!(p.hard_override, V16HardOverride::BackwardMove);
         assert_eq!(p.child_depth_used, 1);
     }
@@ -488,9 +534,9 @@ mod tests {
     #[test]
     fn ace_graduated_increases_with_move_index() {
         let child_full = 10i32;
-        let early = plan_v16_wall_lmr(4, 8, child_full, 0.5, 1);
-        let late = plan_v16_wall_lmr(12, 8, child_full, 0.5, 1);
-        let very_late = plan_v16_wall_lmr(24, 8, child_full, 0.5, 1);
+        let early = plan_v16_wall_lmr(4, 8, child_full, 0.5, 1, 0);
+        let late = plan_v16_wall_lmr(12, 8, child_full, 0.5, 1, 0);
+        let very_late = plan_v16_wall_lmr(24, 8, child_full, 0.5, 1, 0);
         assert!(late.final_reduction > early.final_reduction);
         assert!(very_late.final_reduction > late.final_reduction);
     }

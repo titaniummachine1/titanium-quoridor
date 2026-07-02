@@ -151,7 +151,7 @@ mod lazy_smp_tests {
                 .collect::<std::collections::HashSet<_>>();
             assert!(unique.len() <= allowed);
             if plan.worker_id == 0 {
-                assert_eq!(allowed, plan.root_move_count);
+                assert_eq!(plan.root_width_percent, 10);
             }
         }
     }
@@ -326,7 +326,9 @@ const TT_BITS: usize = 20;
 const TT_SIZE: usize = 1 << TT_BITS;
 const TT_MASK: u32 = (TT_SIZE - 1) as u32;
 
-const LAZY_SMP_WIDTHS: [usize; 5] = [100, 80, 60, 40, 20];
+// Root-move width percent per worker: narrow-first for deepest lookahead.
+// Worker 0 = 10%, then 20%, 40%, and 60% for every subsequent worker.
+const LAZY_SMP_WIDTHS: [usize; 4] = [10, 20, 40, 60];
 
 #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 pub const LAZY_SMP_MAX_THREADS: usize = 16;
@@ -3782,13 +3784,21 @@ impl TitaniumSearch {
                 let v16_plan = if cat_lmr_active {
                     let post_d0 = self.d0[self.dist0_idx][self.g.pawn[0]];
                     let post_d1 = self.d1[self.dist1_idx][self.g.pawn[1]];
-                    let (pre_opp, post_opp) = if mover == 0 {
-                        (pre_d1, post_d1)
+                    let (pre_opp, post_opp, pre_our, post_our) = if mover == 0 {
+                        (pre_d1, post_d1, pre_d0, post_d0)
                     } else {
-                        (pre_d0, post_d0)
+                        (pre_d0, post_d0, pre_d1, post_d1)
                     };
                     wall_opponent_delay = i32::from(post_opp) - i32::from(pre_opp);
-                    plan_v16_wall_lmr(i, depth, new_depth, attention_ratio, wall_opponent_delay)
+                    let wall_self_delay = i32::from(post_our) - i32::from(pre_our);
+                    plan_v16_wall_lmr(
+                        i,
+                        depth,
+                        new_depth,
+                        attention_ratio,
+                        wall_opponent_delay,
+                        wall_self_delay,
+                    )
                 } else {
                     let ace_base = ace_graduated_lmr_reduction(i, depth);
                     let final_reduction = ace_base.min((new_depth - 1).max(0));
